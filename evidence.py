@@ -490,6 +490,23 @@ def numeric_equal(left: str, right: str) -> bool:
     return abs(left_value - right_value) <= max(1e-6, abs(left_value) * 0.001)
 
 
+def claim_has_approx_marker(claim: str) -> bool:
+    return bool(re.search(r"(约|大约|约为|左右|接近|around|about|approximately|roughly)", claim or "", flags=re.I))
+
+
+def numeric_match_for_claim(claim: str, left: str, right: str) -> bool:
+    if numeric_equal(left, right):
+        return True
+    left_value = numeric_value(left)
+    right_value = numeric_value(right)
+    if left_value is None or right_value is None:
+        return False
+    if not claim_has_approx_marker(claim):
+        return False
+    tolerance = max(0.2, min(5.0, abs(right_value) * 0.15))
+    return abs(left_value - right_value) <= tolerance
+
+
 
 
 def sentence_for_value(text: str, value: str) -> str:
@@ -663,6 +680,9 @@ def apply_candidate_features_to_point(point: Dict[str, Any], candidate: Dict[str
         "claim_token_hits",
         "numeric_hits",
         "date_hits",
+        "sentence_candidate_profile",
+        "candidate_slot_match",
+        "direct_candidate_gap_reason",
     ):
         if key in candidate:
             out[key] = candidate.get(key)
@@ -672,6 +692,7 @@ def apply_candidate_features_to_point(point: Dict[str, Any], candidate: Dict[str
 def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any], claim: str, mode: str) -> Dict[str, Any]:
     sentence = normalize_text(str(candidate.get("sentence") or ""))
     sentence_lower = sentence.lower()
+    claim_lower = normalize_text(claim).lower()
     claim_tokens = qa_text_tokens(claim)
     numeric_hits = [value for value, _unit in extract_numbers(sentence)]
     date_hits = extract_dates(sentence)
@@ -702,6 +723,8 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
     noise_penalty = 0
     utility_label = "noise"
     directness = SENTENCE_DIRECTNESS_RELATED_ONLY
+    narrowing_bonus = 0
+    narrowing_reasons: List[str] = []
     if mode == EVIDENCE_MODE_ROUTE:
         if route_analysis.get("directly_answers_route"):
             relation_evidence = 3
@@ -747,6 +770,33 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
             relation_evidence = 1
             answerability = 1
             specificity = 1
+        claim_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", claim, flags=re.I))
+        sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened)", sentence, flags=re.I))
+        sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))
+        sentence_has_close = bool(re.search(r"(收盘|尾盘|close|closed)", sentence, flags=re.I))
+        sentence_has_commentary = bool(re.search(r"(代表|意味着|反映|说明|主要因为|reflects|means|suggests|because)", sentence, flags=re.I))
+        sentence_has_market_quote = bool(re.search(r"(中间价|汇率|牌价|报价|rate|price|basis point|基点)", sentence, flags=re.I))
+        if claim_needs_open and sentence_has_open:
+            narrowing_bonus += 8
+            narrowing_reasons.append("opening_fact_slot_hit")
+        if claim_needs_open and sentence_has_intraday and not sentence_has_open:
+            narrowing_bonus -= 8
+            narrowing_reasons.append("intraday_not_opening_slot")
+            if directness == SENTENCE_DIRECTNESS_DIRECT:
+                directness = SENTENCE_DIRECTNESS_PARTIAL
+        if claim_needs_open and sentence_has_close and not sentence_has_open:
+            narrowing_bonus -= 6
+            narrowing_reasons.append("closing_not_opening_slot")
+            if directness == SENTENCE_DIRECTNESS_DIRECT:
+                directness = SENTENCE_DIRECTNESS_PARTIAL
+        if sentence_has_commentary:
+            narrowing_bonus -= 5
+            narrowing_reasons.append("commentary_not_direct_quote")
+            if directness == SENTENCE_DIRECTNESS_DIRECT and not numeric_hits:
+                directness = SENTENCE_DIRECTNESS_PARTIAL
+        if sentence_has_market_quote:
+            narrowing_bonus += 2
+            narrowing_reasons.append("market_quote_marker")
         utility_label = "answerable" if answerability >= 3 else "borderline" if answerability >= 2 else "background" if relation_evidence >= 1 else "noise"
     elif mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE}:
         if claim_dates and any(normalize_date_value(hit) == normalize_date_value(claim_dates[0]) for hit in date_hits):
@@ -776,6 +826,17 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
             answerability = 1
             specificity = 1
         utility_label = "answerable" if answerability >= 3 else "borderline" if answerability >= 2 else "background" if relation_evidence >= 1 else "noise"
+    if mode == "event_result":
+        sentence_has_result_marker = bool(re.search(r"(战胜|击败|获胜|赢|比分|result|won|beat|defeated|score|winner)", sentence, flags=re.I))
+        sentence_has_commentary = bool(re.search(r"(复盘|影响|说明|意味着|reflects|means|suggests|because)", sentence, flags=re.I))
+        if sentence_has_result_marker:
+            narrowing_bonus += 4
+            narrowing_reasons.append("result_marker")
+        if sentence_has_commentary and not sentence_has_result_marker:
+            narrowing_bonus -= 4
+            narrowing_reasons.append("commentary_not_result")
+            if directness == SENTENCE_DIRECTNESS_DIRECT:
+                directness = SENTENCE_DIRECTNESS_PARTIAL
     if len(sentence) > 220:
         noise_penalty += 1
     utility_bonus = (
@@ -784,6 +845,7 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
         + specificity * 3
         + structural_extractability * 2
         - noise_penalty * 4
+        + narrowing_bonus
     )
     source_type = str(item.get("source_type") or "")
     source_bonus = {"official": 3, "news": 2, "encyclopedia": 1}.get(source_type, 0)
@@ -801,6 +863,46 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
         + direct_bonus
         + utility_bonus
     )
+    status_or_result_hit = bool(
+        route_analysis.get("has_relation_marker") if isinstance(route_analysis, dict) else False
+    ) or bool(
+        re.search(
+            r"(休市|开盘|停牌|生效|发布|公布|取消|暂停|战胜|击败|赢|获胜|晋级|比分|结果|result|won|beat|score|effective|announced|released|open|closed)",
+            sentence,
+            flags=re.I,
+        )
+    )
+    slot_match = infer_sentence_candidate_slot_match(
+        claim,
+        sentence,
+        mode,
+        entity_hit_count=entity_hit_count,
+        numeric_hits=numeric_hits,
+        date_hits=date_hits,
+        route_analysis=route_analysis,
+        status_or_result_hit=status_or_result_hit,
+    )
+    gap_reason = infer_sentence_candidate_gap_reason(
+        claim,
+        sentence,
+        mode,
+        slot_match=slot_match,
+        directness=directness,
+        utility_label=utility_label,
+        numeric_hits=numeric_hits,
+        date_hits=date_hits,
+        route_analysis=route_analysis,
+    )
+    profile = infer_sentence_candidate_profile(
+        mode,
+        slot_match=slot_match,
+        gap_reason=gap_reason,
+        directness=directness,
+        utility_label=utility_label,
+        numeric_hits=numeric_hits,
+        date_hits=date_hits,
+        route_analysis=route_analysis,
+    )
     return {
         "sentence_directness": directness,
         "sentence_score_total": total_score,
@@ -817,6 +919,7 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
             "numeric_score": numeric_score,
             "overlap_score": overlap_score,
             "utility_bonus": utility_bonus,
+            "narrowing_bonus": narrowing_bonus,
         },
         "sentence_utility_components": {
             "answerability": answerability,
@@ -825,12 +928,133 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
             "structural_extractability": structural_extractability,
             "specificity": specificity,
             "noise_penalty": noise_penalty,
+            "narrowing_bonus": narrowing_bonus,
         },
         "claim_token_hits": token_hits[:8],
         "numeric_hits": numeric_hits[:6],
         "date_hits": date_hits[:6],
         "route_relation": route_analysis,
+        "conversion_narrowing_reasons": narrowing_reasons[:6],
+        "sentence_candidate_profile": profile,
+        "candidate_slot_match": slot_match,
+        "direct_candidate_gap_reason": gap_reason,
     }
+
+
+def infer_sentence_candidate_slot_match(
+    claim: str,
+    sentence: str,
+    mode: str,
+    *,
+    entity_hit_count: int,
+    numeric_hits: List[Any],
+    date_hits: List[Any],
+    route_analysis: Optional[Dict[str, Any]] = None,
+    status_or_result_hit: bool = False,
+) -> str:
+    has_subject = entity_hit_count >= 1
+    has_time = bool(date_hits)
+    has_metric = bool(numeric_hits)
+    has_route = bool((route_analysis or {}).get("has_relation_marker"))
+    has_status = bool(status_or_result_hit)
+    if mode == EVIDENCE_MODE_ROUTE or has_route:
+        if has_subject and has_route:
+            return "subject+metric_or_result"
+        if has_route:
+            return "metric_or_result_only"
+    if has_subject and has_time and (has_metric or has_status):
+        return "subject+time+metric_or_result"
+    if has_subject and (has_metric or has_status):
+        return "subject+metric_or_result"
+    if has_time and (has_metric or has_status):
+        return "time+metric_or_result"
+    if has_subject and has_time:
+        return "subject+time"
+    if has_metric or has_status:
+        return "metric_or_result_only"
+    if has_time:
+        return "time_scope_only"
+    return "weak_anchor"
+
+
+def infer_sentence_candidate_gap_reason(
+    claim: str,
+    sentence: str,
+    mode: str,
+    *,
+    slot_match: str,
+    directness: str,
+    utility_label: str,
+    numeric_hits: List[Any],
+    date_hits: List[Any],
+    route_analysis: Optional[Dict[str, Any]] = None,
+) -> str:
+    claim_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", claim, flags=re.I))
+    sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", sentence, flags=re.I))
+    sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))
+    sentence_has_close = bool(re.search(r"(收盘|尾盘|close|closed)", sentence, flags=re.I))
+    sentence_has_commentary = bool(re.search(r"(代表|意味着|反映|说明|主要因为|reflects|means|suggests|because)", sentence, flags=re.I))
+    if claim_needs_open and (sentence_has_intraday or sentence_has_close) and not sentence_has_open:
+        return "opening_slot_mismatch"
+    if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE}:
+        claim_publish = bool(re.search(r"(发布|公布|宣布|announced|released)", claim, flags=re.I))
+        claim_effective = bool(re.search(r"(生效|实施|effective|in force)", claim, flags=re.I))
+        sentence_publish = bool(re.search(r"(发布|公布|宣布|announced|released)", sentence, flags=re.I))
+        sentence_effective = bool(re.search(r"(生效|实施|effective|in force)", sentence, flags=re.I))
+        if (claim_publish and sentence_effective and not sentence_publish) or (claim_effective and sentence_publish and not sentence_effective):
+            return "date_role_mismatch"
+    if mode == "event_result":
+        claim_needs_final = bool(re.search(r"(比分|赛果|结果|获胜|winner|won|beat|result|score)", claim, flags=re.I))
+        sentence_partial = bool(re.search(r"(首节|次节|半场|加时|单盘|盘点|quarter|period|half|set|inning)", sentence, flags=re.I))
+        if claim_needs_final and sentence_partial:
+            return "result_granularity_mismatch"
+    if sentence_has_commentary and utility_label in {"background", "noise"}:
+        return "commentary_only"
+    if mode == EVIDENCE_MODE_NUMERIC and slot_match in {"metric_or_result_only", "weak_anchor"} and numeric_hits:
+        return "numeric_reference_only"
+    if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and slot_match == "time_scope_only" and date_hits:
+        return "date_reference_only"
+    if mode == EVIDENCE_MODE_ROUTE and route_analysis and not route_analysis.get("directly_answers_route") and route_analysis.get("has_relation_marker"):
+        return "route_relation_indirect"
+    if directness == SENTENCE_DIRECTNESS_RELATED_ONLY and slot_match == "weak_anchor":
+        return "weak_anchor_only"
+    if sentence_has_commentary:
+        return "commentary_only"
+    return ""
+
+
+def infer_sentence_candidate_profile(
+    mode: str,
+    *,
+    slot_match: str,
+    gap_reason: str,
+    directness: str,
+    utility_label: str,
+    numeric_hits: List[Any],
+    date_hits: List[Any],
+    route_analysis: Optional[Dict[str, Any]] = None,
+) -> str:
+    if gap_reason == "commentary_only":
+        return "background_commentary"
+    if mode == EVIDENCE_MODE_NUMERIC and gap_reason == "numeric_reference_only":
+        return "numeric_reference_only"
+    if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and gap_reason == "date_reference_only":
+        return "date_reference_only"
+    if directness == SENTENCE_DIRECTNESS_DIRECT and slot_match == "subject+time+metric_or_result" and not gap_reason:
+        return "direct_candidate"
+    if directness == SENTENCE_DIRECTNESS_DIRECT and slot_match in {"subject+metric_or_result", "time+metric_or_result"} and not gap_reason:
+        return "direct_candidate"
+    if slot_match in {"subject+time+metric_or_result", "subject+metric_or_result", "time+metric_or_result", "subject+time"}:
+        return "slot_hit_but_indirect"
+    if mode == EVIDENCE_MODE_NUMERIC and numeric_hits:
+        return "numeric_reference_only"
+    if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and date_hits:
+        return "date_reference_only"
+    if mode == EVIDENCE_MODE_ROUTE and route_analysis and route_analysis.get("has_relation_marker"):
+        return "slot_hit_but_indirect"
+    if utility_label in {"background", "noise"}:
+        return "background_commentary"
+    return "slot_hit_but_indirect"
 
 
 def merge_route_analysis(
@@ -1800,6 +2024,14 @@ def point_conversion_diagnostics(summary: Dict[str, Any], coverage: Dict[str, An
         point for point in uncertain_points
         if str(point.get("direct_answer") or "") == "direct"
     ]
+    sentence_candidate_profile: Dict[str, int] = {}
+    for candidate in sentence_candidates:
+        profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
+        if profile:
+            sentence_candidate_profile[profile] = int(sentence_candidate_profile.get(profile, 0) or 0) + 1
+    top_candidate = sentence_candidates[0] if sentence_candidates else {}
+    top_candidate_slot_match = normalize_text(str(top_candidate.get("candidate_slot_match") or ""))
+    direct_candidate_gap_reason = normalize_text(str(top_candidate.get("direct_candidate_gap_reason") or ""))
     stage = POINT_STAGE_CONVERTED
     reason = "已有 supporting/refuting points"
     if not sentence_candidates:
@@ -1848,6 +2080,9 @@ def point_conversion_diagnostics(summary: Dict[str, Any], coverage: Dict[str, An
             route_direct_uncertain_slot_diagnostics(direct_uncertain_points).get("status_counts") or {}
             if mode == EVIDENCE_MODE_ROUTE else {}
         ),
+        "sentence_candidate_profile": sentence_candidate_profile,
+        "top_candidate_slot_match": top_candidate_slot_match,
+        "direct_candidate_gap_reason": direct_candidate_gap_reason,
         "stage": stage,
         "reason": reason,
     }
@@ -1929,6 +2164,59 @@ def infer_point_conversion_block_reason(summary: Dict[str, Any], point_conversio
         candidate for candidate in (summary.get("evidence_sentence_candidates") or [])
         if isinstance(candidate, dict)
     ]
+    sentence_candidate_profiles = {
+        normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
+        for candidate in sentence_candidates
+        if normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
+    }
+    top_gap_reason = normalize_text(
+        str(
+            (
+                point_conversion.get("direct_candidate_gap_reason")
+                if isinstance(point_conversion, dict) else ""
+            )
+            or (
+                sentence_candidates[0].get("direct_candidate_gap_reason")
+                if sentence_candidates and isinstance(sentence_candidates[0], dict) else ""
+            )
+            or ""
+        )
+    )
+    claim_needs_open = bool(
+        re.search(
+            r"(开盘|开市|opening|opened)",
+            " ".join(
+                normalize_text(str(part or ""))
+                for part in [
+                    summary.get("claim") or "",
+                    evidence_need_program.get("normalized_assertion") if isinstance(evidence_need_program, dict) else "",
+                    direct_need.get("must_answer") if isinstance(direct_need, dict) else "",
+                ]
+                if normalize_text(str(part or ""))
+            ),
+            flags=re.I,
+        )
+    )
+    if claim_needs_open and sentence_candidates:
+        candidate_text = " ".join(normalize_text(str(candidate.get("sentence") or "")) for candidate in sentence_candidates)
+        has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", candidate_text, flags=re.I))
+        has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", candidate_text, flags=re.I))
+        has_close = bool(re.search(r"(收盘|尾盘|close|closed)", candidate_text, flags=re.I))
+        if (has_intraday or has_close) and not has_open:
+            return "not_same_fact_slot"
+    if top_gap_reason in {"opening_slot_mismatch", "route_relation_indirect"}:
+        return "not_same_fact_slot"
+    if top_gap_reason == "date_role_mismatch":
+        return "date_role_mismatch"
+    if top_gap_reason == "result_granularity_mismatch":
+        return "result_granularity_mismatch"
+    rescued_sentence_candidates = [
+        candidate for candidate in sentence_candidates
+        if "deterministic_candidate_rescue" in {
+            normalize_text(str(reason or "")).lower()
+            for reason in (candidate.get("reasons") or [])
+        }
+    ]
     all_points = [
         point for bucket in ("supporting_points", "refuting_points", "uncertain_points")
         for point in (summary.get(bucket) or [])
@@ -1995,6 +2283,12 @@ def infer_point_conversion_block_reason(summary: Dict[str, Any], point_conversio
     if "time" in anchor_buckets and mode in {"date_fact", "schedule_fact"} and stage in {POINT_STAGE_RELATED_ONLY, POINT_STAGE_NO_DIRECT}:
         return "date_role_mismatch"
     if stage in {POINT_STAGE_RELATED_ONLY, POINT_STAGE_NO_DIRECT, POINT_STAGE_NO_CANDIDATE, POINT_STAGE_POINT_NOT_DIRECT}:
+        if top_gap_reason in {"numeric_reference_only", "date_reference_only", "commentary_only", "weak_anchor_only"}:
+            return "candidate_not_direct"
+        if "slot_hit_but_indirect" in sentence_candidate_profiles or "direct_candidate" in sentence_candidate_profiles:
+            return "candidate_not_direct"
+        if rescued_sentence_candidates or sentence_candidates:
+            return "candidate_not_direct"
         return "related_but_not_assertive"
     if sentence_candidates:
         return "candidate_not_direct"
@@ -2683,7 +2977,7 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
                 point["numeric_contract_note"] = "structured_point_not_comparable"
                 uncertain_points.append(point)
                 continue
-            exact_match = numeric_equal(structured_value, claim_value)
+            exact_match = numeric_match_for_claim(claim, structured_value, claim_value)
             point["type"] = "numeric_match" if exact_match else "numeric_mismatch"
             if exact_match:
                 supporting_points.append(point)
@@ -2726,7 +3020,7 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
                 )
             )
             continue
-        exact_match = any(numeric_equal(value, claim_value) for value, _unit in same_unit_values)
+        exact_match = any(numeric_match_for_claim(claim, value, claim_value) for value, _unit in same_unit_values)
         point = apply_candidate_features_to_point(point_with_source(
             item,
             {

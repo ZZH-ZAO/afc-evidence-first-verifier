@@ -291,32 +291,70 @@ def merge_fetch_trace(trace: Optional[Dict[str, Any]], **kwargs: Any) -> None:
             trace[key] = value
 
 
-def apply_detail_fetch_trace(stats: Dict[str, Any], item: Dict[str, Any], trace: Optional[Dict[str, Any]]) -> None:
+def increment_named_counter(bucket: Dict[str, Any], field: str, key: str) -> None:
+    if not key:
+        return
+    counters = bucket.setdefault(field, {})
+    counters[key] = int(counters.get(key, 0) or 0) + 1
+
+
+def apply_detail_fetch_trace(
+    stats: Dict[str, Any],
+    item: Dict[str, Any],
+    trace: Optional[Dict[str, Any]],
+    source_name: str = "",
+) -> None:
     if not isinstance(trace, dict) or not trace:
         return
+    bucket = source_pollution_bucket(stats, source_name) if source_name else {}
     if trace.get("playwright_used"):
         stats["playwright_used"] = int(stats.get("playwright_used", 0) or 0) + 1
+        if bucket:
+            bucket["playwright_used"] = int(bucket.get("playwright_used", 0) or 0) + 1
     if trace.get("playwright_rescued"):
         stats["playwright_rescued"] = int(stats.get("playwright_rescued", 0) or 0) + 1
         item["playwright_rescued"] = True
+        if bucket:
+            bucket["playwright_rescued"] = int(bucket.get("playwright_rescued", 0) or 0) + 1
     if trace.get("environment_block_reason"):
         item["environment_block_reason"] = str(trace.get("environment_block_reason") or "")
+        increment_named_counter(stats, "environment_block_reasons", str(trace.get("environment_block_reason") or ""))
+        if bucket:
+            increment_named_counter(bucket, "environment_block_reasons", str(trace.get("environment_block_reason") or ""))
     if trace.get("detail_fetch_path"):
-        item["detail_fetch_path"] = str(trace.get("detail_fetch_path") or "")
+        detail_fetch_path = str(trace.get("detail_fetch_path") or "")
+        item["detail_fetch_path"] = detail_fetch_path
+        increment_named_counter(stats, "detail_fetch_paths", detail_fetch_path)
+        if bucket:
+            increment_named_counter(bucket, "detail_fetch_paths", detail_fetch_path)
+            if "playwright_failed" in detail_fetch_path:
+                bucket["playwright_failed"] = int(bucket.get("playwright_failed", 0) or 0) + 1
     if trace.get("playwright_block_reasons"):
         item["playwright_block_reasons"] = [str(value) for value in trace.get("playwright_block_reasons", []) if str(value)][:6]
     if trace.get("request_block_reasons"):
         item["request_block_reasons"] = [str(value) for value in trace.get("request_block_reasons", []) if str(value)][:6]
+    if trace.get("playwright_used"):
+        item["playwright_used"] = True
 
 
-def record_detail_fetch_failure(stats: Dict[str, Any], item: Dict[str, Any], exc: Exception) -> None:
+def record_detail_fetch_failure(
+    stats: Dict[str, Any],
+    item: Dict[str, Any],
+    exc: Exception,
+    source_name: str = "",
+) -> None:
     stats["detail_errors"] = int(stats.get("detail_errors", 0) or 0) + 1
     stats["detail_read_failed"] = int(stats.get("detail_read_failed", 0) or 0) + 1
     item["detail_error"] = str(exc)
     item["detail_read_failed"] = True
+    if source_name:
+        bucket = source_pollution_bucket(stats, source_name)
+        bucket["detail_read_failed"] = int(bucket.get("detail_read_failed", 0) or 0) + 1
     if exception_looks_like_anti_bot(exc):
         item["detail_error_type"] = "anti_bot_blocked"
-        item["environment_block_reason"] = "detail_access_blocked"
+        current_reason = str(item.get("environment_block_reason") or "")
+        if not current_reason:
+            item["environment_block_reason"] = "requests_blocked_playwright_failed"
         stats["detail_anti_bot_errors"] = int(stats.get("detail_anti_bot_errors", 0) or 0) + 1
     else:
         item["detail_error_type"] = "fetch_error"
@@ -512,6 +550,8 @@ def retrieval_responsibility_boundary(
     strong_items: List[Dict[str, Any]],
     direct_items: List[Dict[str, Any]],
     source_recall_diagnosis: Dict[str, Any],
+    readiness_promotion_used: int = 0,
+    answer_candidate_total: int = 0,
 ) -> Dict[str, Any]:
     barrier_stage = str(source_recall_diagnosis.get("barrier_stage") or "")
     barrier_reason = str(source_recall_diagnosis.get("barrier_reason") or "")
@@ -529,6 +569,14 @@ def retrieval_responsibility_boundary(
         responsibility_layer = "retrieval_filter"
         stop_stage = "all_results_filtered"
         reason = "已有原始结果，但页面保留阶段没有留下可用网页"
+    elif readiness_promotion_used > 0:
+        responsibility_layer = "retrieval_readiness"
+        stop_stage = "candidate_promoted_from_filter" if answer_candidate_total > 0 else "page_promoted_but_sentence_weak"
+        reason = "已经从差一点被过滤掉的页面里保住了相关材料，但句层仍未形成稳定可直裁的证据"
+    elif answer_candidate_total > 0 and (not strong_items or not direct_items):
+        responsibility_layer = "retrieval_readiness"
+        stop_stage = "weak_source_candidate_only" if not strong_items else "candidate_not_direct"
+        reason = "页面里已经抽到候选句，但这些句子还不够稳定或不够直接，尚未形成可直裁证据"
     elif not strong_items:
         responsibility_layer = "retrieval_filter"
         if high_priority_empty and fallback_only_raw:
@@ -2264,6 +2312,7 @@ def page_shape_llm_bridge_candidate(
 
 QUERY_ORIGIN_BASE_PRIORITY = {
     "planner": 100,
+    "fact_slot_query": 98,
     "preferred_domain_probe": 92,
     "semantic_task_probe": 91,
     "structured_point_retry": 90,
@@ -2370,7 +2419,7 @@ def normalize_query_items(raw_queries: List[Any]) -> List[Dict[str, Any]]:
                 source_preference = [normalize_text(str(item)) for item in raw_preference if normalize_text(str(item))][:3]
                 if source_preference:
                     query_item["source_preference"] = source_preference
-                for extra_key in ("operator", "variant", "gap_flag"):
+                for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
                     extra_value = normalize_text(str(raw_query.get(extra_key) or ""))
                     if extra_value:
                         query_item[extra_key] = extra_value
@@ -3642,13 +3691,184 @@ def query_texts_from_plan(question: str, claim: str, time_value: str, claim_item
         source_preference = [normalize_text(str(value)) for value in raw_preference if normalize_text(str(value))][:3]
         if source_preference:
             query_item["source_preference"] = source_preference
-        for extra_key in ("operator", "variant", "gap_flag"):
+        for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
             extra_value = normalize_text(str(item.get(extra_key) or ""))
             if extra_value:
                 query_item[extra_key] = extra_value
         deduped.append(query_item)
     limit = max(1, MAX_QUERIES_PER_CLAIM)
     return apply_query_plan_policy(deduped, limit, source_intent, task_card, evidence_mode)
+
+
+CORE_FACT_QUERY_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
+
+
+def query_variant_origin_value(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return (
+        normalize_text(str(item.get("query_variant_origin") or ""))
+        or normalize_text(str(item.get("origin") or ""))
+        or "planner"
+    )
+
+
+def query_variant_origin_rows(query_plan: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for item in query_plan or []:
+        if not isinstance(item, dict):
+            continue
+        query_text = normalize_text(str(item.get("q") or ""))
+        if not query_text:
+            continue
+        rows.append(
+            {
+                "q": query_text,
+                "origin": normalize_text(str(item.get("origin") or "")) or "planner",
+                "query_variant_origin": query_variant_origin_value(item),
+            }
+        )
+    return rows[:8]
+
+
+def core_fact_claim_for_recall_probe(claim_item: Dict[str, Any], evidence_mode: str) -> bool:
+    if not isinstance(claim_item, dict):
+        return False
+    if str(claim_item.get("centrality") or "") != "core":
+        return False
+    source_intent = claim_item.get("source_intent") if isinstance(claim_item.get("source_intent"), dict) else {}
+    if str(source_intent.get("claim_shape") or "") == "exclusive_premise":
+        return False
+    return evidence_mode in CORE_FACT_QUERY_MODES
+
+
+def recall_probe_goal_for_mode(evidence_mode: str) -> str:
+    if evidence_mode == "numeric_fact":
+        return "verify_numeric_detail"
+    if evidence_mode in {"date_fact", "schedule_fact"}:
+        return "verify_date_detail"
+    if evidence_mode == "event_result":
+        return "find_result"
+    return "general_verify"
+
+
+def build_fact_slot_probe_query_text(claim_item: Dict[str, Any], claim: str, evidence_mode: str) -> str:
+    program = claim_program_from_claim_item(claim_item)
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    subject = normalize_text(str(decision_slots.get("subject") or ""))
+    time_scope = normalize_text(str(decision_slots.get("time_scope") or ""))
+    metric = normalize_text(str(decision_slots.get("metric_or_relation") or ""))
+    status_or_result = normalize_text(str(decision_slots.get("status_or_result") or ""))
+    must_include = [
+        normalize_text(str(term))
+        for term in (direct_need.get("must_include") or [])[:4]
+        if normalize_text(str(term))
+    ]
+    opening_required = bool(
+        re.search(
+            r"(开盘|开市|opening|opened)",
+            " ".join([claim, subject, metric, status_or_result, str(direct_need.get("must_answer") or "")]),
+            flags=re.I,
+        )
+    )
+    terms = dedupe_keep_order(
+        [
+            time_scope,
+            subject,
+            "开盘" if opening_required else "",
+            "开市" if opening_required else "",
+            "opening" if opening_required else "",
+            "opened" if opening_required else "",
+            metric,
+            status_or_result,
+        ] + must_include[:2]
+    )
+    query_text = compact_text_for_query(" ".join(term for term in terms if term), 96)
+    if query_text:
+        return query_text
+    return compact_text_for_query(
+        normalize_text(str(program.get("normalized_assertion") or claim)),
+        96,
+    )
+
+
+def first_query_site_constraint(query_plan: List[Dict[str, Any]]) -> str:
+    for item in query_plan or []:
+        if not isinstance(item, dict):
+            continue
+        site = normalize_domain(extract_site_constraint(str(item.get("q") or "")))
+        if site:
+            return site
+    return ""
+
+
+def build_recall_probe_query_item(
+    claim_item: Dict[str, Any],
+    claim: str,
+    source_intent: Dict[str, Any],
+    query_plan: List[Dict[str, Any]],
+    evidence_mode: str,
+) -> Optional[Dict[str, Any]]:
+    if not core_fact_claim_for_recall_probe(claim_item, evidence_mode):
+        return None
+    fact_slot_item = next(
+        (
+            item for item in query_plan
+            if isinstance(item, dict) and query_variant_origin_value(item).startswith("fact_slot_query")
+        ),
+        None,
+    )
+    probe_query = normalize_text(str((fact_slot_item or {}).get("q") or "")) or build_fact_slot_probe_query_text(claim_item, claim, evidence_mode)
+    if not probe_query:
+        return None
+    site_constraint = (
+        normalize_domain(extract_site_constraint(probe_query))
+        or first_query_site_constraint(query_plan)
+    )
+    preferred_domains = preferred_domains_from_intent(source_intent)
+    if not site_constraint and preferred_domains:
+        site_constraint = normalize_domain(preferred_domains[0])
+    if site_constraint and not extract_site_constraint(probe_query):
+        probe_query = f"site:{site_constraint} {probe_query}"
+    source_preference = ["news", "html"] if evidence_mode == "event_result" else ["html", "news"]
+    return {
+        "q": probe_query,
+        "goal": normalize_text(str((fact_slot_item or {}).get("goal") or recall_probe_goal_for_mode(evidence_mode))) or "general_verify",
+        "origin": "fact_slot_recall_probe",
+        "query_variant_origin": "fact_slot_query_probe",
+        "source_preference": source_preference,
+        "probe_only_if_raw_zero": True,
+    }
+
+
+def restrict_recall_probe_source_jobs(source_jobs: List[Tuple[str, str]], evidence_mode: str) -> List[Tuple[str, str]]:
+    if evidence_mode == "event_result":
+        preferred_families = ["news_rss", "html"]
+    else:
+        preferred_families = ["html", "news_rss"]
+    selected: List[Tuple[str, str]] = []
+    seen = set()
+    for family in preferred_families:
+        for source_name, source_query in source_jobs:
+            if source_name in seen:
+                continue
+            if source_family_name(source_name) != family:
+                continue
+            selected.append((source_name, source_query))
+            seen.add(source_name)
+            if len(selected) >= 3:
+                return selected
+    for source_name, source_query in source_jobs:
+        if source_name in seen:
+            continue
+        if source_family_name(source_name) not in {"html", "news_rss"}:
+            continue
+        selected.append((source_name, source_query))
+        seen.add(source_name)
+        if len(selected) >= 3:
+            break
+    return selected or source_jobs[:2]
 
 
 def verification_query_items(claim_item: Dict[str, Any], claim: str, source_intent: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -4453,6 +4673,7 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
                 merge_fetch_trace(
                     trace,
                     playwright_rescued=False,
+                    environment_block_reason="requests_blocked_playwright_failed",
                     detail_fetch_path="requests_blocked_playwright_failed",
                     playwright_block_reasons=[str(fallback_exc)],
                 )
@@ -4463,6 +4684,7 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
                 merge_fetch_trace(
                     trace,
                     playwright_rescued=True,
+                    environment_block_reason="requests_blocked_playwright_rescued",
                     detail_fetch_path="requests_blocked_playwright_rescued",
                 )
                 return result
@@ -4491,7 +4713,40 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
         cache_set("page", result, url, max_chars)
         return result
     text = decode_response_text(response)
-    ensure_response_not_blocked(response, request_url=url, source_name="fetch_page_text", decoded_text=text)
+    try:
+        ensure_response_not_blocked(response, request_url=url, source_name="fetch_page_text", decoded_text=text)
+    except Exception as exc:
+        if exception_looks_like_anti_bot(exc):
+            merge_fetch_trace(
+                trace,
+                anti_bot_blocked=True,
+                playwright_used=True,
+                environment_block_reason="detail_access_blocked",
+                detail_fetch_path="requests_blocked_after_fetch",
+                request_block_reasons=[str(exc)],
+            )
+            try:
+                fallback_text = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=False)
+            except Exception as fallback_exc:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescued=False,
+                    environment_block_reason="requests_blocked_playwright_failed",
+                    detail_fetch_path="requests_blocked_playwright_failed",
+                    playwright_block_reasons=[str(fallback_exc)],
+                )
+                raise fallback_exc
+            if fallback_text:
+                result = fallback_text[:max_chars]
+                cache_set("page", result, url, max_chars)
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescued=True,
+                    environment_block_reason="requests_blocked_playwright_rescued",
+                    detail_fetch_path="requests_blocked_playwright_rescued",
+                )
+                return result
+        raise
     text = re.sub(r"<script.*?</script>", " ", text, flags=re.S)
     text = re.sub(r"<style.*?</style>", " ", text, flags=re.S)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -4529,6 +4784,7 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
                 merge_fetch_trace(
                     trace,
                     playwright_rescued=False,
+                    environment_block_reason="requests_blocked_playwright_failed",
                     detail_fetch_path="requests_html_blocked_playwright_failed",
                     playwright_block_reasons=[str(fallback_exc)],
                 )
@@ -4538,6 +4794,7 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
                 merge_fetch_trace(
                     trace,
                     playwright_rescued=True,
+                    environment_block_reason="requests_blocked_playwright_rescued",
                     detail_fetch_path="requests_html_blocked_playwright_rescued",
                 )
                 return fallback_html
@@ -4551,10 +4808,128 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
     ):
         response.encoding = apparent_encoding
     html = decode_response_text(response) or ""
-    ensure_response_not_blocked(response, request_url=url, source_name="fetch_page_html", decoded_text=html)
+    try:
+        ensure_response_not_blocked(response, request_url=url, source_name="fetch_page_html", decoded_text=html)
+    except Exception as exc:
+        if exception_looks_like_anti_bot(exc):
+            merge_fetch_trace(
+                trace,
+                anti_bot_blocked=True,
+                playwright_used=True,
+                environment_block_reason="detail_access_blocked",
+                detail_fetch_path="requests_html_blocked_after_fetch",
+                request_block_reasons=[str(exc)],
+            )
+            try:
+                fallback_html = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=True)
+            except Exception as fallback_exc:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescued=False,
+                    environment_block_reason="requests_blocked_playwright_failed",
+                    detail_fetch_path="requests_html_blocked_playwright_failed",
+                    playwright_block_reasons=[str(fallback_exc)],
+                )
+                raise fallback_exc
+            if fallback_html:
+                cache_set("page_html", fallback_html, url, 0)
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescued=True,
+                    environment_block_reason="requests_blocked_playwright_rescued",
+                    detail_fetch_path="requests_html_blocked_playwright_rescued",
+                )
+                return fallback_html
+        raise
     cache_set("page_html", html, url, 0)
     merge_fetch_trace(trace, detail_fetch_path="requests_html_ok")
     return html
+
+
+def external_access_rescue_smoke(
+    url: str,
+    fetch_kind: str = "text",
+    timeout_sec: int = 10,
+    max_chars: int = 1200,
+) -> Dict[str, Any]:
+    trace: Dict[str, Any] = {}
+    preview = ""
+    error = ""
+    try:
+        if fetch_kind == "html":
+            content = fetch_page_html(url, timeout_sec=timeout_sec, trace=trace)
+        else:
+            content = fetch_page_text(url, max_chars=max_chars, timeout_sec=timeout_sec, trace=trace)
+        preview = normalize_text(str(content or ""))[:180]
+    except Exception as exc:
+        error = str(exc)
+    return {
+        "url": url,
+        "fetch_kind": fetch_kind,
+        "ok": not error,
+        "preview": preview,
+        "error": error[:240],
+        "playwright_rescued": bool(trace.get("playwright_rescued")),
+        "playwright_used": bool(trace.get("playwright_used")),
+        "environment_block_reason": str(trace.get("environment_block_reason") or ""),
+        "detail_fetch_path": str(trace.get("detail_fetch_path") or ""),
+        "request_block_reasons": [str(value) for value in (trace.get("request_block_reasons") or []) if str(value)][:6],
+        "playwright_block_reasons": [str(value) for value in (trace.get("playwright_block_reasons") or []) if str(value)][:6],
+    }
+
+
+def batch_external_access_rescue_smoke(
+    urls: List[str],
+    fetch_kind: str = "text",
+    timeout_sec: int = 10,
+    max_chars: int = 1200,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        normalized = normalize_text(str(url or ""))
+        if not normalized:
+            continue
+        results.append(
+            external_access_rescue_smoke(
+                normalized,
+                fetch_kind=fetch_kind,
+                timeout_sec=timeout_sec,
+                max_chars=max_chars,
+            )
+        )
+    return results
+
+
+def evaluate_external_access_rescue_expectations(
+    smoke_input: Dict[str, Any],
+    timeout_sec: int = 10,
+    max_chars: int = 1200,
+) -> Dict[str, Any]:
+    success_urls = [normalize_text(str(url)) for url in (smoke_input.get("rescue_expected_success") or []) if normalize_text(str(url))]
+    fail_urls = [normalize_text(str(url)) for url in (smoke_input.get("rescue_expected_fail") or []) if normalize_text(str(url))]
+    success_results = batch_external_access_rescue_smoke(success_urls, fetch_kind="text", timeout_sec=timeout_sec, max_chars=max_chars)
+    fail_results = batch_external_access_rescue_smoke(fail_urls, fetch_kind="text", timeout_sec=timeout_sec, max_chars=max_chars)
+    success_pass = [
+        item for item in success_results
+        if item.get("playwright_rescued") and item.get("preview")
+    ]
+    fail_pass = [
+        item for item in fail_results
+        if (not item.get("playwright_rescued")) and str(item.get("environment_block_reason") or "") in {
+            "requests_blocked_playwright_failed",
+            "source_access_blocked_without_rescue",
+            "detail_read_failed_after_fetch",
+        }
+    ]
+    return {
+        "rescue_expected_success": success_results,
+        "rescue_expected_fail": fail_results,
+        "success_pass_count": len(success_pass),
+        "fail_pass_count": len(fail_pass),
+        "success_total": len(success_results),
+        "fail_total": len(fail_results),
+        "all_passed": len(success_pass) == len(success_results) and len(fail_pass) == len(fail_results),
+    }
 
 
 def choose_sources(claim: str, question: str, time_value: str) -> List[str]:
@@ -5706,6 +6081,108 @@ def query_numeric_markers(query: str) -> List[str]:
     return extract_numeric_markers(query)[:6]
 
 
+def candidate_slot_match_from_scored(query: str, sentence: str, scored: Dict[str, Any], evidence_mode: str = "") -> str:
+    token_hits = bool(scored.get("token_hits"))
+    numeric_hits = bool(scored.get("numeric_hits"))
+    time_hits = bool(scored.get("time_hits"))
+    route_hits = bool(scored.get("route_hits"))
+    status_hit = bool(scored.get("answer_markers")) or bool(
+        re.search(
+            r"(战胜|击败|获胜|赢|比分|赛果|结果|发布|公布|宣布|生效|实施|休市|开盘|won|beat|result|score|announced|released|effective|open|closed)",
+            sentence,
+            flags=re.I,
+        )
+    )
+    if evidence_mode == "route_fact" or route_hits:
+        if token_hits and route_hits:
+            return "subject+metric_or_result"
+        if route_hits:
+            return "metric_or_result_only"
+    if token_hits and time_hits and (numeric_hits or status_hit):
+        return "subject+time+metric_or_result"
+    if token_hits and (numeric_hits or status_hit):
+        return "subject+metric_or_result"
+    if time_hits and (numeric_hits or status_hit):
+        return "time+metric_or_result"
+    if token_hits and time_hits:
+        return "subject+time"
+    if numeric_hits or status_hit:
+        return "metric_or_result_only"
+    if time_hits:
+        return "time_scope_only"
+    return "weak_anchor"
+
+
+def candidate_gap_reason_from_scored(
+    query: str,
+    sentence: str,
+    scored: Dict[str, Any],
+    slot_match: str,
+    evidence_mode: str = "",
+) -> str:
+    query_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", query, flags=re.I))
+    sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", sentence, flags=re.I))
+    sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))
+    sentence_has_close = bool(re.search(r"(收盘|尾盘|close|closed)", sentence, flags=re.I))
+    sentence_has_commentary = bool(re.search(r"(代表|意味着|反映|说明|主要因为|reflects|means|suggests|because)", sentence, flags=re.I))
+    if query_needs_open and (sentence_has_intraday or sentence_has_close) and not sentence_has_open:
+        return "opening_slot_mismatch"
+    if evidence_mode in {"date_fact", "schedule_fact"}:
+        query_publish = bool(re.search(r"(发布|公布|宣布|announced|released)", query, flags=re.I))
+        query_effective = bool(re.search(r"(生效|实施|effective|in force)", query, flags=re.I))
+        sentence_publish = bool(re.search(r"(发布|公布|宣布|announced|released)", sentence, flags=re.I))
+        sentence_effective = bool(re.search(r"(生效|实施|effective|in force)", sentence, flags=re.I))
+        if (query_publish and sentence_effective and not sentence_publish) or (query_effective and sentence_publish and not sentence_effective):
+            return "date_role_mismatch"
+    if evidence_mode == "event_result":
+        query_needs_final = bool(re.search(r"(比分|赛果|结果|获胜|winner|won|beat|result|score)", query, flags=re.I))
+        sentence_partial = bool(re.search(r"(首节|次节|半场|加时|单盘|盘点|quarter|period|half|set|inning)", sentence, flags=re.I))
+        if query_needs_final and sentence_partial:
+            return "result_granularity_mismatch"
+    if sentence_has_commentary and slot_match in {"weak_anchor", "time_scope_only"}:
+        return "commentary_only"
+    if evidence_mode == "numeric_fact" and slot_match in {"metric_or_result_only", "weak_anchor"} and scored.get("numeric_hits"):
+        return "numeric_reference_only"
+    if evidence_mode in {"date_fact", "schedule_fact"} and slot_match == "time_scope_only" and scored.get("time_hits"):
+        return "date_reference_only"
+    if sentence_has_commentary:
+        return "commentary_only"
+    return ""
+
+
+def candidate_profile_from_scored(
+    query: str,
+    sentence: str,
+    scored: Dict[str, Any],
+    slot_match: str,
+    gap_reason: str,
+    evidence_mode: str = "",
+) -> str:
+    score = int(scored.get("score") or 0)
+    token_hits = bool(scored.get("token_hits"))
+    numeric_hits = bool(scored.get("numeric_hits"))
+    time_hits = bool(scored.get("time_hits"))
+    route_hits = bool(scored.get("route_hits"))
+    answer_hits = bool(scored.get("answer_markers"))
+    if gap_reason == "commentary_only":
+        return "background_commentary"
+    if evidence_mode == "numeric_fact" and gap_reason == "numeric_reference_only":
+        return "numeric_reference_only"
+    if evidence_mode in {"date_fact", "schedule_fact"} and gap_reason == "date_reference_only":
+        return "date_reference_only"
+    if slot_match == "subject+time+metric_or_result" and score >= 12 and (numeric_hits or answer_hits or route_hits):
+        return "direct_candidate"
+    if slot_match in {"subject+time+metric_or_result", "subject+metric_or_result", "time+metric_or_result", "subject+time"}:
+        return "slot_hit_but_indirect"
+    if evidence_mode == "numeric_fact" and numeric_hits:
+        return "numeric_reference_only"
+    if evidence_mode in {"date_fact", "schedule_fact"} and time_hits:
+        return "date_reference_only"
+    if token_hits or answer_hits or route_hits:
+        return "slot_hit_but_indirect"
+    return "background_commentary"
+
+
 def answer_candidate_sentence_score(query: str, sentence: str, field: str) -> Dict[str, Any]:
     generic = {
         "赛果", "比分", "结果", "比赛", "今日", "今天", "小组赛", "实际", "最终",
@@ -5742,6 +6219,24 @@ def answer_candidate_sentence_score(query: str, sentence: str, field: str) -> Di
         score += min(6, len(answer_markers))
         reasons.append("answer_marker")
 
+    query_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", query, flags=re.I))
+    sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", sentence, flags=re.I))
+    sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))
+    sentence_has_close = bool(re.search(r"(收盘|尾盘|close|closed)", sentence, flags=re.I))
+    sentence_has_commentary = bool(re.search(r"(代表|意味着|反映|说明|主要因为|reflects|means|suggests|because)", sentence, flags=re.I))
+    if query_needs_open and sentence_has_open:
+        score += 7
+        reasons.append("opening_fact_slot_hit")
+    if query_needs_open and sentence_has_intraday and not sentence_has_open:
+        score -= 7
+        reasons.append("intraday_not_opening_slot")
+    if query_needs_open and sentence_has_close and not sentence_has_open:
+        score -= 6
+        reasons.append("closing_not_opening_slot")
+    if query_needs_open and sentence_has_commentary:
+        score -= 4
+        reasons.append("commentary_not_opening_quote")
+
     if field == "title":
         score += 3
         reasons.append("title_bonus")
@@ -5762,11 +6257,12 @@ def answer_candidate_sentence_score(query: str, sentence: str, field: str) -> Di
         "numeric_hits": numeric_hits[:4],
         "time_hits": time_hits[:4],
         "route_hits": route_hits[:4],
+        "answer_markers": answer_markers[:4],
         "reasons": reasons,
     }
 
 
-def answer_candidate_sentences(query: str, item: Dict[str, Any], max_items: int = 3) -> List[Dict[str, Any]]:
+def answer_candidate_sentences(query: str, item: Dict[str, Any], max_items: int = 3, evidence_mode: str = "") -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     seen = set()
     for unit in evidence_sentence_units(item):
@@ -5781,6 +6277,9 @@ def answer_candidate_sentences(query: str, item: Dict[str, Any], max_items: int 
             continue
         if not scored.get("token_hits") and not scored.get("numeric_hits") and not scored.get("route_hits"):
             continue
+        slot_match = candidate_slot_match_from_scored(query, sentence, scored, evidence_mode)
+        gap_reason = candidate_gap_reason_from_scored(query, sentence, scored, slot_match, evidence_mode)
+        profile = candidate_profile_from_scored(query, sentence, scored, slot_match, gap_reason, evidence_mode)
         candidates.append(
             {
                 "sentence": sentence[:260],
@@ -5791,11 +6290,22 @@ def answer_candidate_sentences(query: str, item: Dict[str, Any], max_items: int 
                 "time_hits": list(scored.get("time_hits") or [])[:4],
                 "route_hits": list(scored.get("route_hits") or [])[:4],
                 "reasons": list(scored.get("reasons") or [])[:6],
+                "sentence_candidate_profile": profile,
+                "candidate_slot_match": slot_match,
+                "direct_candidate_gap_reason": gap_reason,
             }
         )
     route_directed = query_looks_route_directed(query)
+    profile_rank = {
+        "direct_candidate": 4,
+        "slot_hit_but_indirect": 3,
+        "numeric_reference_only": 2,
+        "date_reference_only": 2,
+        "background_commentary": 1,
+    }
     candidates.sort(
         key=lambda row: (
+            profile_rank.get(str(row.get("sentence_candidate_profile") or ""), 0),
             route_directed and bool(row.get("route_hits")),
             route_directed and row.get("field") == "detail",
             route_directed and row.get("field") == "snippet",
@@ -5807,6 +6317,133 @@ def answer_candidate_sentences(query: str, item: Dict[str, Any], max_items: int 
         reverse=True,
     )
     return candidates[:max_items]
+
+
+def claim_program_query(claim_item: Optional[Dict[str, Any]], fallback_query: str = "") -> str:
+    if not isinstance(claim_item, dict):
+        return fallback_query
+    program = claim_program_from_claim_item(claim_item)
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    parts = [
+        str(program.get("normalized_assertion") or ""),
+        str(direct_need.get("must_answer") or ""),
+        str(claim_item.get("claim") or ""),
+        str(decision_slots.get("subject") or ""),
+        str(decision_slots.get("object") or ""),
+        str(decision_slots.get("time_scope") or ""),
+        str(decision_slots.get("metric_or_relation") or ""),
+        str(decision_slots.get("status_or_result") or ""),
+    ]
+    compact = normalize_text(" ".join(part for part in parts if normalize_text(part)))
+    return compact or fallback_query
+
+
+def direct_result_markers() -> List[str]:
+    return [
+        "战胜", "击败", "赢", "获胜", "比分", "赛果", "结果",
+        "won", "beat", "defeated", "result", "score", "winner",
+        "休市", "开盘", "生效", "发布", "公布", "取消",
+        "open", "closed", "effective", "announced", "released",
+    ]
+
+
+def deterministic_candidate_rescue(
+    claim_item: Dict[str, Any],
+    item: Dict[str, Any],
+    evidence_mode: str,
+    fallback_query: str,
+) -> Dict[str, Any]:
+    if str(evidence_mode or "") not in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}:
+        return {}
+    program_query = claim_program_query(claim_item, fallback_query)
+    if not program_query:
+        return {}
+    best: Dict[str, Any] = {}
+    markers = direct_result_markers()
+    claim_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", program_query, flags=re.I))
+    for unit in evidence_sentence_units(item):
+        sentence = str(unit.get("sentence") or "")
+        field = str(unit.get("field") or "")
+        if not sentence:
+            continue
+        scored = answer_candidate_sentence_score(program_query, sentence, field)
+        lower = sentence.lower()
+        has_number = bool(re.search(r"\d", sentence))
+        has_time = bool(scored.get("time_hits"))
+        has_numeric = bool(scored.get("numeric_hits"))
+        has_result_marker = any(marker in sentence or marker in lower for marker in markers)
+        sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", sentence, flags=re.I))
+        sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))
+        sentence_has_close = bool(re.search(r"(收盘|尾盘|close|closed)", sentence, flags=re.I))
+        rescue_ok = False
+        if evidence_mode == "numeric_fact":
+            rescue_ok = (has_numeric and (has_time or has_number)) or (has_number and int(scored.get("score") or 0) >= 6)
+        elif evidence_mode in {"date_fact", "schedule_fact"}:
+            rescue_ok = has_time and (has_result_marker or int(scored.get("score") or 0) >= 6)
+        elif evidence_mode == "event_result":
+            rescue_ok = has_result_marker and (bool(scored.get("token_hits")) or re.search(r"\d+\s*[-:：比]\s*\d+|\b\d+-\d+\b", sentence))
+        if claim_needs_open and (sentence_has_intraday or sentence_has_close) and not sentence_has_open:
+            rescue_ok = False
+        if not rescue_ok:
+            continue
+        candidate = {
+            "sentence": sentence[:260],
+            "score": max(6, int(scored.get("score") or 0) + 2),
+            "hits": list(scored.get("token_hits") or [])[:6],
+            "field": field,
+            "numeric_hits": list(scored.get("numeric_hits") or [])[:4],
+            "time_hits": list(scored.get("time_hits") or [])[:4],
+            "route_hits": list(scored.get("route_hits") or [])[:4],
+            "reasons": dedupe_keep_order(list(scored.get("reasons") or []) + ["deterministic_candidate_rescue"])[:6],
+        }
+        if not best or (
+            int(candidate.get("score") or 0),
+            field == "detail",
+            field == "snippet",
+        ) > (
+            int(best.get("score") or 0),
+            str(best.get("field") or "") == "detail",
+            str(best.get("field") or "") == "snippet",
+        ):
+            best = candidate
+    return best
+
+
+def maybe_apply_deterministic_candidate_rescue(
+    claim_item: Dict[str, Any],
+    item: Dict[str, Any],
+    evidence_mode: str,
+    source_query: str,
+) -> None:
+    existing = item.get("answer_candidates") if isinstance(item.get("answer_candidates"), list) else []
+    if existing and answer_candidate_quality_score(item) >= 7:
+        return
+    rescue_candidate = deterministic_candidate_rescue(claim_item, item, evidence_mode, source_query)
+    if not rescue_candidate:
+        return
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for candidate in [rescue_candidate] + list(existing):
+        if not isinstance(candidate, dict):
+            continue
+        sentence_key = normalize_text(str(candidate.get("sentence") or "")).lower()
+        if not sentence_key or sentence_key in seen:
+            continue
+        seen.add(sentence_key)
+        merged.append(candidate)
+    item["answer_candidates"] = merged[:3]
+    item["direct_candidate_rescue_used"] = True
+    item["direct_candidate_rescue_source"] = str(rescue_candidate.get("field") or "")
+
+
+def finalize_direct_candidate_rescue_progress(item: Dict[str, Any], default_stage: str = "post_keep") -> None:
+    if not item.get("direct_candidate_rescue_used"):
+        return
+    stage = normalize_text(str(item.get("direct_candidate_rescue_stage") or default_stage)) or default_stage
+    item["direct_candidate_rescue_stage"] = stage
+    if item.get("rescue_promoted_from_filter"):
+        item["program_used_for_retention"] = True
 
 
 def answer_candidate_quality_score(item: Dict[str, Any]) -> int:
@@ -5822,7 +6459,15 @@ def answer_candidate_quality_score(item: Dict[str, Any]) -> int:
     hit_count = len(best.get("hits") or []) if isinstance(best.get("hits"), list) else 0
     field_bonus = 3 if best_field == "title" else (2 if best_field == "detail" else 1 if best_field == "snippet" else 0)
     signal_bonus = min(4, route_hits + numeric_hits + time_hits + hit_count // 2)
-    return min(20, max(0, best_score + field_bonus + signal_bonus))
+    profile = str(best.get("sentence_candidate_profile") or "")
+    profile_bonus = {
+        "direct_candidate": 4,
+        "slot_hit_but_indirect": 2,
+        "numeric_reference_only": 0,
+        "date_reference_only": 0,
+        "background_commentary": -3,
+    }.get(profile, 0)
+    return min(20, max(0, best_score + field_bonus + signal_bonus + profile_bonus))
 
 
 def task_card_match_features(item: Dict[str, Any], task_card: Dict[str, Any]) -> Dict[str, Any]:
@@ -7451,6 +8096,42 @@ CLAIM_ALIGNED_FACT_LOW_REASONS = {
     "low_relevance",
     "source_quality_bad",
 }
+PREFILTER_RESCUE_ALLOWED_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
+PREFILTER_RESCUE_ALLOWED_SOURCE_TYPES = {"official", "news", "encyclopedia"}
+PREFILTER_RESCUE_NEAR_MISS_REASONS = CLAIM_ALIGNED_FACT_LOW_REASONS | {
+    "filtered_low_claim_anchor",
+    "filtered_page_shape_mismatch",
+    "filtered_low_source_relevance",
+    "filtered_utility_drop_conflict",
+    "structured_noise_value_without_context",
+    "structured_noise_date_window_mismatch",
+}
+PREFILTER_RESCUE_HARD_FILTER_REASONS = {
+    "site_domain_mismatch",
+    "sitemap_generic_landing_page",
+    "search_engine_result_page",
+    "temporal_mismatch",
+    "event_window_mismatch",
+    "structured_noise_high_penalty",
+    "structured_noise_no_entity_weak_source",
+    "official_structured_discovery_stub",
+    "route_retention_policy_not_satisfied",
+    "route_weak_no_direct_sentence",
+    "route_noise_no_relation_single_entity",
+}
+FACT_PAGE_KEEP_REVIEW_ALLOWED_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
+FACT_PAGE_KEEP_REVIEW_ALLOWED_SOURCE_TYPES = {"official", "news", "encyclopedia", "unknown", "finance"}
+FACT_PAGE_KEEP_REVIEW_NEAR_MISS_REASONS = CLAIM_ALIGNED_FACT_LOW_REASONS | {
+    "filtered_low_claim_anchor",
+    "filtered_page_shape_mismatch",
+    "filtered_low_source_relevance",
+    "filtered_utility_drop_conflict",
+}
+FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS = PREFILTER_RESCUE_HARD_FILTER_REASONS | {
+    "search_engine_result_page",
+    "landing_page",
+    "hard_noise_page",
+}
 
 
 def claim_program_from_claim_item(claim_item: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -7527,6 +8208,159 @@ def claim_aligned_page_shape_ok(item: Dict[str, Any]) -> bool:
     return True
 
 
+def fact_like_keep_review_allowed(claim_item: Optional[Dict[str, Any]], evidence_mode: str) -> bool:
+    if str(evidence_mode or "") not in FACT_PAGE_KEEP_REVIEW_ALLOWED_MODES:
+        return False
+    if not isinstance(claim_item, dict):
+        return False
+    centrality = str(claim_item.get("centrality") or "")
+    if centrality == "core":
+        return True
+    return centrality == "supporting" and str(evidence_mode or "") in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
+
+
+def claim_needs_opening_slot(claim_item: Optional[Dict[str, Any]], evidence_mode: str, query: str = "") -> bool:
+    if str(evidence_mode or "") != "numeric_fact":
+        return False
+    program = claim_program_from_claim_item(claim_item)
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    combined = " ".join(
+        normalize_text(str(part or ""))
+        for part in [
+            query,
+            claim_item.get("claim") if isinstance(claim_item, dict) else "",
+            program.get("normalized_assertion") if isinstance(program, dict) else "",
+            decision_slots.get("object") if isinstance(decision_slots, dict) else "",
+            decision_slots.get("status_or_result") if isinstance(decision_slots, dict) else "",
+            direct_need.get("must_answer") if isinstance(direct_need, dict) else "",
+        ]
+        if normalize_text(str(part or ""))
+    )
+    return bool(re.search(r"(开盘|开市|opening|opened)", combined, flags=re.I))
+
+
+def fact_slot_signal_summary(
+    query: str,
+    item: Dict[str, Any],
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    anchor_hits = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    answer_quality = answer_candidate_quality_score(item)
+    page_retention_score = int(item.get("page_retention_score") or 0)
+    page_utility_score = int(item.get("page_utility_score") or 0)
+    directness = int(item.get("directness_score") or 0)
+    evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+    structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    text = normalize_text(
+        " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("snippet") or ""),
+                str(item.get("detail") or ""),
+                " ".join(
+                    str(candidate.get("sentence") or "")
+                    for candidate in (item.get("answer_candidates") or [])
+                    if isinstance(candidate, dict)
+                ),
+            ]
+        )
+    )
+    needs_opening = claim_needs_opening_slot(claim_item, evidence_mode, query)
+    has_opening = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", text, flags=re.I))
+    has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", text, flags=re.I))
+    has_close = bool(re.search(r"(收盘|尾盘|close|closed)", text, flags=re.I))
+    text_has_current_marker = bool(re.search(r"(今天|今日|current|latest|实时|live|now)", text, flags=re.I))
+    subject_time_hit = "entity" in anchor_hits and (
+        "time" in anchor_hits
+        or text_has_current_marker
+        or (needs_opening and directness >= 2)
+    )
+    metric_or_status_hit = (
+        any(bucket in anchor_hits for bucket in {"numeric", "event", "status"})
+        or evidence_contract_status in {"partial", "satisfied"}
+        or structured_point_status in {"partial", "satisfied"}
+        or answer_quality >= 5
+        or directness >= 3
+        or (needs_opening and has_opening)
+    )
+    promotable_signal = (
+        answer_quality >= 4
+        or directness >= 3
+        or page_retention_score >= 30
+        or page_utility_score >= 28
+        or evidence_contract_status in {"partial", "satisfied"}
+        or structured_point_status in {"partial", "satisfied"}
+        or (needs_opening and has_opening and directness >= 2)
+    )
+    return {
+        "anchor_hits": anchor_hits,
+        "answer_quality": answer_quality,
+        "directness": directness,
+        "page_retention_score": page_retention_score,
+        "page_utility_score": page_utility_score,
+        "subject_time_hit": subject_time_hit,
+        "metric_or_status_hit": metric_or_status_hit,
+        "promotable_signal": promotable_signal,
+        "needs_opening": needs_opening,
+        "has_opening": has_opening,
+        "has_intraday": has_intraday,
+        "has_close": has_close,
+    }
+
+
+def apply_fact_page_keep_review_annotations(
+    item: Dict[str, Any],
+    profile: str,
+    filter_reason: str,
+    signal: Dict[str, Any],
+) -> None:
+    item["filter_decision_profile"] = profile
+    item["candidate_strength_before_keep"] = int(signal.get("answer_quality") or 0)
+    if profile.startswith("recoverable"):
+        item["recoverable_filter_reason"] = filter_reason
+    elif profile.startswith("hard_drop"):
+        item["hard_drop_reason"] = filter_reason
+
+
+def maybe_promote_fact_page_keep_review(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> tuple[bool, str]:
+    if not fact_like_keep_review_allowed(claim_item, evidence_mode):
+        return False, filter_reason
+    source_type = str(item.get("source_type") or "")
+    if source_type not in FACT_PAGE_KEEP_REVIEW_ALLOWED_SOURCE_TYPES:
+        return False, filter_reason
+    if filter_reason in FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS or not claim_aligned_page_shape_ok(item):
+        apply_fact_page_keep_review_annotations(item, "hard_drop", filter_reason, {"answer_quality": answer_candidate_quality_score(item)})
+        return False, filter_reason
+    if filter_reason not in FACT_PAGE_KEEP_REVIEW_NEAR_MISS_REASONS and filter_reason != "source_quality_bad":
+        return False, filter_reason
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        apply_fact_page_keep_review_annotations(item, "hard_drop", "utility_drop_decision", {"answer_quality": answer_candidate_quality_score(item)})
+        return False, filter_reason
+    signal = fact_slot_signal_summary(query, item, evidence_mode, claim_item)
+    if not signal.get("subject_time_hit") or not signal.get("metric_or_status_hit"):
+        apply_fact_page_keep_review_annotations(item, "low_signal_drop", filter_reason, signal)
+        return False, filter_reason
+    if signal.get("needs_opening") and (signal.get("has_intraday") or signal.get("has_close")) and not signal.get("has_opening"):
+        apply_fact_page_keep_review_annotations(item, "recoverable_opening_slot_mismatch", "opening_slot_mismatch", signal)
+        return False, filter_reason
+    if not signal.get("promotable_signal"):
+        apply_fact_page_keep_review_annotations(item, "recoverable_but_too_weak", filter_reason, signal)
+        return False, filter_reason
+    apply_fact_page_keep_review_annotations(item, "recoverable_near_miss_promoted", filter_reason, signal)
+    item["readiness_promotion_used"] = True
+    item["readiness_promotion_source"] = "fact_page_keep_review"
+    item["program_used_for_retention"] = True
+    return True, "fact_page_keep_review"
+
+
 def remap_claim_aligned_filter_reason(default_reason: str, query: str, item: Dict[str, Any], evidence_mode: str) -> str:
     if default_reason not in CLAIM_ALIGNED_FACT_LOW_REASONS:
         return default_reason
@@ -7575,6 +8409,69 @@ def should_soft_keep_claim_aligned_fact_item(
     if int(item.get("relevance_score") or 0) < 1 and int(item.get("entity_match_count") or 0) < 1:
         return False
     return True
+
+
+def should_try_prefilter_candidate_rescue(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if str(evidence_mode or "") not in PREFILTER_RESCUE_ALLOWED_MODES:
+        return False
+    if str(item.get("source_type") or "") not in PREFILTER_RESCUE_ALLOWED_SOURCE_TYPES:
+        return False
+    if filter_reason in PREFILTER_RESCUE_HARD_FILTER_REASONS:
+        return False
+    if filter_reason not in PREFILTER_RESCUE_NEAR_MISS_REASONS:
+        return False
+    if not claim_aligned_page_shape_ok(item):
+        return False
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        return False
+    if item.get("source_quality_label") == "bad":
+        source_quality_reasons = item.get("source_quality_reasons") if isinstance(item.get("source_quality_reasons"), list) else []
+        if "hard_noise_page" in source_quality_reasons:
+            return False
+    anchor_hits = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+    structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    answer_quality = answer_candidate_quality_score(item)
+    has_answer_candidates = bool(item.get("answer_candidates")) and isinstance(item.get("answer_candidates"), list)
+    return (
+        has_answer_candidates
+        and answer_quality >= 6
+        and (
+            len(anchor_hits) >= 2
+            or evidence_contract_status in {"partial", "satisfied"}
+            or structured_point_status in {"partial", "satisfied"}
+        )
+    )
+
+
+def maybe_promote_prefilter_candidate_rescue(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> tuple[bool, str]:
+    if not should_try_prefilter_candidate_rescue(query, item, filter_reason, evidence_mode, claim_item):
+        return False, filter_reason
+    if not item.get("direct_candidate_rescue_used"):
+        candidates = item.get("answer_candidates") if isinstance(item.get("answer_candidates"), list) else []
+        best_candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+        item["direct_candidate_rescue_used"] = True
+        item["direct_candidate_rescue_source"] = str(best_candidate.get("field") or "candidate")
+    item["rescue_promoted_from_filter"] = True
+    item["direct_candidate_rescue_stage"] = "pre_filter"
+    item["direct_candidate_rescue_filter_reason"] = filter_reason
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    item["program_used_for_retention"] = True
+    return True, "candidate_rescued_before_filter"
 
 
 def annotate_soft_kept_claim_aligned_item(
@@ -8103,6 +9000,15 @@ def source_pollution_bucket(stats: Dict[str, Any], source_name: str) -> Dict[str
             "filter_reasons": {},
             "quality_reasons": {},
             "errors": 0,
+            "detail_fetch_paths": {},
+            "environment_block_reasons": {},
+            "playwright_used": 0,
+            "playwright_rescued": 0,
+            "playwright_failed": 0,
+            "detail_read_failed": 0,
+            "requests_blocked_playwright_rescued": 0,
+            "requests_blocked_playwright_failed": 0,
+            "detail_read_failed_after_fetch": 0,
         },
     )
     return bucket
@@ -8147,6 +9053,13 @@ def record_source_item_quality(
     for reason_item in item.get("source_quality_reasons", []) if isinstance(item.get("source_quality_reasons"), list) else []:
         reasons = bucket.setdefault("quality_reasons", {})
         reasons[reason_item] = int(reasons.get(reason_item, 0) or 0) + 1
+    environment_block_reason = normalize_text(str(item.get("environment_block_reason") or ""))
+    if environment_block_reason == "requests_blocked_playwright_rescued":
+        bucket["requests_blocked_playwright_rescued"] = int(bucket.get("requests_blocked_playwright_rescued", 0) or 0) + 1
+    elif environment_block_reason == "requests_blocked_playwright_failed":
+        bucket["requests_blocked_playwright_failed"] = int(bucket.get("requests_blocked_playwright_failed", 0) or 0) + 1
+    elif environment_block_reason == "detail_read_failed_after_fetch":
+        bucket["detail_read_failed_after_fetch"] = int(bucket.get("detail_read_failed_after_fetch", 0) or 0) + 1
 
 
 def compact_source_pollution_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -8169,6 +9082,15 @@ def compact_source_pollution_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str,
             "quality_avg": round(int(bucket.get("quality_sum", 0) or 0) / quality_count, 1) if quality_count else None,
             "errors": int(bucket.get("errors", 0) or 0),
             "anti_bot_blocks": int(bucket.get("anti_bot_blocks", 0) or 0),
+            "detail_fetch_paths": bucket.get("detail_fetch_paths", {}),
+            "environment_block_reasons": bucket.get("environment_block_reasons", {}),
+            "playwright_used": int(bucket.get("playwright_used", 0) or 0),
+            "playwright_rescued": int(bucket.get("playwright_rescued", 0) or 0),
+            "playwright_failed": int(bucket.get("playwright_failed", 0) or 0),
+            "detail_read_failed": int(bucket.get("detail_read_failed", 0) or 0),
+            "requests_blocked_playwright_rescued": int(bucket.get("requests_blocked_playwright_rescued", 0) or 0),
+            "requests_blocked_playwright_failed": int(bucket.get("requests_blocked_playwright_failed", 0) or 0),
+            "detail_read_failed_after_fetch": int(bucket.get("detail_read_failed_after_fetch", 0) or 0),
             "filter_reasons": bucket.get("filter_reasons", {}),
             "quality_reasons": bucket.get("quality_reasons", {}),
         }
@@ -8188,6 +9110,10 @@ def health_bucket_score(bucket: Dict[str, Any]) -> int:
     empty = int(bucket.get("empty", 0) or 0)
     errors = int(bucket.get("errors", 0) or 0)
     anti_bot_blocks = int(bucket.get("anti_bot_blocks", 0) or 0)
+    playwright_rescued = int(bucket.get("playwright_rescued", 0) or 0)
+    requests_blocked_playwright_rescued = int(bucket.get("requests_blocked_playwright_rescued", 0) or 0)
+    requests_blocked_playwright_failed = int(bucket.get("requests_blocked_playwright_failed", 0) or 0)
+    detail_read_failed_after_fetch = int(bucket.get("detail_read_failed_after_fetch", 0) or 0)
     score = 0
     if kept > 0:
         score += 20 + kept * 5
@@ -8197,8 +9123,17 @@ def health_bucket_score(bucket: Dict[str, Any]) -> int:
         score -= 8
     if errors:
         score -= 8 * errors
-    if anti_bot_blocks:
-        score -= 12 * anti_bot_blocks
+    if requests_blocked_playwright_rescued > 0:
+        score += min(8, requests_blocked_playwright_rescued * 3)
+    if playwright_rescued > 0:
+        score += min(6, playwright_rescued * 2)
+    if requests_blocked_playwright_failed > 0:
+        score -= 10 * requests_blocked_playwright_failed
+    if detail_read_failed_after_fetch > 0:
+        score -= 6 * detail_read_failed_after_fetch
+    unresolved_anti_bot_blocks = max(0, anti_bot_blocks - requests_blocked_playwright_rescued)
+    if unresolved_anti_bot_blocks:
+        score -= 14 * unresolved_anti_bot_blocks
     return score
 
 
@@ -8226,6 +9161,10 @@ def reorder_sources_by_health(
                     "kept": int(bucket.get("kept", 0) or 0),
                     "bad": int(bucket.get("bad", 0) or 0),
                     "empty": int(bucket.get("empty", 0) or 0),
+                    "anti_bot_blocks": int(bucket.get("anti_bot_blocks", 0) or 0),
+                    "playwright_rescued": int(bucket.get("playwright_rescued", 0) or 0),
+                    "requests_blocked_playwright_rescued": int(bucket.get("requests_blocked_playwright_rescued", 0) or 0),
+                    "requests_blocked_playwright_failed": int(bucket.get("requests_blocked_playwright_failed", 0) or 0),
                 }
             )
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -8245,13 +9184,31 @@ def update_source_health_from_stats(
         if not isinstance(source_stats, dict):
             continue
         key = source_health_key(str(source_name), evidence_mode, "any", "")
-        bucket = source_health.setdefault(key, {"raw": 0, "kept": 0, "bad": 0, "empty": 0, "errors": 0, "anti_bot_blocks": 0})
+        bucket = source_health.setdefault(
+            key,
+            {
+                "raw": 0,
+                "kept": 0,
+                "bad": 0,
+                "empty": 0,
+                "errors": 0,
+                "anti_bot_blocks": 0,
+                "playwright_rescued": 0,
+                "requests_blocked_playwright_rescued": 0,
+                "requests_blocked_playwright_failed": 0,
+                "detail_read_failed_after_fetch": 0,
+            },
+        )
         raw = int(source_stats.get("raw", 0) or 0)
         bucket["raw"] = int(bucket.get("raw", 0) or 0) + raw
         bucket["kept"] = int(bucket.get("kept", 0) or 0) + int(source_stats.get("kept", 0) or 0)
         bucket["bad"] = int(bucket.get("bad", 0) or 0) + int(source_stats.get("bad", 0) or 0)
         bucket["errors"] = int(bucket.get("errors", 0) or 0) + int(source_stats.get("errors", 0) or 0)
         bucket["anti_bot_blocks"] = int(bucket.get("anti_bot_blocks", 0) or 0) + int(source_stats.get("anti_bot_blocks", 0) or 0)
+        bucket["playwright_rescued"] = int(bucket.get("playwright_rescued", 0) or 0) + int(source_stats.get("playwright_rescued", 0) or 0)
+        bucket["requests_blocked_playwright_rescued"] = int(bucket.get("requests_blocked_playwright_rescued", 0) or 0) + int(source_stats.get("requests_blocked_playwright_rescued", 0) or 0)
+        bucket["requests_blocked_playwright_failed"] = int(bucket.get("requests_blocked_playwright_failed", 0) or 0) + int(source_stats.get("requests_blocked_playwright_failed", 0) or 0)
+        bucket["detail_read_failed_after_fetch"] = int(bucket.get("detail_read_failed_after_fetch", 0) or 0) + int(source_stats.get("detail_read_failed_after_fetch", 0) or 0)
         if raw == 0:
             bucket["empty"] = int(bucket.get("empty", 0) or 0) + int(source_stats.get("calls", 0) or 0)
 
@@ -8400,6 +9357,13 @@ def add_filtered_sample(stats: Dict[str, Any], reason: str, item: Dict[str, Any]
             "detail_error": item.get("detail_error", ""),
             "detail_error_type": item.get("detail_error_type", ""),
             "answer_candidates": item.get("answer_candidates", [])[:2],
+            "answer_candidate_quality_score": item.get("answer_candidate_quality_score"),
+            "filter_decision_profile": item.get("filter_decision_profile", ""),
+            "recoverable_filter_reason": item.get("recoverable_filter_reason", ""),
+            "hard_drop_reason": item.get("hard_drop_reason", ""),
+            "readiness_promotion_used": item.get("readiness_promotion_used", False),
+            "readiness_promotion_source": item.get("readiness_promotion_source", ""),
+            "candidate_strength_before_keep": item.get("candidate_strength_before_keep"),
             "structured_table_best_point": item.get("structured_table_best_point", {}),
             "structured_point_contract_status": item.get("structured_point_contract_status"),
             "structured_point_contract_score": item.get("structured_point_contract_score"),
@@ -8407,6 +9371,24 @@ def add_filtered_sample(stats: Dict[str, Any], reason: str, item: Dict[str, Any]
             "structured_point_contract_risks": item.get("structured_point_contract_risks", []),
         }
     )
+
+
+def record_fact_filter_diagnostic(stats: Dict[str, Any], item: Dict[str, Any], kept: bool, filter_reason: str) -> None:
+    profile = normalize_text(str(item.get("filter_decision_profile") or ""))
+    if not profile:
+        if kept:
+            profile = "kept"
+        elif filter_reason in FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS:
+            profile = "hard_drop"
+        else:
+            profile = "filtered"
+    increment_named_counter(stats, "filter_decision_profile", profile)
+    recoverable_reason = normalize_text(str(item.get("recoverable_filter_reason") or ""))
+    if recoverable_reason:
+        increment_named_counter(stats, "recoverable_filter_reason", recoverable_reason)
+    hard_drop_reason = normalize_text(str(item.get("hard_drop_reason") or ""))
+    if hard_drop_reason:
+        increment_named_counter(stats, "hard_drop_reason", hard_drop_reason)
 
 
 def filtered_item_deepen_risk(item: Dict[str, Any], filter_reason: str) -> Dict[str, Any]:
@@ -8610,21 +9592,27 @@ def expand_official_inner_link_candidates(
                 page_text = fetch_page_text(str(item["url"]), max_chars=raw_chars, timeout_sec=timeout_sec, trace=detail_trace)
                 item["detail"] = extract_relevant_passage(page_text, passage_focus_terms(source_query, str(item.get("title") or "")), max_chars=passage_chars)
                 enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec, fetch_trace=detail_trace)
-                apply_detail_fetch_trace(stats, item, detail_trace)
+                apply_detail_fetch_trace(stats, item, detail_trace, "official_inner_link")
                 detail_fetches += 1
                 stats["detail_successes"] = int(stats.get("detail_successes", 0) or 0) + 1
                 add_timing(stats, "fetch_detail", time.perf_counter() - detail_started)
             except Exception as exc:
                 add_timing(stats, "fetch_detail", time.perf_counter() - detail_started if "detail_started" in locals() else 0.0)
-                apply_detail_fetch_trace(stats, item, detail_trace)
-                record_detail_fetch_failure(stats, item, exc)
+                apply_detail_fetch_trace(stats, item, detail_trace, "official_inner_link")
+                record_detail_fetch_failure(stats, item, exc, "official_inner_link")
         item["relevance_score"] = evidence_relevance_score(source_query, item)
         item["entity_match_count"] = entity_match_count(source_query, item)
         item["directness_score"] = evidence_directness_score(source_query, item, evidence_mode)
         item["temporal_score"] = evidence_temporal_score(source_query, item)
         item["event_window_score"] = event_window_score(source_query, item, evidence_mode)
-        item["answer_candidates"] = answer_candidate_sentences(source_query, item)
+        item["answer_candidates"] = answer_candidate_sentences(source_query, item, evidence_mode=evidence_mode)
+        maybe_apply_deterministic_candidate_rescue(claim_item, item, evidence_mode, source_query)
         item["answer_candidate_quality_score"] = answer_candidate_quality_score(item)
+        if item.get("direct_candidate_rescue_used"):
+            stats["direct_candidate_rescue_used"] = int(stats.get("direct_candidate_rescue_used", 0) or 0) + 1
+            source_field = str(item.get("direct_candidate_rescue_source") or "")
+            if source_field:
+                increment_named_counter(stats, "direct_candidate_rescue_sources", source_field)
         item.update(task_card_match_features(item, claim_item.get("evidence_task_card", {}) if isinstance(claim_item.get("evidence_task_card"), dict) else {}))
         item.update(source_quality_features(source_query, item, evidence_mode, preferred_domains))
         item.update(page_intent_features(item, source_intent, source_query, stats))
@@ -8644,7 +9632,16 @@ def expand_official_inner_link_candidates(
             keep_item = True
             filter_reason = "soft_keep_claim_aligned_fact_page"
             annotate_soft_kept_claim_aligned_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
+        if not keep_item:
+            keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
+                source_query,
+                item,
+                filter_reason,
+                evidence_mode,
+                claim_item,
+            )
         if keep_item:
+            finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
             record_source_item_quality(stats, "official_inner_link", item, kept=True)
             claim_evidence.append(item)
             existing_urls.add(str(item.get("url") or ""))
@@ -9225,6 +10222,16 @@ def query_contract_anchor_items(
     selected: List[Dict[str, Any]] = []
     primary_retry_origin, supporting_retry_origins, variant_hint = retry_operator_origin_hints(source_intent)
 
+    fact_slot_item = next(
+        (
+            item for item in query_plan
+            if normalize_text(str(item.get("origin") or "")) == "fact_slot_query"
+            or query_variant_origin_value(item).startswith("fact_slot_query")
+        ),
+        None,
+    )
+    append_unique_query_item(selected, fact_slot_item, limit)
+
     if is_retry and site_planner_items and (
         mechanism_type in {"structured_numeric_authority", "date_authority"}
         or evidence_mode in {"numeric_fact", "date_fact", "schedule_fact"}
@@ -9439,7 +10446,7 @@ def apply_query_plan_policy(
         source_preference = [normalize_text(str(value)) for value in raw_preference if normalize_text(str(value))][:3]
         if source_preference:
             query_item["source_preference"] = source_preference
-        for extra_key in ("operator", "variant", "gap_flag"):
+        for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
             extra_value = normalize_text(str(item.get(extra_key) or ""))
             if extra_value:
                 query_item[extra_key] = extra_value
@@ -10009,6 +11016,18 @@ def observed_slot_signals_from_web_items(web_items: List[Dict[str, Any]]) -> Tup
     return buckets, observed_slots
 
 
+def count_item_field_values(web_items: List[Dict[str, Any]], field_name: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in web_items:
+        if not isinstance(item, dict):
+            continue
+        value = normalize_text(str(item.get(field_name) or ""))
+        if not value:
+            continue
+        counts[value] = int(counts.get(value, 0) or 0) + 1
+    return counts
+
+
 def infer_missing_required_slots_for_claim(
     claim_item: Dict[str, Any],
     web_items: List[Dict[str, Any]],
@@ -10079,7 +11098,10 @@ def diagnose_claim_retrieval(
         if item.get("source_type") == "official"
         or str(item.get("source") or "") in {"official_discovery", "official_inner_link", "domain_sitemap"}
     ]
-    direct_items = [item for item in web_items if int(item.get("directness_score") or 0) >= 2]
+    direct_items = [
+        item for item in web_items
+        if int(item.get("directness_score") or 0) >= 2 and not item.get("readiness_promotion_used")
+    ]
     readiness_block_reason = infer_readiness_block_reason(web_items, direct_items, stats)
     readiness_block_layer = infer_readiness_block_layer(readiness_block_reason)
     missing_required_slots = infer_missing_required_slots_for_claim(claim_item, web_items, evidence_mode)
@@ -10122,15 +11144,27 @@ def diagnose_claim_retrieval(
     detail_anti_bot_errors = int(stats.get("detail_anti_bot_errors", 0) or 0)
     detail_read_failed = int(stats.get("detail_read_failed", 0) or 0)
     playwright_rescued = int(stats.get("playwright_rescued", 0) or 0)
+    detail_fetch_paths = count_item_field_values(web_items, "detail_fetch_path")
+    direct_candidate_rescue_used = sum(1 for item in web_items if isinstance(item, dict) and item.get("direct_candidate_rescue_used"))
+    direct_candidate_rescue_sources = count_item_field_values(web_items, "direct_candidate_rescue_source")
+    direct_candidate_rescue_stages = count_item_field_values(web_items, "direct_candidate_rescue_stage")
+    rescue_promoted_from_filter = sum(1 for item in web_items if isinstance(item, dict) and item.get("rescue_promoted_from_filter"))
+    readiness_promotion_used = sum(1 for item in web_items if isinstance(item, dict) and item.get("readiness_promotion_used"))
+    readiness_promotion_source = count_item_field_values(web_items, "readiness_promotion_source")
+    candidate_strength_before_keep = max(
+        [int(item.get("candidate_strength_before_keep") or 0) for item in web_items if isinstance(item, dict) and item.get("readiness_promotion_used")]
+        + [int(score or 0) for score in (stats.get("candidate_strength_before_keep_scores") or [])],
+        default=0,
+    )
     environment_block_reason = ""
-    if raw_results <= 0 and anti_bot_blocks > 0:
-        environment_block_reason = "source_access_blocked"
+    if raw_results <= 0 and anti_bot_blocks > 0 and playwright_rescued <= 0:
+        environment_block_reason = "source_access_blocked_without_rescue"
     elif detail_anti_bot_errors > 0 and playwright_rescued <= 0:
-        environment_block_reason = "detail_access_blocked"
+        environment_block_reason = "requests_blocked_playwright_failed"
     elif detail_read_failed > 0 and int(stats.get("detail_successes", 0) or 0) <= 0:
-        environment_block_reason = "detail_read_failed"
+        environment_block_reason = "detail_read_failed_after_fetch"
     elif detail_anti_bot_errors > 0 and playwright_rescued > 0:
-        environment_block_reason = "access_rescued_by_playwright"
+        environment_block_reason = "requests_blocked_playwright_rescued"
     needs_retry = False
     reason = "sufficient"
     if raw_results == 0:
@@ -10235,6 +11269,8 @@ def diagnose_claim_retrieval(
         direct_items,
         retrieval_quality.get("source_recall_diagnosis", {})
         if isinstance(retrieval_quality, dict) else {},
+        readiness_promotion_used,
+        answer_candidate_total,
     )
     return {
         "claim_id": str(claim_item.get("claim_id") or claim_item.get("id") or ""),
@@ -10307,6 +11343,11 @@ def diagnose_claim_retrieval(
         "planned_query_count": stats.get("planned_query_count"),
         "executed_query_plan": stats.get("executed_query_plan", []),
         "executed_query_source_plan": stats.get("executed_query_source_plan", [])[:6],
+        "query_variant_origin": stats.get("query_variant_origin", [])[:8],
+        "recall_probe_used": int(stats.get("recall_probe_used", 0) or 0),
+        "recall_probe_query": stats.get("recall_probe_query", ""),
+        "recall_probe_source": stats.get("recall_probe_source", []),
+        "recall_probe_raw_hits": int(stats.get("recall_probe_raw_hits", 0) or 0),
         "skipped_by_query_budget": stats.get("skipped_by_query_budget", 0),
         "skipped_sources_by_budget": stats.get("skipped_sources_by_budget", 0),
         "retrieval_budget_skip": stats.get("retrieval_budget_skip", ""),
@@ -10328,6 +11369,17 @@ def diagnose_claim_retrieval(
         "detail_anti_bot_errors": detail_anti_bot_errors,
         "playwright_rescued": playwright_rescued,
         "environment_block_reason": environment_block_reason,
+        "detail_fetch_paths": detail_fetch_paths,
+        "direct_candidate_rescue_used": direct_candidate_rescue_used,
+        "direct_candidate_rescue_sources": direct_candidate_rescue_sources,
+        "direct_candidate_rescue_stages": direct_candidate_rescue_stages,
+        "rescue_promoted_from_filter": rescue_promoted_from_filter,
+        "filter_decision_profile": stats.get("filter_decision_profile", {}),
+        "recoverable_filter_reason": stats.get("recoverable_filter_reason", {}),
+        "hard_drop_reason": stats.get("hard_drop_reason", {}),
+        "readiness_promotion_used": readiness_promotion_used,
+        "readiness_promotion_source": readiness_promotion_source,
+        "candidate_strength_before_keep": candidate_strength_before_keep,
         "answer_candidate_count": int(stats.get("answer_candidate_count", 0) or 0),
         "answer_candidate_examples": stats.get("answer_candidate_examples", [])[:5],
         "soft_keep_claim_aligned_examples": [
@@ -10673,6 +11725,15 @@ def retrieve_evidence(
         task_card = planned_claim_item.get("evidence_task_card") if isinstance(planned_claim_item.get("evidence_task_card"), dict) else {}
         query_plan = apply_query_plan_policy(query_plan, claim_query_limit, source_intent, task_card, evidence_mode)
         query_plan = ensure_verification_query(query_plan, planned_claim_item, claim_text, source_intent, claim_query_limit)
+        recall_probe_item = build_recall_probe_query_item(planned_claim_item, claim_text, source_intent, query_plan, evidence_mode)
+        execution_query_plan = list(query_plan)
+        if recall_probe_item and not any(
+            normalize_text(str(item.get("q") or "")) == normalize_text(str(recall_probe_item.get("q") or ""))
+            and normalize_text(str(item.get("origin") or "")) == normalize_text(str(recall_probe_item.get("origin") or ""))
+            for item in execution_query_plan
+            if isinstance(item, dict)
+        ):
+            execution_query_plan.append(recall_probe_item)
         source_plan = source_plan_from_intent(question, claim_text, source_intent)
         claim_evidence: List[Dict[str, Any]] = []
         stats: Dict[str, Any] = {
@@ -10681,11 +11742,16 @@ def retrieve_evidence(
             "query_limit": claim_query_limit,
             "source_limit": claim_source_limit,
             "planned_query_count": original_query_count,
-            "executed_query_plan": query_plan,
+            "executed_query_plan": execution_query_plan,
             "executed_query_source_plan": [],
+            "query_variant_origin": query_variant_origin_rows(execution_query_plan),
             "skipped_by_query_budget": original_query_count if claim_query_limit <= 0 else max(0, original_query_count - len(query_plan)),
             "raw_results": 0,
             "filtered_results": 0,
+            "recall_probe_used": 0,
+            "recall_probe_query": "",
+            "recall_probe_source": [],
+            "recall_probe_raw_hits": 0,
             "source_plan_used": source_plan,
             "llm_source_strategy": source_intent.get("source_strategy", {}) if isinstance(source_intent.get("source_strategy"), dict) else {},
             "source_strategy_sanitized": bool(sanitize_result.get("changed")),
@@ -10791,16 +11857,38 @@ def retrieve_evidence(
             if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
                 keep_item = True
                 filter_reason = "soft_keep_structured_metric_table_candidate"
-                if not keep_item and should_soft_keep_claim_aligned_fact_item(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
-                    original_filter_reason = filter_reason
-                    keep_item = True
-                    filter_reason = "soft_keep_claim_aligned_fact_page"
-                    annotate_soft_kept_claim_aligned_item(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
+            if not keep_item and should_soft_keep_claim_aligned_fact_item(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
+                original_filter_reason = filter_reason
+                keep_item = True
+                filter_reason = "soft_keep_claim_aligned_fact_page"
+                annotate_soft_kept_claim_aligned_item(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
             if not keep_item and should_soft_keep_route_review_item(item, filter_reason, evidence_mode):
                 keep_item = True
                 filter_reason = "soft_keep_route_review_candidate"
+            if not keep_item:
+                keep_item, filter_reason = maybe_promote_fact_page_keep_review(
+                    f"{question} {claim_text}",
+                    item,
+                    filter_reason,
+                    evidence_mode,
+                    claim_item,
+                )
+            if not keep_item:
+                keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
+                    f"{question} {claim_text}",
+                    item,
+                    filter_reason,
+                    evidence_mode,
+                    claim_item,
+                )
             stats["raw_results"] += 1
             if keep_item:
+                record_fact_filter_diagnostic(stats, item, True, filter_reason)
+                if item.get("readiness_promotion_used"):
+                    stats["readiness_promotion_used"] = int(stats.get("readiness_promotion_used", 0) or 0) + 1
+                    increment_named_counter(stats, "readiness_promotion_source", normalize_text(str(item.get("readiness_promotion_source") or "fact_page_keep_review")) or "fact_page_keep_review")
+                    stats.setdefault("candidate_strength_before_keep_scores", []).append(int(item.get("candidate_strength_before_keep") or 0))
+                finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
                 claim_evidence.append(item)
                 if not item.get("_bridge_expanded"):
                     detail_fetches = expand_official_inner_link_candidates(
@@ -10819,15 +11907,19 @@ def retrieve_evidence(
                         max_results_per_query,
                     )
             else:
+                record_fact_filter_diagnostic(stats, item, False, filter_reason)
                 stats["filtered_results"] += 1
                 add_filter_reason(stats, filter_reason)
                 add_filtered_sample(stats, filter_reason, item)
         if claim_query_limit <= 0:
             stats["retrieval_budget_skip"] = "query_limit_zero"
-        for query_item in query_plan:
+        for query_item in execution_query_plan:
             if budget_exhausted():
                 stats["budget_exhausted"] = True
                 break
+            is_recall_probe = bool(query_item.get("probe_only_if_raw_zero"))
+            if is_recall_probe and int(stats.get("raw_results", 0) or 0) > 0:
+                continue
             query_goal = normalize_text(query_item.get("goal") or "general_verify") or "general_verify"
             query = normalize_text(query_item.get("q") or "")
             if not query:
@@ -10843,11 +11935,16 @@ def retrieve_evidence(
                     and str(page_intent.get("needed_page_type") or "") not in {"", "general_page"}
                 )
             )
-            allow_adaptive_fallback = ENABLE_ADAPTIVE_SOURCE_FALLBACK or page_probe_adaptive_fallback
+            allow_adaptive_fallback = (ENABLE_ADAPTIVE_SOURCE_FALLBACK or page_probe_adaptive_fallback) and not is_recall_probe
             source_jobs = [
                 (source_name, query)
                 for source_name in source_plan_for_query_goal(source_plan, query_item, query_goal, source_intent)
             ]
+            if is_recall_probe:
+                source_jobs = restrict_recall_probe_source_jobs(source_jobs, evidence_mode)
+                stats["recall_probe_used"] = 1
+                stats["recall_probe_query"] = query
+                stats["recall_probe_source"] = [source_name for source_name, _ in source_jobs]
             if ENABLE_SOURCE_HEALTH_REORDER:
                 stats["source_health_before"] = {
                     key: dict(value)
@@ -10860,7 +11957,7 @@ def retrieve_evidence(
             if claim_source_limit > 0:
                 source_jobs = budgeted_source_jobs(source_jobs, claim_source_limit, query_goal, source_intent)
                 stats["skipped_sources_by_budget"] = int(stats.get("skipped_sources_by_budget", 0) or 0) + max(0, original_source_job_count - len(source_jobs))
-            if ENABLE_PLAYWRIGHT and used_playwright_queries < PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
+            if not is_recall_probe and ENABLE_PLAYWRIGHT and used_playwright_queries < PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
                 use_playwright, playwright_reason = should_use_playwright_fallback(
                     claim_evidence,
                     evidence_mode,
@@ -10883,6 +11980,8 @@ def retrieve_evidence(
                     "q": query,
                     "goal": query_goal,
                     "origin": normalize_text(str(query_item.get("origin") or "")) or "planner",
+                    "query_variant_origin": query_variant_origin_value(query_item),
+                    "probe_only_if_raw_zero": is_recall_probe,
                     "sources": [source_name for source_name, _ in source_jobs],
                     "source_count": len(source_jobs),
                 }
@@ -11003,14 +12102,14 @@ def retrieve_evidence(
                             page_text = fetch_page_text(item["url"], max_chars=raw_chars, timeout_sec=timeout_sec, trace=detail_trace)
                             item["detail"] = extract_relevant_passage(page_text, passage_focus_terms(source_query, str(item.get("title") or "")), max_chars=passage_chars)
                             enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec, fetch_trace=detail_trace)
-                            apply_detail_fetch_trace(stats, item, detail_trace)
+                            apply_detail_fetch_trace(stats, item, detail_trace, source_name)
                             detail_fetches += 1
                             stats["detail_successes"] = int(stats.get("detail_successes", 0) or 0) + 1
                             add_timing(stats, "fetch_detail", time.perf_counter() - detail_started)
                         except Exception as exc:
                             add_timing(stats, "fetch_detail", time.perf_counter() - detail_started if "detail_started" in locals() else 0.0)
-                            apply_detail_fetch_trace(stats, item, detail_trace)
-                            record_detail_fetch_failure(stats, item, exc)
+                            apply_detail_fetch_trace(stats, item, detail_trace, source_name)
+                            record_detail_fetch_failure(stats, item, exc, source_name)
                     item["relevance_score"] = evidence_relevance_score(source_query, item)
                     item["entity_match_count"] = entity_match_count(source_query, item)
                     if evidence_mode == "route_fact":
@@ -11018,8 +12117,14 @@ def retrieve_evidence(
                     item["directness_score"] = evidence_directness_score(source_query, item, evidence_mode)
                     item["temporal_score"] = evidence_temporal_score(source_query, item)
                     item["event_window_score"] = event_window_score(source_query, item, evidence_mode)
-                    item["answer_candidates"] = answer_candidate_sentences(source_query, item)
+                    item["answer_candidates"] = answer_candidate_sentences(source_query, item, evidence_mode=evidence_mode)
+                    maybe_apply_deterministic_candidate_rescue(claim_item, item, evidence_mode, source_query)
                     item["answer_candidate_quality_score"] = answer_candidate_quality_score(item)
+                    if item.get("direct_candidate_rescue_used"):
+                        stats["direct_candidate_rescue_used"] = int(stats.get("direct_candidate_rescue_used", 0) or 0) + 1
+                        source_field = str(item.get("direct_candidate_rescue_source") or "")
+                        if source_field:
+                            increment_named_counter(stats, "direct_candidate_rescue_sources", source_field)
                     item.update(task_card_match_features(item, claim_item.get("evidence_task_card", {}) if isinstance(claim_item.get("evidence_task_card"), dict) else {}))
                     if item["answer_candidates"]:
                         stats["answer_candidate_count"] = int(stats.get("answer_candidate_count", 0) or 0) + len(item["answer_candidates"])
@@ -11090,12 +12195,35 @@ def retrieve_evidence(
                         keep_item = True
                         filter_reason = "soft_keep_route_review_candidate"
                     if not keep_item:
+                        keep_item, filter_reason = maybe_promote_fact_page_keep_review(
+                            source_query,
+                            item,
+                            filter_reason,
+                            evidence_mode,
+                            claim_item,
+                        )
+                    if not keep_item:
+                        keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
+                            source_query,
+                            item,
+                            filter_reason,
+                            evidence_mode,
+                            claim_item,
+                        )
+                    if not keep_item:
+                        record_fact_filter_diagnostic(stats, item, False, filter_reason)
                         add_trusted_deepen_jobs(stats, source_jobs, item, filter_reason, source_query)
                         record_source_item_quality(stats, source_name, item, kept=False, filter_reason=filter_reason)
                         stats["filtered_results"] += 1
                         add_filter_reason(stats, filter_reason)
                         add_filtered_sample(stats, filter_reason, item)
                         continue
+                    record_fact_filter_diagnostic(stats, item, True, filter_reason)
+                    if item.get("readiness_promotion_used"):
+                        stats["readiness_promotion_used"] = int(stats.get("readiness_promotion_used", 0) or 0) + 1
+                        increment_named_counter(stats, "readiness_promotion_source", normalize_text(str(item.get("readiness_promotion_source") or "fact_page_keep_review")) or "fact_page_keep_review")
+                        stats.setdefault("candidate_strength_before_keep_scores", []).append(int(item.get("candidate_strength_before_keep") or 0))
+                    finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
                     record_source_item_quality(stats, source_name, item, kept=True)
                     claim_evidence.append(item)
                     if not item.get("_bridge_expanded"):
@@ -11174,6 +12302,8 @@ def retrieve_evidence(
                         )
             if should_stop_querying_after_web_budget(claim_evidence, evidence_mode, source_intent, max_results_per_query):
                 break
+            if is_recall_probe:
+                stats["recall_probe_raw_hits"] = int(stats.get("raw_results", 0) or 0) - query_raw_before
         claim_evidence.sort(
             key=lambda item: (
                 item.get("task_card_score", 0),
