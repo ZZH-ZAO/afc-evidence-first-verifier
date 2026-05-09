@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.env.*
+
+# Debug / temp outputs
+tmp_*/
+tmp_*.json
+*.tmp
+
+# Cache
+.cache_v2/
+
+# Backup files
+*.bak_*
+*.corrupt_backup_*
+*.bak
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Recovered / legacy
+pyc_recover/
+evidence_from_pyc.py
+
+# Old backups at root
+solve.py.bak_*
+playwright_retrieval.py.bak_*
+solve_v1.py
+
+# Output directory (runtime artifacts)
+output/
