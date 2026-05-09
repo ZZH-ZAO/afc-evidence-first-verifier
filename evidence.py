@@ -682,7 +682,10 @@ def apply_candidate_features_to_point(point: Dict[str, Any], candidate: Dict[str
         "date_hits",
         "sentence_candidate_profile",
         "candidate_slot_match",
+        "candidate_slot_coverage",
         "direct_candidate_gap_reason",
+        "candidate_directness_rank",
+        "direct_candidate_promotion_used",
     ):
         if key in candidate:
             out[key] = candidate.get(key)
@@ -903,6 +906,11 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
         date_hits=date_hits,
         route_analysis=route_analysis,
     )
+    slot_coverage = build_sentence_slot_coverage(mode, slot_match, gap_reason)
+    directness_rank = sentence_candidate_directness_rank(profile, slot_match, gap_reason, slot_coverage)
+    direct_candidate_promotion_used = profile == "direct_candidate" and not (
+        slot_coverage.get("subject") and slot_coverage.get("time_scope") and (slot_coverage.get("metric_or_relation") or slot_coverage.get("status_or_result"))
+    )
     return {
         "sentence_directness": directness,
         "sentence_score_total": total_score,
@@ -937,7 +945,10 @@ def sentence_candidate_features(item: Dict[str, Any], candidate: Dict[str, Any],
         "conversion_narrowing_reasons": narrowing_reasons[:6],
         "sentence_candidate_profile": profile,
         "candidate_slot_match": slot_match,
+        "candidate_slot_coverage": slot_coverage,
         "direct_candidate_gap_reason": gap_reason,
+        "candidate_directness_rank": directness_rank,
+        "direct_candidate_promotion_used": direct_candidate_promotion_used,
     }
 
 
@@ -958,23 +969,118 @@ def infer_sentence_candidate_slot_match(
     has_route = bool((route_analysis or {}).get("has_relation_marker"))
     has_status = bool(status_or_result_hit)
     if mode == EVIDENCE_MODE_ROUTE or has_route:
-        if has_subject and has_route:
-            return "subject+metric_or_result"
-        if has_route:
-            return "metric_or_result_only"
+        return build_sentence_slot_signature(
+            has_subject=has_subject,
+            has_metric=has_route,
+            has_status=has_status,
+        )
     if has_subject and has_time and (has_metric or has_status):
-        return "subject+time+metric_or_result"
+        return build_sentence_slot_signature(
+            has_subject=True,
+            has_time=True,
+            has_metric=has_metric,
+            has_status=has_status,
+        )
     if has_subject and (has_metric or has_status):
-        return "subject+metric_or_result"
+        return build_sentence_slot_signature(
+            has_subject=True,
+            has_metric=has_metric,
+            has_status=has_status,
+        )
     if has_time and (has_metric or has_status):
-        return "time+metric_or_result"
+        return build_sentence_slot_signature(
+            has_time=True,
+            has_metric=has_metric,
+            has_status=has_status,
+        )
     if has_subject and has_time:
-        return "subject+time"
+        return build_sentence_slot_signature(has_subject=True, has_time=True)
     if has_metric or has_status:
-        return "metric_or_result_only"
+        return build_sentence_slot_signature(has_metric=has_metric, has_status=has_status)
     if has_time:
-        return "time_scope_only"
+        return build_sentence_slot_signature(has_time=True)
     return "weak_anchor"
+
+
+def build_sentence_slot_signature(
+    *,
+    has_subject: bool = False,
+    has_time: bool = False,
+    has_metric: bool = False,
+    has_status: bool = False,
+) -> str:
+    slots: List[str] = []
+    if has_subject:
+        slots.append("subject")
+    if has_time:
+        slots.append("time_scope")
+    if has_metric:
+        slots.append("metric_or_relation")
+    if has_status:
+        slots.append("status_or_result")
+    return "+".join(slots) if slots else "weak_anchor"
+
+
+def sentence_slot_match_flags(slot_match: str) -> Dict[str, bool]:
+    parts = {
+        normalize_text(str(part or ""))
+        for part in str(slot_match or "").split("+")
+        if normalize_text(str(part or ""))
+    }
+    return {
+        "subject": "subject" in parts,
+        "time_scope": "time_scope" in parts,
+        "metric_or_relation": "metric_or_relation" in parts,
+        "status_or_result": "status_or_result" in parts,
+    }
+
+
+def build_sentence_slot_coverage(mode: str, slot_match: str, gap_reason: str) -> Dict[str, Any]:
+    flags = sentence_slot_match_flags(slot_match)
+    coverage = {
+        "subject": bool(flags.get("subject")),
+        "time_scope": bool(flags.get("time_scope")),
+        "metric_or_relation": bool(flags.get("metric_or_relation")),
+        "status_or_result": bool(flags.get("status_or_result")),
+        "date_role": mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and gap_reason != "date_role_mismatch",
+        "result_granularity": mode == "event_result" and gap_reason != "result_granularity_mismatch",
+    }
+    coverage["slot_count"] = sum(
+        1 for key in ("subject", "time_scope", "metric_or_relation", "status_or_result")
+        if coverage.get(key)
+    )
+    coverage["slot_match_signature"] = slot_match
+    return coverage
+
+
+def sentence_candidate_directness_rank(
+    profile: str,
+    slot_match: str,
+    gap_reason: str,
+    coverage: Optional[Dict[str, Any]] = None,
+) -> int:
+    flags = sentence_slot_match_flags(slot_match)
+    slot_count = int(
+        (coverage or {}).get("slot_count")
+        or sum(
+            1
+            for key in ("subject", "time_scope", "metric_or_relation", "status_or_result")
+            if flags.get(key)
+        )
+    )
+    if profile == "direct_candidate":
+        if flags.get("subject") and flags.get("time_scope") and (flags.get("metric_or_relation") or flags.get("status_or_result")):
+            return 5
+        return 4
+    if gap_reason in {"date_role_mismatch", "result_granularity_mismatch", "opening_slot_mismatch", "route_relation_indirect"}:
+        return 3
+    if profile == "slot_hit_but_indirect":
+        return 3 if slot_count >= 2 else 2
+    if profile in {"numeric_reference_only", "date_reference_only"}:
+        return 2
+    if profile == "background_commentary":
+        return 1
+    return 0
 
 
 def infer_sentence_candidate_gap_reason(
@@ -989,6 +1095,8 @@ def infer_sentence_candidate_gap_reason(
     date_hits: List[Any],
     route_analysis: Optional[Dict[str, Any]] = None,
 ) -> str:
+    slot_flags = sentence_slot_match_flags(slot_match)
+    slot_count = sum(1 for key in ("subject", "time_scope", "metric_or_relation", "status_or_result") if slot_flags.get(key))
     claim_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", claim, flags=re.I))
     sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", sentence, flags=re.I))
     sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))
@@ -1010,9 +1118,9 @@ def infer_sentence_candidate_gap_reason(
             return "result_granularity_mismatch"
     if sentence_has_commentary and utility_label in {"background", "noise"}:
         return "commentary_only"
-    if mode == EVIDENCE_MODE_NUMERIC and slot_match in {"metric_or_result_only", "weak_anchor"} and numeric_hits:
+    if mode == EVIDENCE_MODE_NUMERIC and slot_count <= 1 and numeric_hits:
         return "numeric_reference_only"
-    if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and slot_match == "time_scope_only" and date_hits:
+    if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and slot_flags.get("time_scope") and slot_count == 1 and date_hits:
         return "date_reference_only"
     if mode == EVIDENCE_MODE_ROUTE and route_analysis and not route_analysis.get("directly_answers_route") and route_analysis.get("has_relation_marker"):
         return "route_relation_indirect"
@@ -1034,17 +1142,23 @@ def infer_sentence_candidate_profile(
     date_hits: List[Any],
     route_analysis: Optional[Dict[str, Any]] = None,
 ) -> str:
+    slot_flags = sentence_slot_match_flags(slot_match)
+    strong_fact_slots = slot_flags.get("subject") and slot_flags.get("time_scope") and (slot_flags.get("metric_or_relation") or slot_flags.get("status_or_result"))
+    medium_fact_slots = (
+        (slot_flags.get("subject") and (slot_flags.get("metric_or_relation") or slot_flags.get("status_or_result")))
+        or (slot_flags.get("time_scope") and (slot_flags.get("metric_or_relation") or slot_flags.get("status_or_result")))
+    )
     if gap_reason == "commentary_only":
         return "background_commentary"
     if mode == EVIDENCE_MODE_NUMERIC and gap_reason == "numeric_reference_only":
         return "numeric_reference_only"
     if mode in {EVIDENCE_MODE_DATE, EVIDENCE_MODE_SCHEDULE} and gap_reason == "date_reference_only":
         return "date_reference_only"
-    if directness == SENTENCE_DIRECTNESS_DIRECT and slot_match == "subject+time+metric_or_result" and not gap_reason:
+    if directness == SENTENCE_DIRECTNESS_DIRECT and strong_fact_slots and not gap_reason:
         return "direct_candidate"
-    if directness == SENTENCE_DIRECTNESS_DIRECT and slot_match in {"subject+metric_or_result", "time+metric_or_result"} and not gap_reason:
+    if directness == SENTENCE_DIRECTNESS_DIRECT and medium_fact_slots and not gap_reason:
         return "direct_candidate"
-    if slot_match in {"subject+time+metric_or_result", "subject+metric_or_result", "time+metric_or_result", "subject+time"}:
+    if slot_flags.get("subject") or slot_flags.get("time_scope") or slot_flags.get("metric_or_relation") or slot_flags.get("status_or_result"):
         return "slot_hit_but_indirect"
     if mode == EVIDENCE_MODE_NUMERIC and numeric_hits:
         return "numeric_reference_only"
@@ -1181,6 +1295,9 @@ def collect_evidence_sentence_candidates(evidence: List[Dict[str, Any]], claim: 
             collected.append(enriched)
     collected.sort(
         key=lambda row: (
+            int(row.get("candidate_directness_rank") or 0),
+            int((row.get("candidate_slot_coverage") or {}).get("slot_count") or 0),
+            bool(row.get("direct_candidate_promotion_used")),
             int(row.get("sentence_score_total") or 0),
             int(row.get("sentence_utility_score") or 0),
             str(row.get("sentence_directness") or "") == SENTENCE_DIRECTNESS_DIRECT,
@@ -2031,7 +2148,14 @@ def point_conversion_diagnostics(summary: Dict[str, Any], coverage: Dict[str, An
             sentence_candidate_profile[profile] = int(sentence_candidate_profile.get(profile, 0) or 0) + 1
     top_candidate = sentence_candidates[0] if sentence_candidates else {}
     top_candidate_slot_match = normalize_text(str(top_candidate.get("candidate_slot_match") or ""))
+    top_candidate_slot_coverage = (
+        top_candidate.get("candidate_slot_coverage")
+        if isinstance(top_candidate.get("candidate_slot_coverage"), dict)
+        else {}
+    )
     direct_candidate_gap_reason = normalize_text(str(top_candidate.get("direct_candidate_gap_reason") or ""))
+    candidate_directness_rank = int(top_candidate.get("candidate_directness_rank") or 0)
+    direct_candidate_promotion_used = bool(top_candidate.get("direct_candidate_promotion_used"))
     stage = POINT_STAGE_CONVERTED
     reason = "已有 supporting/refuting points"
     if not sentence_candidates:
@@ -2082,7 +2206,10 @@ def point_conversion_diagnostics(summary: Dict[str, Any], coverage: Dict[str, An
         ),
         "sentence_candidate_profile": sentence_candidate_profile,
         "top_candidate_slot_match": top_candidate_slot_match,
+        "candidate_slot_coverage": top_candidate_slot_coverage,
         "direct_candidate_gap_reason": direct_candidate_gap_reason,
+        "candidate_directness_rank": candidate_directness_rank,
+        "direct_candidate_promotion_used": direct_candidate_promotion_used,
         "stage": stage,
         "reason": reason,
     }

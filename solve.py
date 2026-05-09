@@ -1892,7 +1892,14 @@ def claim_pipeline_diagnostic(
         else {}
     )
     top_candidate_slot_match = str(point_conversion.get("top_candidate_slot_match") or "")
+    candidate_slot_coverage = (
+        point_conversion.get("candidate_slot_coverage")
+        if isinstance(point_conversion.get("candidate_slot_coverage"), dict)
+        else {}
+    )
     direct_candidate_gap_reason = str(point_conversion.get("direct_candidate_gap_reason") or "")
+    candidate_directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
+    point_direct_candidate_promotion_used = int(bool(point_conversion.get("direct_candidate_promotion_used")))
     missing_required_slots = [
         str(slot)
         for slot in (diagnostic.get("missing_required_slots") or [])
@@ -2003,7 +2010,10 @@ def claim_pipeline_diagnostic(
         "point_conversion_block_layer": point_conversion_block_layer,
         "sentence_candidate_profile": sentence_candidate_profile,
         "top_candidate_slot_match": top_candidate_slot_match,
+        "candidate_slot_coverage": candidate_slot_coverage,
         "direct_candidate_gap_reason": direct_candidate_gap_reason,
+        "candidate_directness_rank": candidate_directness_rank,
+        "direct_candidate_promotion_used": point_direct_candidate_promotion_used,
         "missing_required_slots": missing_required_slots[:4],
         "slot_alignment_status": slot_alignment_status,
         "environment_block_reason": environment_block_reason,
@@ -9314,6 +9324,8 @@ def dominant_pipeline_row(
             score += 2
         if pipeline_row_has_retained_progress(item):
             score += 2
+        score += min(5, int(item.get("candidate_directness_rank") or 0))
+        score += 2 if int(item.get("direct_candidate_promotion_used") or 0) > 0 else 0
         score += recall_probe_progress_priority(item) * 6
         score += rescue_stage_priority(item) * 2
         ranked.append((score, item))
@@ -9388,7 +9400,10 @@ def insufficient_evidence_reason(
     point_block_layer = str(dominant_row.get("point_conversion_block_layer") or "")
     sentence_candidate_profile = dominant_row.get("sentence_candidate_profile") if isinstance(dominant_row.get("sentence_candidate_profile"), dict) else {}
     top_candidate_slot_match = str(dominant_row.get("top_candidate_slot_match") or "")
+    candidate_slot_coverage = dominant_row.get("candidate_slot_coverage") if isinstance(dominant_row.get("candidate_slot_coverage"), dict) else {}
     direct_candidate_gap_reason = str(dominant_row.get("direct_candidate_gap_reason") or "")
+    candidate_directness_rank = int(dominant_row.get("candidate_directness_rank") or 0)
+    direct_candidate_promotion_used = int(dominant_row.get("direct_candidate_promotion_used") or 0)
     environment_block_reason = str(dominant_row.get("environment_block_reason") or "")
     direct_candidate_rescue_used = int(dominant_row.get("direct_candidate_rescue_used") or 0)
     direct_candidate_rescue_stages = dominant_row.get("direct_candidate_rescue_stages") if isinstance(dominant_row.get("direct_candidate_rescue_stages"), dict) else {}
@@ -9400,6 +9415,22 @@ def insufficient_evidence_reason(
     has_core_support = has_new_scheme_core_supporting_evidence(extracted, evidence_summary)
     unresolved_details = has_unresolved_high_risk_detail_claims(extracted, evidence_summary)
     dominant_claim_text = normalize_text(str(dominant_row.get("claim") or ""))
+
+    def slot_hit(slot_name: str) -> bool:
+        if candidate_slot_coverage.get(slot_name) is True:
+            return True
+        slot_parts = {
+            normalize_text(str(part or ""))
+            for part in top_candidate_slot_match.split("+")
+            if normalize_text(str(part or ""))
+        }
+        legacy_parts = {
+            "subject": {"subject"},
+            "time_scope": {"time_scope", "time"},
+            "metric_or_relation": {"metric_or_relation", "metric_or_result"},
+            "status_or_result": {"status_or_result", "metric_or_result"},
+        }
+        return bool(slot_parts & legacy_parts.get(slot_name, {slot_name}))
 
     def opening_slot_clause(relaxed: bool = False) -> str:
         if not relaxed and point_block_reason not in {"numeric_not_normalizable", "candidate_not_direct", "not_same_fact_slot"}:
@@ -9435,9 +9466,15 @@ def insufficient_evidence_reason(
             return "当前候选句只有日期痕迹，还没有把这个日期稳定绑定到 claim 要核的事实位点。"
         if direct_candidate_gap_reason == "commentary_only":
             return "当前候选句更多是解释、评论或背景表述，不是可直接裁决的事实句。"
-        if top_candidate_slot_match == "subject+time+metric_or_result":
+        if slot_hit("subject") and slot_hit("time_scope") and (slot_hit("metric_or_relation") or slot_hit("status_or_result")):
+            if direct_candidate_promotion_used > 0 and candidate_directness_rank >= 4:
+                return "当前最强候选句已经打到主体、时间和关键结果位点，但表达还不够直接，离稳定直裁还差最后一层。"
             return "当前候选句已经打到主体、时间和结果/数值位点，但表达还不够直接。"
-        if top_candidate_slot_match in {"subject+metric_or_result", "time+metric_or_result", "subject+time"}:
+        if (
+            (slot_hit("subject") and (slot_hit("metric_or_relation") or slot_hit("status_or_result")))
+            or (slot_hit("time_scope") and (slot_hit("metric_or_relation") or slot_hit("status_or_result")))
+            or (slot_hit("subject") and slot_hit("time_scope"))
+        ):
             return "当前候选句已经打到一部分关键位点，但还没形成可直接回答的直裁句。"
         if sentence_candidate_profile:
             return "当前已经有候选句，但它们整体还停在弱句层，没有形成稳定的 direct candidate。"
