@@ -2100,7 +2100,14 @@ def infer_access_path_state(
     recall_probe_used: int,
     recall_probe_raw_hits: int,
     direct_candidate_rescue_used: int,
+    diagnostic_access_path_state: str = "",
+    source_budget_cutoff: Optional[Dict[str, Any]] = None,
 ) -> str:
+    if diagnostic_access_path_state:
+        return diagnostic_access_path_state
+    source_budget_cutoff = source_budget_cutoff if isinstance(source_budget_cutoff, dict) else {}
+    if source_budget_cutoff.get("applied") and raw_results <= 0:
+        return "source_budget_cutoff"
     if environment_block_reason == "source_access_blocked_without_rescue":
         return "source_access_blocked"
     if environment_block_reason in {"requests_blocked_playwright_failed", "detail_read_failed_after_fetch"}:
@@ -2118,7 +2125,10 @@ def infer_access_block_source(
     environment_block_reason: str,
     news_family_state: str,
     html_family_state: str,
+    diagnostic_access_block_source: str = "",
 ) -> str:
+    if diagnostic_access_block_source:
+        return diagnostic_access_block_source
     if environment_block_reason == "source_access_blocked_without_rescue":
         if "blocked" in news_family_state and "blocked" in html_family_state:
             return "news_and_html"
@@ -2141,9 +2151,14 @@ def infer_rescue_attempt_state(
     direct_candidate_rescue_used: int,
     rescue_promoted_from_filter: int,
     playwright_rescued: int,
+    diagnostic_playwright_rescue_state: str = "",
 ) -> str:
     if direct_candidate_rescue_used > 0 or rescue_promoted_from_filter > 0:
         return "candidate_rescue_succeeded"
+    if diagnostic_playwright_rescue_state == "playwright_rescue_failed":
+        return "playwright_rescue_failed"
+    if diagnostic_playwright_rescue_state == "playwright_rescue_skipped_by_policy":
+        return "playwright_rescue_skipped_by_policy"
     if playwright_rescued > 0:
         return "playwright_rescue_succeeded"
     if recall_probe_used > 0 and recall_probe_raw_hits > 0:
@@ -2477,6 +2492,19 @@ def claim_pipeline_diagnostic(
     recall_probe_raw_hits = int(diagnostic.get("recall_probe_raw_hits") or 0)
     recall_probe_query = normalize_text(str(diagnostic.get("recall_probe_query") or ""))
     recall_probe_source = diagnostic.get("recall_probe_source") if isinstance(diagnostic.get("recall_probe_source"), list) else []
+    retrieval_access_path_state = str(diagnostic.get("access_path_state") or "")
+    retrieval_access_block_source = str(diagnostic.get("access_block_source") or "")
+    source_budget_cutoff = diagnostic.get("source_budget_cutoff") if isinstance(diagnostic.get("source_budget_cutoff"), dict) else {}
+    provider_health_snapshot = diagnostic.get("provider_health_snapshot") if isinstance(diagnostic.get("provider_health_snapshot"), list) else []
+    effective_source_plan = diagnostic.get("effective_source_plan") if isinstance(diagnostic.get("effective_source_plan"), list) else []
+    playwright_rescue_state = str(diagnostic.get("playwright_rescue_state") or "")
+    playwright_rescue_trigger = str(diagnostic.get("playwright_rescue_trigger") or "")
+    playwright_rescue_source = str(diagnostic.get("playwright_rescue_source") or "")
+    playwright_rescue_result_count = int(diagnostic.get("playwright_rescue_result_count") or 0)
+    official_entry_attempted = normalize_bool(diagnostic.get("official_entry_attempted"), False)
+    official_entry_hit = normalize_bool(diagnostic.get("official_entry_hit"), False)
+    official_entry_source_family = str(diagnostic.get("official_entry_source_family") or "")
+    official_discovery_block_reason = str(diagnostic.get("official_discovery_block_reason") or "")
     raw_results = int(diagnostic.get("raw_results") or 0)
     kept_web = int(diagnostic.get("kept_web") or 0)
     answer_candidate_total = int(diagnostic.get("answer_candidate_total") or 0)
@@ -2490,11 +2518,14 @@ def claim_pipeline_diagnostic(
         recall_probe_used,
         recall_probe_raw_hits,
         direct_candidate_rescue_used,
+        retrieval_access_path_state,
+        source_budget_cutoff,
     )
     access_block_source = infer_access_block_source(
         environment_block_reason,
         news_family_state,
         html_family_state,
+        retrieval_access_block_source,
     )
     rescue_attempt_state = infer_rescue_attempt_state(
         environment_block_reason,
@@ -2503,6 +2534,7 @@ def claim_pipeline_diagnostic(
         direct_candidate_rescue_used,
         rescue_promoted_from_filter,
         playwright_rescued,
+        playwright_rescue_state,
     )
     claim_family = infer_claim_family(claim, summary)
     core_binding_strength = infer_core_binding_strength(claim, decision_slots, direct_need)
@@ -2652,6 +2684,17 @@ def claim_pipeline_diagnostic(
         "recall_probe_raw_hits": recall_probe_raw_hits,
         "recall_probe_query": recall_probe_query,
         "recall_probe_source": recall_probe_source[:4],
+        "source_budget_cutoff": source_budget_cutoff,
+        "provider_health_snapshot": provider_health_snapshot[:5],
+        "effective_source_plan": effective_source_plan[:10],
+        "playwright_rescue_state": playwright_rescue_state,
+        "playwright_rescue_trigger": playwright_rescue_trigger,
+        "playwright_rescue_source": playwright_rescue_source,
+        "playwright_rescue_result_count": playwright_rescue_result_count,
+        "official_entry_attempted": official_entry_attempted,
+        "official_entry_hit": official_entry_hit,
+        "official_entry_source_family": official_entry_source_family,
+        "official_discovery_block_reason": official_discovery_block_reason,
         "program_expected_failure_stage": str(evidence_need_program.get("expected_failure_stage") or ""),
         "program_anchor_buckets": list(decision_slots.get("anchor_buckets") or [])[:6] if isinstance(decision_slots, dict) else [],
         "program_direct_evidence_need": compact_claim_text(str(direct_need.get("must_answer") or ""), 120),
@@ -11019,6 +11062,12 @@ def insufficient_evidence_reason(
     access_path_state = str(dominant_row.get("access_path_state") or "")
     access_block_source = str(dominant_row.get("access_block_source") or "")
     rescue_attempt_state = str(dominant_row.get("rescue_attempt_state") or "")
+    source_budget_cutoff = dominant_row.get("source_budget_cutoff") if isinstance(dominant_row.get("source_budget_cutoff"), dict) else {}
+    playwright_rescue_state = str(dominant_row.get("playwright_rescue_state") or "")
+    playwright_rescue_trigger = str(dominant_row.get("playwright_rescue_trigger") or "")
+    official_entry_attempted = normalize_bool(dominant_row.get("official_entry_attempted"), False)
+    official_entry_hit = normalize_bool(dominant_row.get("official_entry_hit"), False)
+    official_discovery_block_reason = str(dominant_row.get("official_discovery_block_reason") or "")
     detail_fetch_paths = dominant_row.get("detail_fetch_paths") if isinstance(dominant_row.get("detail_fetch_paths"), dict) else {}
     has_core_support = has_new_scheme_core_supporting_evidence(extracted, evidence_summary)
     unresolved_details = has_unresolved_high_risk_detail_claims(extracted, evidence_summary)
@@ -11063,13 +11112,29 @@ def insufficient_evidence_reason(
         return "已经额外尝试了更贴事实位点的检索问法，但仍没有稳定拿回原始结果"
 
     def access_clause() -> str:
-        if access_path_state == "source_access_blocked":
+        if access_path_state == "source_budget_cutoff":
+            omitted = source_budget_cutoff.get("omitted_sources") if isinstance(source_budget_cutoff.get("omitted_sources"), list) else []
+            if omitted:
+                return f"当前主要卡在 source budget 截断：像 {compact_claim_text(str(omitted[0]), 40)} 这类入口没有轮到执行。"
+            return "当前主要卡在 source budget 截断：后排入口没有真正执行到。"
+        if access_path_state == "official_discovery_failed":
+            if official_entry_attempted and not official_entry_hit:
+                if official_discovery_block_reason == "anti_bot_blocked":
+                    return "当前官网/权威入口发现也尝试过了，但发现阶段被反爬或搜索页阻塞住了。"
+                return "当前官网/权威入口也尝试过了，但还没稳定找到可用的 authority 入口页。"
+        if access_path_state in {"source_access_blocked", "access_blocked_but_rescuable"}:
             if access_block_source:
                 return f"当前主要卡在外站访问受阻：{access_block_source} 这一路没有稳定拿回原始结果。"
             return "当前主要卡在外站访问受阻：原始结果没有稳定拿回。"
-        if access_path_state == "page_access_or_read_blocked":
+        if access_path_state in {"page_access_or_read_blocked", "access_blocked_and_unresolved"}:
             if rescue_attempt_state == "playwright_rescue_succeeded":
                 return "当前页面访问一度受阻，但救援只拿回了部分材料，正文读取仍不稳定。"
+            if playwright_rescue_state == "playwright_rescue_failed":
+                if playwright_rescue_trigger:
+                    return f"当前主要卡在页面访问或正文读取受阻：已经触发过 Playwright 救援（{playwright_rescue_trigger}），但还是没把关键正文稳定读下来。"
+                return "当前主要卡在页面访问或正文读取受阻：已经尝试过 Playwright 救援，但还是没把关键正文稳定读下来。"
+            if rescue_attempt_state == "playwright_rescue_skipped_by_policy":
+                return "当前页面访问有阻塞迹象，但本轮补救策略没有真正接手，关键正文仍没稳定拿下来。"
             return "当前主要卡在页面访问或正文读取受阻：相关页出现过，但关键正文没有稳定读下来。"
         if access_path_state == "provider_recall_insufficient_after_probe":
             return "当前已经补试了更贴位点的检索问法，但 provider 侧仍没有稳定召回足够结果。"
@@ -11176,7 +11241,7 @@ def insufficient_evidence_reason(
                 return f"当前主要卡在检索召回：关键 claim 还没有拿到足够可用的原始材料，尤其缺少能直接回答“{program_need}”的证据，因此暂不判定为事实错误。"
             return "当前主要卡在检索召回，关键 claim 还没有拿到足够可用的原始材料，因此暂不判定为事实错误。"
         if stage == "retrieval_filter":
-            if access_prefix and access_path_state == "page_access_or_read_blocked":
+            if access_prefix and access_path_state in {"page_access_or_read_blocked", "access_blocked_and_unresolved"}:
                 return access_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"
             if env_prefix:
                 return env_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"

@@ -83,7 +83,7 @@ PLAYWRIGHT_AFTER_SEARCH = os.environ.get("V2_PLAYWRIGHT_AFTER_SEARCH", "1").lowe
 ENABLE_ADAPTIVE_SOURCE_FALLBACK = os.environ.get("V2_ENABLE_ADAPTIVE_SOURCE_FALLBACK", "0").lower() in {"1", "true", "yes"}
 ADAPTIVE_SOURCE_FALLBACK_LIMIT = int(os.environ.get("V2_ADAPTIVE_SOURCE_FALLBACK_LIMIT", "1"))
 ENABLE_SOURCE_TOP1_PRECHECK = os.environ.get("V2_ENABLE_SOURCE_TOP1_PRECHECK", "0").lower() in {"1", "true", "yes"}
-ENABLE_SOURCE_HEALTH_REORDER = os.environ.get("V2_ENABLE_SOURCE_HEALTH_REORDER", "0").lower() in {"1", "true", "yes"}
+ENABLE_SOURCE_HEALTH_REORDER = os.environ.get("V2_ENABLE_SOURCE_HEALTH_REORDER", "1").lower() in {"1", "true", "yes"}
 ENABLE_TRUSTED_FILTER_DEEPEN = os.environ.get("V2_ENABLE_TRUSTED_FILTER_DEEPEN", "0").lower() in {"1", "true", "yes"}
 ENABLE_PAGE_UTILITY_LLM_RERANK = os.environ.get("V2_ENABLE_PAGE_UTILITY_LLM_RERANK", "1").lower() in {"1", "true", "yes"}
 PAGE_UTILITY_LLM_MAX_ITEMS_PER_CLAIM = int(os.environ.get("V2_PAGE_UTILITY_LLM_MAX_ITEMS_PER_CLAIM", "3"))
@@ -459,9 +459,9 @@ def summarize_source_recall_diagnosis(
         family = source_family_name(source_name)
         target = family_rollup.setdefault(
             family,
-            {"calls": 0, "raw": 0, "kept": 0, "filtered": 0, "errors": 0},
+            {"calls": 0, "raw": 0, "kept": 0, "filtered": 0, "errors": 0, "anti_bot_blocks": 0},
         )
-        for key in ["calls", "raw", "kept", "filtered", "errors"]:
+        for key in ["calls", "raw", "kept", "filtered", "errors", "anti_bot_blocks"]:
             target[key] += int(bucket.get(key, 0) or 0)
         if int(bucket.get("raw", 0) or 0) > 0:
             raw_sources.append(str(source_name))
@@ -533,8 +533,11 @@ def source_family_recall_state(source_recall_diagnosis: Dict[str, Any], family: 
     raw = int(bucket.get("raw", 0) or 0)
     kept = int(bucket.get("kept", 0) or 0)
     errors = int(bucket.get("errors", 0) or 0)
+    anti_bot_blocks = int(bucket.get("anti_bot_blocks", 0) or 0)
     if calls <= 0:
         return "not_used"
+    if anti_bot_blocks > 0 and raw <= 0:
+        return "blocked"
     if errors > 0 and raw <= 0:
         return "provider_error"
     if raw <= 0:
@@ -614,32 +617,86 @@ def budgeted_source_jobs(
     limit: int,
     query_goal: str,
     source_intent: Dict[str, Any],
-) -> List[tuple[str, str]]:
+    query_item: Optional[Dict[str, Any]] = None,
+) -> tuple[List[tuple[str, str]], Dict[str, Any]]:
     if limit <= 0 or len(source_jobs) <= limit:
-        return source_jobs
+        return source_jobs, {
+            "applied": False,
+            "limit": limit,
+            "original_count": len(source_jobs),
+            "selected_count": len(source_jobs),
+            "selected_sources": [str(source) for source, _ in source_jobs],
+            "omitted_sources": [],
+            "omitted_families": [],
+            "different_family_omitted": False,
+            "higher_priority_omitted": False,
+            "preserved_family_diversity": False,
+            "high_value_query": False,
+        }
+    query_item = query_item if isinstance(query_item, dict) else {}
+    query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
+    high_value_query = query_goal == "verification_question" or query_family_role in {"closure", "distinguish", "refute"}
     if limit == 1:
-        return source_jobs[:1]
+        selected = source_jobs[:1]
+        omitted = source_jobs[1:]
+        return selected, {
+            "applied": True,
+            "limit": limit,
+            "original_count": len(source_jobs),
+            "selected_count": len(selected),
+            "selected_sources": [str(source) for source, _ in selected],
+            "omitted_sources": [str(source) for source, _ in omitted][:6],
+            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
+            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(selected[0][0]))}),
+            "higher_priority_omitted": False,
+            "preserved_family_diversity": False,
+            "high_value_query": high_value_query,
+        }
     page_intent = normalize_page_intent(source_intent)
     needed_page_type = str(page_intent.get("needed_page_type") or "")
     preserve_family_diversity = query_goal in {"find_route_page", "find_page_intent_page"} or (
         query_goal == "verification_question" and needed_page_type not in {"", "general_page"}
     )
+    preserve_family_diversity = preserve_family_diversity or high_value_query
     if not preserve_family_diversity:
-        return source_jobs[:limit]
+        selected = source_jobs[:limit]
+        omitted = source_jobs[limit:]
+        return selected, {
+            "applied": True,
+            "limit": limit,
+            "original_count": len(source_jobs),
+            "selected_count": len(selected),
+            "selected_sources": [str(source) for source, _ in selected],
+            "omitted_sources": [str(source) for source, _ in omitted][:6],
+            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
+            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(source)) for source, _ in selected}),
+            "higher_priority_omitted": False,
+            "preserved_family_diversity": False,
+            "high_value_query": high_value_query,
+        }
 
     selected: List[tuple[str, str]] = []
     used_names = set()
 
-    def pick_family(family_name: str) -> None:
+    def pick_family(family_name: str, source_names: Optional[List[str]] = None) -> None:
         for job in source_jobs:
             source_name = str(job[0])
             if source_name in used_names:
                 continue
-            if source_family_name(source_name) != family_name:
+            if source_names and source_name not in source_names:
+                continue
+            if not source_names and source_family_name(source_name) != family_name:
                 continue
             selected.append(job)
             used_names.add(source_name)
             return
+
+    if high_value_query and limit >= 2:
+        pick_family("html")
+        if len(selected) < limit:
+            pick_family("authority_or_news", ["domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss"])
+        if len(selected) < limit:
+            pick_family("html", ["bing_html", "duckduckgo_html", "sogou_html"])
 
     for family_name in ["html", "news_rss", "rss", "other"]:
         if len(selected) >= limit:
@@ -654,7 +711,24 @@ def budgeted_source_jobs(
         used_names.add(source_name)
         if len(selected) >= limit:
             break
-    return selected[:limit]
+    selected = selected[:limit]
+    selected_names = {str(source) for source, _ in selected}
+    omitted = [job for job in source_jobs if str(job[0]) not in selected_names]
+    selected_indexes = [index for index, job in enumerate(source_jobs) if str(job[0]) in selected_names]
+    omitted_indexes = [index for index, job in enumerate(source_jobs) if str(job[0]) not in selected_names]
+    return selected, {
+        "applied": True,
+        "limit": limit,
+        "original_count": len(source_jobs),
+        "selected_count": len(selected),
+        "selected_sources": [str(source) for source, _ in selected],
+        "omitted_sources": [str(source) for source, _ in omitted][:6],
+        "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
+        "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(source)) for source, _ in selected}),
+        "higher_priority_omitted": bool(selected_indexes and omitted_indexes and min(omitted_indexes) < max(selected_indexes)),
+        "preserved_family_diversity": preserve_family_diversity,
+        "high_value_query": high_value_query,
+    }
 
 
 def clamp_int(value: Any, lower: int, upper: int) -> int:
@@ -3516,6 +3590,7 @@ def discover_official_domains(
             "discovered_domains": [],
             "official_discovery_score": 0,
             "official_discovery_used": False,
+            "official_discovery_block_reason": "",
             "official_discovery_reason": "not_required_or_already_has_preferred_domains",
         }
 
@@ -3523,7 +3598,7 @@ def discover_official_domains(
     candidates_by_domain: Dict[str, Dict[str, Any]] = {}
     logs: List[Dict[str, Any]] = []
     discovery_sources: List[str] = []
-    for source_name in ["bing_rss", "bing_news_zh_rss", "bing_news_rss", "bing_html", "sogou_html", "duckduckgo_html"]:
+    for source_name in ["bing_rss", "bing_news_zh_rss", "bing_news_rss", "bing_html", "duckduckgo_html", "sogou_html"]:
         if source_enabled_for_query(source_name):
             discovery_sources.append(source_name)
     for query in queries[:2]:
@@ -3604,8 +3679,19 @@ def discover_official_domains(
         "discovered_domains": discovered,
         "official_discovery_score": best_discovered_score,
         "official_discovery_used": bool(discovered),
+        "official_discovery_block_reason": infer_official_discovery_block_reason(logs, discovered),
         "official_discovery_logs": logs[:5],
     }
+
+
+def infer_official_discovery_block_reason(logs: List[Dict[str, Any]], discovered: List[str]) -> str:
+    if discovered:
+        return ""
+    if any(exception_looks_like_anti_bot(RuntimeError(str(item.get("error") or ""))) for item in logs if isinstance(item, dict)):
+        return "anti_bot_blocked"
+    if any(normalize_text(str(item.get("error") or "")) for item in logs if isinstance(item, dict)):
+        return "provider_error"
+    return "no_authority_domain_found"
 
 
 def query_texts_from_plan(question: str, claim: str, time_value: str, claim_item: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -5002,8 +5088,10 @@ def source_plan_for_query_goal(
     query_item = query_or_item if isinstance(query_or_item, dict) else {}
     query = normalize_text(str(query_item.get("q") or query_or_item or ""))
     query_goal = normalize_text(str(query_item.get("goal") or goal or "general_verify")) or "general_verify"
+    query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
     source_preference = query_item.get("source_preference") if isinstance(query_item.get("source_preference"), list) else []
     sources = source_plan_for_query(source_plan, query)
+    evidence_mode = effective_evidence_mode(source_intent, str(source_intent.get("evidence_mode") or ""))
     if query_goal == "find_metric_source_page":
         priority_sources = ["bing_html", "sogou_html", "bing_rss"]
         if ENABLE_DUCKDUCKGO:
@@ -5022,6 +5110,20 @@ def source_plan_for_query_goal(
     priority_sources = profile_sources_for_goal(profile, query_goal, query, source_intent)
     if priority_sources:
         sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+    role_priority: List[str] = []
+    if query_family_role == "closure":
+        role_priority = ["domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss", "bing_html"]
+    elif query_family_role == "distinguish":
+        role_priority = ["domain_sitemap", "bing_html", "bing_news_zh_rss", "bing_news_rss", "bing_rss"]
+    elif query_family_role == "refute":
+        role_priority = ["bing_news_zh_rss", "bing_news_rss", "bing_html", "bing_rss", "domain_sitemap"]
+    elif query_goal == "verification_question" and evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}:
+        role_priority = ["domain_sitemap", "bing_news_zh_rss", "bing_news_rss", "bing_html", "bing_rss"]
+    if ENABLE_DUCKDUCKGO and role_priority:
+        insert_after = role_priority.index("bing_html") + 1 if "bing_html" in role_priority else len(role_priority)
+        role_priority = role_priority[:insert_after] + ["duckduckgo_html"] + role_priority[insert_after:]
+    if role_priority:
+        sources = reorder_sources_by_priority_order(dedupe_keep_order(role_priority + sources), role_priority)
     sources = reorder_sources_by_evidence_shape(sources, source_intent)
     sources = reorder_sources_by_query_preference(sources, query_goal, query, [str(item) for item in source_preference])
     sources = finalize_route_source_plan(sources, source_intent, query_goal)
@@ -5071,6 +5173,41 @@ def route_retry_should_fetch_detail(
     if source_name in {"bing_news_rss", "bing_news_zh_rss", "bing_html", "duckduckgo_html", "playwright_duckduckgo"}:
         return True
     return False
+
+
+def has_high_priority_source_attempt(stats: Dict[str, Any]) -> bool:
+    pollution = stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}
+    for source_name, bucket in pollution.items():
+        if not isinstance(bucket, dict):
+            continue
+        if source_family_name(str(source_name)) in {"html", "news_rss"} and int(bucket.get("calls", 0) or 0) > 0:
+            return True
+    return False
+
+
+def has_source_level_anti_bot(stats: Dict[str, Any]) -> bool:
+    pollution = stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}
+    for bucket in pollution.values():
+        if isinstance(bucket, dict) and int(bucket.get("anti_bot_blocks", 0) or 0) > 0:
+            return True
+    return False
+
+
+def infer_playwright_rescue_state(stats: Dict[str, Any]) -> str:
+    playwright_rescued = int(stats.get("playwright_rescued", 0) or 0)
+    playwright_queries = stats.get("playwright_queries") if isinstance(stats.get("playwright_queries"), list) else []
+    skipped_reasons = stats.get("playwright_skipped_reasons") if isinstance(stats.get("playwright_skipped_reasons"), list) else []
+    pollution = stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}
+    playwright_bucket = pollution.get("playwright_duckduckgo") if isinstance(pollution.get("playwright_duckduckgo"), dict) else {}
+    playwright_calls = int(playwright_bucket.get("calls", 0) or 0)
+    playwright_raw = int(playwright_bucket.get("raw", 0) or 0)
+    if playwright_rescued > 0 or playwright_raw > 0:
+        return "playwright_rescue_succeeded"
+    if playwright_calls > 0 or playwright_queries:
+        return "playwright_rescue_failed"
+    if skipped_reasons:
+        return "playwright_rescue_skipped_by_policy"
+    return ""
 
 
 def build_specialized_queries(question: str, claim: str, time_value: str) -> List[str]:
@@ -11322,6 +11459,59 @@ def diagnose_claim_retrieval(
         environment_block_reason = "detail_read_failed_after_fetch"
     elif detail_anti_bot_errors > 0 and playwright_rescued > 0:
         environment_block_reason = "requests_blocked_playwright_rescued"
+    official_discovery_block_reason = normalize_text(str(stats.get("official_discovery_block_reason") or ""))
+    if not official_discovery_block_reason and isinstance(stats.get("official_discovery_logs"), list):
+        official_discovery_block_reason = infer_official_discovery_block_reason(stats.get("official_discovery_logs") or [], stats.get("discovered_domains") or [])
+    source_budget_cutoff = stats.get("source_budget_cutoff") if isinstance(stats.get("source_budget_cutoff"), dict) else {}
+    provider_health_snapshot = stats.get("provider_health_snapshot") if isinstance(stats.get("provider_health_snapshot"), list) else []
+    effective_source_plan = [str(item) for item in (stats.get("effective_source_plan") or []) if str(item)][:10]
+    playwright_rescue_state = infer_playwright_rescue_state(stats)
+    playwright_reasons = stats.get("playwright_reasons") if isinstance(stats.get("playwright_reasons"), list) else []
+    playwright_skipped_reasons = stats.get("playwright_skipped_reasons") if isinstance(stats.get("playwright_skipped_reasons"), list) else []
+    pollution_bucket = source_pollution_stats.get("playwright_duckduckgo") if isinstance(source_pollution_stats.get("playwright_duckduckgo"), dict) else {}
+    playwright_rescue_result_count = int(pollution_bucket.get("raw", 0) or 0)
+    if playwright_rescue_state == "playwright_rescue_skipped_by_policy":
+        playwright_rescue_trigger = normalize_text(str(playwright_skipped_reasons[0] if playwright_skipped_reasons else "")) or "policy_skip"
+    else:
+        playwright_rescue_trigger = normalize_text(str(playwright_reasons[0] if playwright_reasons else "")) or ""
+    playwright_rescue_source = "playwright_duckduckgo" if (playwright_rescue_state or pollution_bucket) else ""
+    official_entry_attempted = bool(stats.get("official_discovery_attempted")) or "domain_sitemap" in effective_source_plan
+    official_entry_hit = bool(stats.get("official_discovery_used")) or bool(official_points)
+    official_entry_source_family = ""
+    if bool(stats.get("official_discovery_used")):
+        official_entry_source_family = "official_discovery"
+    elif any(str(item.get("source") or "") == "domain_sitemap" for item in web_items if isinstance(item, dict)):
+        official_entry_source_family = "sitemap"
+    elif any(str(item.get("source_type") or "") == "official" for item in web_items if isinstance(item, dict)):
+        official_entry_source_family = "official"
+    access_path_state = ""
+    access_block_source = ""
+    anti_bot_sources = [
+        str(source_name)
+        for source_name, bucket in source_pollution_stats.items()
+        if isinstance(bucket, dict) and int(bucket.get("anti_bot_blocks", 0) or 0) > 0
+    ]
+    partial_progress_available = len(web_items) > 0 or answer_candidate_total > 0 or direct_candidate_rescue_used > 0
+    if source_budget_cutoff.get("applied") and raw_results <= 0 and not anti_bot_blocks:
+        access_path_state = "source_budget_cutoff"
+    elif official_entry_attempted and not official_entry_hit and official_discovery_block_reason and not partial_progress_available:
+        access_path_state = "official_discovery_failed"
+    elif environment_block_reason == "source_access_blocked_without_rescue":
+        access_path_state = "access_blocked_but_rescuable"
+    elif environment_block_reason in {"requests_blocked_playwright_failed", "detail_read_failed_after_fetch"}:
+        access_path_state = "access_blocked_and_unresolved"
+    elif raw_results <= 0:
+        access_path_state = "provider_no_raw"
+    elif partial_progress_available:
+        access_path_state = "partial_progress_available"
+    else:
+        access_path_state = "raw_results_returned"
+    if anti_bot_sources:
+        access_block_source = normalize_text(str(anti_bot_sources[0]))
+    elif environment_block_reason == "detail_read_failed_after_fetch":
+        access_block_source = "detail_fetch_path"
+    elif access_path_state == "official_discovery_failed" and official_discovery_block_reason:
+        access_block_source = "official_discovery"
     needs_retry = False
     reason = "sufficient"
     if raw_results == 0:
@@ -11516,6 +11706,7 @@ def diagnose_claim_retrieval(
         "official_discovery_used": bool(stats.get("official_discovery_used")),
         "official_discovery_queries": stats.get("official_discovery_queries", []),
         "official_discovery_logs": stats.get("official_discovery_logs", []),
+        "official_discovery_block_reason": official_discovery_block_reason,
         "route_retry_source_strategy": stats.get("route_retry_source_strategy", ""),
         "budget_exhausted": bool(stats.get("budget_exhausted")),
         "detail_fetches": int(stats.get("detail_fetches", 0) or 0),
@@ -11526,6 +11717,18 @@ def diagnose_claim_retrieval(
         "detail_anti_bot_errors": detail_anti_bot_errors,
         "playwright_rescued": playwright_rescued,
         "environment_block_reason": environment_block_reason,
+        "access_path_state": access_path_state,
+        "access_block_source": access_block_source,
+        "source_budget_cutoff": source_budget_cutoff,
+        "provider_health_snapshot": provider_health_snapshot,
+        "effective_source_plan": effective_source_plan,
+        "playwright_rescue_state": playwright_rescue_state,
+        "playwright_rescue_trigger": playwright_rescue_trigger,
+        "playwright_rescue_source": playwright_rescue_source,
+        "playwright_rescue_result_count": playwright_rescue_result_count,
+        "official_entry_attempted": official_entry_attempted,
+        "official_entry_hit": official_entry_hit,
+        "official_entry_source_family": official_entry_source_family,
         "detail_fetch_paths": detail_fetch_paths,
         "direct_candidate_rescue_used": direct_candidate_rescue_used,
         "direct_candidate_rescue_sources": direct_candidate_rescue_sources,
@@ -11923,6 +12126,7 @@ def retrieve_evidence(
             "official_discovery_used": discovery_result.get("official_discovery_used", False),
             "official_discovery_queries": discovery_result.get("official_discovery_queries", []),
             "official_discovery_logs": discovery_result.get("official_discovery_logs", []),
+            "official_discovery_block_reason": discovery_result.get("official_discovery_block_reason", ""),
             "evidence_task_card": claim_item.get("evidence_task_card", {}) if isinstance(claim_item.get("evidence_task_card"), dict) else {},
             **source_strategy_eval,
         }
@@ -12110,10 +12314,16 @@ def retrieve_evidence(
                 source_jobs, health_actions = reorder_sources_by_health(source_jobs, source_health, evidence_mode, query_goal)
                 if health_actions:
                     stats.setdefault("source_health_reorder_actions", []).extend(health_actions[:5])
+                    stats["provider_health_snapshot"] = health_actions[:5]
             original_source_job_count = len(source_jobs)
             if claim_source_limit > 0:
-                source_jobs = budgeted_source_jobs(source_jobs, claim_source_limit, query_goal, source_intent)
+                source_jobs, source_budget_cutoff = budgeted_source_jobs(source_jobs, claim_source_limit, query_goal, source_intent, query_item)
                 stats["skipped_sources_by_budget"] = int(stats.get("skipped_sources_by_budget", 0) or 0) + max(0, original_source_job_count - len(source_jobs))
+                if source_budget_cutoff.get("applied"):
+                    stats["source_budget_cutoff"] = source_budget_cutoff
+            stats["effective_source_plan"] = dedupe_keep_order(
+                list(stats.get("effective_source_plan", [])) + [source_name for source_name, _ in source_jobs]
+            )[:10]
             if not is_recall_probe and ENABLE_PLAYWRIGHT and used_playwright_queries < PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
                 use_playwright, playwright_reason = should_use_playwright_fallback(
                     claim_evidence,
@@ -12121,9 +12331,18 @@ def retrieve_evidence(
                     centrality,
                     source_intent,
                 )
-                if PLAYWRIGHT_AFTER_SEARCH and int(stats.get("raw_results", 0) or 0) <= 0:
+                if (
+                    PLAYWRIGHT_AFTER_SEARCH
+                    and int(stats.get("raw_results", 0) or 0) <= 0
+                    and not has_high_priority_source_attempt(stats)
+                    and not has_source_level_anti_bot(stats)
+                ):
                     use_playwright = False
-                    playwright_reason = "skip_playwright_before_regular_search"
+                    playwright_reason = "skip_playwright_waiting_for_high_priority_search"
+                elif use_playwright and int(stats.get("raw_results", 0) or 0) <= 0 and has_source_level_anti_bot(stats):
+                    playwright_reason = "use_playwright_after_anti_bot_block"
+                elif use_playwright and int(stats.get("raw_results", 0) or 0) <= 0 and has_high_priority_source_attempt(stats):
+                    playwright_reason = "use_playwright_after_high_priority_no_raw"
                 playwright_query = query if use_playwright else ""
                 if playwright_query and not extract_site_constraint(playwright_query):
                     source_jobs.append(("playwright_duckduckgo", playwright_query))
