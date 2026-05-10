@@ -1668,20 +1668,77 @@ def detail_claim_logic_refutation_diagnostics(
     summary = summary if isinstance(summary, dict) else {}
     source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
     claim_text = normalize_text(str(claim.get("claim") or ""))
+    evidence_mode = normalize_text(str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or ""))
     structured_detail_retained = (
         str(claim.get("centrality") or "") in {"supporting", "peripheral"}
         and normalize_bool(source_intent.get("stated_as_fact", True), True)
         and has_structured_detail(claim_text, source_intent)
     )
-    logic_point: Dict[str, Any] = {}
+    direct_supporting = claim_direct_supporting_points(summary)
+
+    def point_text_for_logic(point: Dict[str, Any]) -> str:
+        return normalize_text(
+            " ".join(
+                [
+                    str(point.get("title") or ""),
+                    str(point.get("evidence_sentence") or ""),
+                    str(point.get("claim_value") or ""),
+                    str(point.get("evidence_value") or ""),
+                ]
+            )
+        )
+
+    def is_logic_refutation_form(point: Dict[str, Any]) -> bool:
+        if not isinstance(point, dict) or str(point.get("source_type") or "") != "computed":
+            return False
+        text = point_text_for_logic(point)
+        if not text:
+            return False
+        has_should = bool(re.search(r"(应为|应该为|合计应为|总计应为|应当为)", text))
+        has_not = bool(re.search(r"(而不是|不是|而非)", text))
+        has_logic_title = "逻辑计算" in normalize_text(str(point.get("title") or ""))
+        has_numeric_or_result = bool(re.search(r"\d", text) or re.search(r"(胜|负|平|比分|日期|时间|金额|票房|价格)", text))
+        return (has_should and has_not) or (has_logic_title and has_numeric_or_result)
+
+    def point_matches_logic_topic(point: Dict[str, Any], claim_obj: Dict[str, Any]) -> bool:
+        text = point_text_for_logic(point)
+        claim_body = normalize_text(str(claim_obj.get("claim") or ""))
+        if not text or not claim_body:
+            return False
+        topic_rules = [
+            (r"(交锋|交手|总战绩|赛季交锋|常规赛交锋)", r"(交锋|交手|总战绩|赛季交锋|常规赛交锋)"),
+            (r"(赛后战绩|战绩提升至|战绩为|\d+胜\d+负)", r"(战绩|胜|负)"),
+            (r"(比分|比数|战果)", r"(比分|比数|战果|胜|负)"),
+            (r"(发布日期|发布日|公布日)", r"(发布日期|发布日|公布日|发布|公布)"),
+            (r"(生效日|生效时间)", r"(生效日|生效时间|生效)"),
+            (r"(举办日|开赛日|比赛时间|赛程)", r"(举办日|开赛日|比赛时间|赛程|举行|开赛)"),
+            (r"(金额|票房|价格|市值|汇率|美元|元)", r"(金额|票房|价格|市值|汇率|美元|元)"),
+            (r"(身份|归属|属于|担任|职位)", r"(身份|归属|属于|担任|职位)"),
+        ]
+        for claim_pattern, point_pattern in topic_rules:
+            if re.search(claim_pattern, claim_body):
+                return bool(re.search(point_pattern, text))
+        if evidence_mode in {"date_fact", "schedule_fact"}:
+            return bool(re.search(r"(日期|时间|日|月|年|发布|生效|举行|开赛)", text))
+        if evidence_mode in {"numeric_fact", "event_result"}:
+            return bool(re.search(r"(\d|胜|负|比分|金额|价格|涨|跌)", text))
+        return True
+
+    broad_logic_points: List[Dict[str, Any]] = []
+    same_topic_logic_points: List[Dict[str, Any]] = []
+    stable_logic_points: List[Dict[str, Any]] = []
     if structured_detail_retained:
         for bucket in ("supporting_points", "refuting_points", "uncertain_points"):
             for point in (summary.get(bucket) or []):
-                if isinstance(point, dict) and point_is_stable_logic_detail_refutation(point, claim):
-                    logic_point = point
-                    break
-            if logic_point:
-                break
+                if not isinstance(point, dict) or not is_logic_refutation_form(point):
+                    continue
+                broad_logic_points.append(point)
+                if not point_matches_logic_topic(point, claim):
+                    continue
+                same_topic_logic_points.append(point)
+                if point_is_stable_logic_detail_refutation(point, claim):
+                    stable_logic_points.append(point)
+    logic_point = stable_logic_points[0] if stable_logic_points else same_topic_logic_points[0] if same_topic_logic_points else broad_logic_points[0] if broad_logic_points else {}
     basis_text = ""
     if logic_point:
         basis_text = compact_claim_text(
@@ -1695,14 +1752,43 @@ def detail_claim_logic_refutation_diagnostics(
             ),
             120,
         )
-    gap_reason = ""
-    if structured_detail_retained and not logic_point:
+    if not structured_detail_retained:
+        logic_refutation_state = "not_retained"
+        closure_stage = ""
+        gap_reason = ""
+    elif stable_logic_points:
+        logic_refutation_state = "stable_logic_refutation_ready"
+        closure_stage = "stable_logic_point"
+        gap_reason = ""
+    elif direct_supporting:
+        logic_refutation_state = "shadowed_by_direct_channel"
+        closure_stage = "direct_support_present"
+        if same_topic_logic_points:
+            gap_reason = "shadowed_by_direct_channel"
+        elif broad_logic_points:
+            gap_reason = "logic_point_topic_mismatch"
+        else:
+            gap_reason = "no_logic_refutation_candidate"
+    elif not broad_logic_points:
+        logic_refutation_state = "retained_without_logic_point"
+        closure_stage = "no_logic_point"
         gap_reason = "no_logic_refutation_candidate"
+    elif not same_topic_logic_points:
+        logic_refutation_state = "logic_point_topic_mismatch"
+        closure_stage = "logic_point_found"
+        gap_reason = "logic_point_topic_mismatch"
+    else:
+        logic_refutation_state = "same_topic_logic_point_unstable"
+        closure_stage = "same_topic_logic_point"
+        gap_reason = "logic_refutation_closure_unstable"
     return {
         "structured_detail_retained": structured_detail_retained,
-        "logic_refutation_candidate": bool(logic_point),
+        "logic_refutation_candidate": bool(same_topic_logic_points),
         "logic_refutation_basis": basis_text,
         "logic_refutation_gap_reason": gap_reason,
+        "logic_refutation_state": logic_refutation_state,
+        "logic_refutation_closure_stage": closure_stage,
+        "logic_refutation_block_reason": gap_reason,
     }
 
 
@@ -1870,6 +1956,147 @@ def evidence_first_audit(
     }
 
 
+def candidate_slot_coverage_summary(
+    candidate_slot_coverage: Optional[Dict[str, Any]],
+    top_candidate_slot_match: str,
+) -> str:
+    coverage = candidate_slot_coverage if isinstance(candidate_slot_coverage, dict) else {}
+    ordered_slots = [
+        "subject",
+        "time_scope",
+        "metric_or_relation",
+        "status_or_result",
+        "date_role",
+        "result_granularity",
+    ]
+    hit_slots = [slot for slot in ordered_slots if coverage.get(slot) is True]
+    if hit_slots:
+        return "+".join(hit_slots)
+    legacy_parts = [
+        normalize_text(str(part or ""))
+        for part in str(top_candidate_slot_match or "").split("+")
+        if normalize_text(str(part or ""))
+    ]
+    if legacy_parts:
+        return "+".join(legacy_parts[:4])
+    slot_count = int(coverage.get("slot_count") or 0)
+    if slot_count > 0:
+        return f"slot_count={slot_count}"
+    return ""
+
+
+def infer_candidate_promotion_basis(
+    direct_candidate_promotion_used: int,
+    candidate_slot_coverage: Optional[Dict[str, Any]],
+    top_candidate_slot_match: str,
+    candidate_directness_rank: int,
+) -> str:
+    if direct_candidate_promotion_used <= 0:
+        return ""
+    slot_summary = candidate_slot_coverage_summary(candidate_slot_coverage, top_candidate_slot_match)
+    if slot_summary:
+        return f"{slot_summary}|rank={candidate_directness_rank}"
+    return f"rank={candidate_directness_rank}"
+
+
+def infer_candidate_promotion_block_reason(
+    direct_candidate_promotion_used: int,
+    direct_candidate_gap_reason: str,
+    point_conversion_block_reason: str,
+    sentence_candidate_profile: Optional[Dict[str, int]],
+    candidate_slot_coverage: Optional[Dict[str, Any]],
+) -> str:
+    if direct_candidate_promotion_used > 0:
+        return ""
+    coverage = candidate_slot_coverage if isinstance(candidate_slot_coverage, dict) else {}
+    profile = sentence_candidate_profile if isinstance(sentence_candidate_profile, dict) else {}
+    if direct_candidate_gap_reason in {
+        "opening_slot_mismatch",
+        "date_role_mismatch",
+        "result_granularity_mismatch",
+        "numeric_reference_only",
+        "date_reference_only",
+        "commentary_only",
+    }:
+        return direct_candidate_gap_reason
+    if point_conversion_block_reason in {
+        "not_same_fact_slot",
+        "date_role_mismatch",
+        "result_granularity_mismatch",
+        "numeric_not_normalizable",
+    }:
+        return point_conversion_block_reason
+    if int(profile.get("background_commentary") or 0) > 0 and int(profile.get("direct_candidate") or 0) <= 0:
+        return "background_commentary_topranked"
+    slot_count = int(coverage.get("slot_count") or 0)
+    if slot_count >= 2:
+        return "slot_hit_but_indirect"
+    return "candidate_not_direct"
+
+
+def infer_access_path_state(
+    environment_block_reason: str,
+    raw_results: int,
+    kept_web: int,
+    answer_candidate_total: int,
+    recall_probe_used: int,
+    recall_probe_raw_hits: int,
+    direct_candidate_rescue_used: int,
+) -> str:
+    if environment_block_reason == "source_access_blocked_without_rescue":
+        return "source_access_blocked"
+    if environment_block_reason in {"requests_blocked_playwright_failed", "detail_read_failed_after_fetch"}:
+        return "page_access_or_read_blocked"
+    if raw_results <= 0 and recall_probe_used > 0 and recall_probe_raw_hits <= 0:
+        return "provider_recall_insufficient_after_probe"
+    if raw_results <= 0:
+        return "provider_recall_insufficient"
+    if kept_web > 0 or answer_candidate_total > 0 or direct_candidate_rescue_used > 0:
+        return "partial_progress_available"
+    return "raw_results_returned"
+
+
+def infer_access_block_source(
+    environment_block_reason: str,
+    news_family_state: str,
+    html_family_state: str,
+) -> str:
+    if environment_block_reason == "source_access_blocked_without_rescue":
+        if "blocked" in news_family_state and "blocked" in html_family_state:
+            return "news_and_html"
+        if "blocked" in news_family_state:
+            return "news_family"
+        if "blocked" in html_family_state:
+            return "html_family"
+        return "provider_request_path"
+    if environment_block_reason in {"requests_blocked_playwright_failed", "detail_read_failed_after_fetch"}:
+        if "blocked" in html_family_state:
+            return "html_family"
+        return "detail_fetch_path"
+    return ""
+
+
+def infer_rescue_attempt_state(
+    environment_block_reason: str,
+    recall_probe_used: int,
+    recall_probe_raw_hits: int,
+    direct_candidate_rescue_used: int,
+    rescue_promoted_from_filter: int,
+    playwright_rescued: int,
+) -> str:
+    if direct_candidate_rescue_used > 0 or rescue_promoted_from_filter > 0:
+        return "candidate_rescue_succeeded"
+    if playwright_rescued > 0:
+        return "playwright_rescue_succeeded"
+    if recall_probe_used > 0 and recall_probe_raw_hits > 0:
+        return "recall_probe_recovered_raw_results"
+    if recall_probe_used > 0:
+        return "recall_probe_attempted_but_failed"
+    if environment_block_reason:
+        return "no_rescue_recovered_progress"
+    return ""
+
+
 def claim_direct_decidable_diagnostic(
     claim: Dict[str, Any],
     summary: Optional[Dict[str, Any]],
@@ -1950,9 +2177,23 @@ def claim_pipeline_diagnostic(
         if isinstance(point_conversion.get("candidate_slot_coverage"), dict)
         else {}
     )
+    candidate_slot_coverage_summary_text = candidate_slot_coverage_summary(candidate_slot_coverage, top_candidate_slot_match)
     direct_candidate_gap_reason = str(point_conversion.get("direct_candidate_gap_reason") or "")
     candidate_directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
     point_direct_candidate_promotion_used = int(bool(point_conversion.get("direct_candidate_promotion_used")))
+    direct_candidate_promotion_basis = infer_candidate_promotion_basis(
+        point_direct_candidate_promotion_used,
+        candidate_slot_coverage,
+        top_candidate_slot_match,
+        candidate_directness_rank,
+    )
+    candidate_promotion_block_reason = infer_candidate_promotion_block_reason(
+        point_direct_candidate_promotion_used,
+        direct_candidate_gap_reason,
+        point_conversion_block_reason,
+        sentence_candidate_profile,
+        candidate_slot_coverage,
+    )
     missing_required_slots = [
         str(slot)
         for slot in (diagnostic.get("missing_required_slots") or [])
@@ -1979,6 +2220,33 @@ def claim_pipeline_diagnostic(
     recall_probe_raw_hits = int(diagnostic.get("recall_probe_raw_hits") or 0)
     recall_probe_query = normalize_text(str(diagnostic.get("recall_probe_query") or ""))
     recall_probe_source = diagnostic.get("recall_probe_source") if isinstance(diagnostic.get("recall_probe_source"), list) else []
+    raw_results = int(diagnostic.get("raw_results") or 0)
+    kept_web = int(diagnostic.get("kept_web") or 0)
+    answer_candidate_total = int(diagnostic.get("answer_candidate_total") or 0)
+    news_family_state = str(responsibility.get("news_family_state") or "")
+    html_family_state = str(responsibility.get("html_family_state") or "")
+    access_path_state = infer_access_path_state(
+        environment_block_reason,
+        raw_results,
+        kept_web,
+        answer_candidate_total,
+        recall_probe_used,
+        recall_probe_raw_hits,
+        direct_candidate_rescue_used,
+    )
+    access_block_source = infer_access_block_source(
+        environment_block_reason,
+        news_family_state,
+        html_family_state,
+    )
+    rescue_attempt_state = infer_rescue_attempt_state(
+        environment_block_reason,
+        recall_probe_used,
+        recall_probe_raw_hits,
+        direct_candidate_rescue_used,
+        rescue_promoted_from_filter,
+        playwright_rescued,
+    )
     if direct_diag.get("decidable"):
         blocked_at = str(direct_diag.get("stage") or "evidence_direct_decidable")
         boundary_reason = str(direct_diag.get("reason") or "direct_decidable")
@@ -2091,17 +2359,26 @@ def claim_pipeline_diagnostic(
         "program_anchor_buckets": list(decision_slots.get("anchor_buckets") or [])[:6] if isinstance(decision_slots, dict) else [],
         "program_direct_evidence_need": compact_claim_text(str(direct_need.get("must_answer") or ""), 120),
         "program_false_friend_evidence": compact_term_list(evidence_need_program.get("false_friend_evidence") or [], 3, 90),
-        "news_family_state": str(responsibility.get("news_family_state") or ""),
-        "html_family_state": str(responsibility.get("html_family_state") or ""),
-        "raw_results": int(diagnostic.get("raw_results") or 0),
-        "kept_web": int(diagnostic.get("kept_web") or 0),
-        "answer_candidate_total": int(diagnostic.get("answer_candidate_total") or 0),
+        "news_family_state": news_family_state,
+        "html_family_state": html_family_state,
+        "raw_results": raw_results,
+        "kept_web": kept_web,
+        "answer_candidate_total": answer_candidate_total,
         "direct_support_points": len(claim_direct_supporting_points(summary)),
         "direct_refute_points": len(claim_direct_refuting_points(summary)),
         "structured_detail_retained": int(bool(detail_state.get("structured_detail_retained"))),
         "logic_refutation_candidate": int(bool(detail_state.get("logic_refutation_candidate"))),
         "logic_refutation_basis": compact_claim_text(str(detail_state.get("logic_refutation_basis") or ""), 120),
         "logic_refutation_gap_reason": str(detail_state.get("logic_refutation_gap_reason") or ""),
+        "logic_refutation_state": str(detail_state.get("logic_refutation_state") or ""),
+        "logic_refutation_closure_stage": str(detail_state.get("logic_refutation_closure_stage") or ""),
+        "logic_refutation_block_reason": str(detail_state.get("logic_refutation_block_reason") or ""),
+        "direct_candidate_promotion_basis": direct_candidate_promotion_basis,
+        "candidate_promotion_block_reason": candidate_promotion_block_reason,
+        "candidate_slot_coverage_summary": candidate_slot_coverage_summary_text,
+        "access_path_state": access_path_state,
+        "access_block_source": access_block_source,
+        "rescue_attempt_state": rescue_attempt_state,
     }
 
 
@@ -8504,6 +8781,8 @@ def point_is_secondary_detail_refutation(
     claim: Optional[Dict[str, Any]] = None,
     summary: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    claim = claim if isinstance(claim, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
     if point.get("direct_answer") != "direct":
         return False
     if point.get("source_type") not in {"official", "news"}:
@@ -8535,6 +8814,22 @@ def point_is_secondary_detail_refutation(
     if int(point.get("event_window_score", 0) or 0) < 0:
         return False
     point_type = normalize_text(str(point.get("type") or "")).lower()
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    mode = normalize_text(str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or ""))
+    centrality = str(claim.get("centrality") or "")
+    direct_supporting = claim_direct_supporting_points(summary)
+    if (
+        point_type == "date_mismatch"
+        and point.get("source_type") != "official"
+        and (
+            bool(direct_supporting)
+            or (
+                centrality in {"supporting", "peripheral"}
+                and mode in {"date_fact", "schedule_fact"}
+            )
+        )
+    ):
+        return False
     if point_type in SECONDARY_DETAIL_REFUTATION_POINT_TYPES:
         return True
     numeric_alignment = point.get("numeric_alignment") if isinstance(point.get("numeric_alignment"), dict) else {}
@@ -9486,6 +9781,7 @@ def dominant_pipeline_row(
                     1 if str(item.get("centrality") or "") == "core" else 0,
                     int(item.get("logic_refutation_candidate") or 0),
                     int(item.get("structured_detail_retained") or 0),
+                    1 if str(item.get("logic_refutation_state") or "") in {"same_topic_logic_point_unstable", "shadowed_by_direct_channel"} else 0,
                     1 if str(item.get("pipeline_stage") or "") in {"retrieval_readiness", "evidence_partial_but_incomparable", "evidence_point_not_convertible"} else 0,
                     1 if str(item.get("program_expected_failure_stage") or "") in {"retrieval_readiness", "point_conversion", "comparability"} else 0,
                     recall_probe_progress_priority(item),
@@ -9532,8 +9828,10 @@ def dominant_pipeline_row(
             score += 2
         score += 7 if int(item.get("logic_refutation_candidate") or 0) > 0 else 0
         score += 3 if int(item.get("structured_detail_retained") or 0) > 0 else 0
+        score += 2 if str(item.get("logic_refutation_state") or "") in {"same_topic_logic_point_unstable", "shadowed_by_direct_channel"} else 0
         score += min(5, int(item.get("candidate_directness_rank") or 0))
         score += 2 if int(item.get("direct_candidate_promotion_used") or 0) > 0 else 0
+        score += 1 if str(item.get("candidate_promotion_block_reason") or "") in {"slot_hit_but_indirect", "opening_slot_mismatch"} else 0
         score += recall_probe_progress_priority(item) * 6
         score += rescue_stage_priority(item) * 2
         ranked.append((score, item))
@@ -9616,6 +9914,9 @@ def insufficient_evidence_reason(
     direct_candidate_gap_reason = str(dominant_row.get("direct_candidate_gap_reason") or "")
     candidate_directness_rank = int(dominant_row.get("candidate_directness_rank") or 0)
     direct_candidate_promotion_used = int(dominant_row.get("direct_candidate_promotion_used") or 0)
+    direct_candidate_promotion_basis = str(dominant_row.get("direct_candidate_promotion_basis") or "")
+    candidate_promotion_block_reason = str(dominant_row.get("candidate_promotion_block_reason") or "")
+    candidate_slot_coverage_summary_text = str(dominant_row.get("candidate_slot_coverage_summary") or "")
     environment_block_reason = str(dominant_row.get("environment_block_reason") or "")
     direct_candidate_rescue_used = int(dominant_row.get("direct_candidate_rescue_used") or 0)
     direct_candidate_rescue_stages = dominant_row.get("direct_candidate_rescue_stages") if isinstance(dominant_row.get("direct_candidate_rescue_stages"), dict) else {}
@@ -9623,6 +9924,9 @@ def insufficient_evidence_reason(
     recoverable_filter_reason = dominant_row.get("recoverable_filter_reason") if isinstance(dominant_row.get("recoverable_filter_reason"), dict) else {}
     recall_probe_used = int(dominant_row.get("recall_probe_used") or 0)
     recall_probe_raw_hits = int(dominant_row.get("recall_probe_raw_hits") or 0)
+    access_path_state = str(dominant_row.get("access_path_state") or "")
+    access_block_source = str(dominant_row.get("access_block_source") or "")
+    rescue_attempt_state = str(dominant_row.get("rescue_attempt_state") or "")
     detail_fetch_paths = dominant_row.get("detail_fetch_paths") if isinstance(dominant_row.get("detail_fetch_paths"), dict) else {}
     has_core_support = has_new_scheme_core_supporting_evidence(extracted, evidence_summary)
     unresolved_details = has_unresolved_high_risk_detail_claims(extracted, evidence_summary)
@@ -9666,6 +9970,21 @@ def insufficient_evidence_reason(
             return "已经改用更贴事实位点的检索问法拿回了结果"
         return "已经额外尝试了更贴事实位点的检索问法，但仍没有稳定拿回原始结果"
 
+    def access_clause() -> str:
+        if access_path_state == "source_access_blocked":
+            if access_block_source:
+                return f"当前主要卡在外站访问受阻：{access_block_source} 这一路没有稳定拿回原始结果。"
+            return "当前主要卡在外站访问受阻：原始结果没有稳定拿回。"
+        if access_path_state == "page_access_or_read_blocked":
+            if rescue_attempt_state == "playwright_rescue_succeeded":
+                return "当前页面访问一度受阻，但救援只拿回了部分材料，正文读取仍不稳定。"
+            return "当前主要卡在页面访问或正文读取受阻：相关页出现过，但关键正文没有稳定读下来。"
+        if access_path_state == "provider_recall_insufficient_after_probe":
+            return "当前已经补试了更贴位点的检索问法，但 provider 侧仍没有稳定召回足够结果。"
+        if access_path_state == "provider_recall_insufficient":
+            return "当前主要还是 provider 侧召回不足：关键原始结果没有稳定回来。"
+        return ""
+
     def candidate_gap_clause() -> str:
         if direct_candidate_gap_reason == "opening_slot_mismatch":
             return "当前候选句更多是盘中、收盘或泛涨跌材料，不是开盘事实位点。"
@@ -9679,6 +9998,8 @@ def insufficient_evidence_reason(
             return "当前候选句只有日期痕迹，还没有把这个日期稳定绑定到 claim 要核的事实位点。"
         if direct_candidate_gap_reason == "commentary_only":
             return "当前候选句更多是解释、评论或背景表述，不是可直接裁决的事实句。"
+        if candidate_promotion_block_reason == "background_commentary_topranked":
+            return "当前排在最前的仍偏评论句或背景句，还没把真正可核的事实句稳定顶上来。"
         if slot_hit("subject") and slot_hit("time_scope") and (slot_hit("metric_or_relation") or slot_hit("status_or_result")):
             if direct_candidate_promotion_used > 0 and candidate_directness_rank >= 4:
                 return "当前最强候选句已经打到主体、时间和关键结果位点，但表达还不够直接，离稳定直裁还差最后一层。"
@@ -9709,11 +10030,20 @@ def insufficient_evidence_reason(
             if not isinstance(row, dict) or not normalize_bool(row.get("structured_detail_retained"), False):
                 continue
             claim_text = compact_claim_text(str(row.get("claim") or ""), 60)
+            logic_state = str(row.get("logic_refutation_state") or "")
             if normalize_bool(row.get("logic_refutation_candidate"), False):
                 basis = compact_claim_text(str(row.get("logic_refutation_basis") or ""), 72)
+                if logic_state == "same_topic_logic_point_unstable":
+                    if basis:
+                        return f" 当前附带细节“{claim_text}”已保留，也拿到了同主题逻辑线索“{basis}”，但闭合还不够稳定。"
+                    return f" 当前附带细节“{claim_text}”已保留，也拿到了同主题逻辑线索，但闭合还不够稳定。"
                 if basis:
                     return f" 当前附带细节“{claim_text}”已保留，也拿到了可做逻辑闭合的线索“{basis}”，但还没稳定收成可裁决反证。"
                 return f" 当前附带细节“{claim_text}”已保留，也拿到了可做逻辑闭合的线索，但还没稳定收成可裁决反证。"
+            if logic_state == "logic_point_topic_mismatch":
+                return f" 当前附带细节“{claim_text}”已保留，也搜到过一些逻辑计算线索，但主题或位点还没对上，暂时不能消费成反证。"
+            if logic_state == "shadowed_by_direct_channel":
+                return f" 当前附带细节“{claim_text}”已保留，但现阶段仍被更强的网页直证通道压住，尚未单独收成稳定逻辑反证。"
             if str(row.get("state") or "") == "unresolved":
                 return f" 当前附带细节“{claim_text}”已保留，但还未形成稳定逻辑反证。"
         return ""
@@ -9741,8 +10071,11 @@ def insufficient_evidence_reason(
             return reason + f" 当前页面里已有相关句子，但还卡在{point_block_layer or '点层'}，没转成同一事实位点下可直接比较的证据点。"
         return reason
     if state == "unsupported":
+        access_prefix = access_clause()
         env_prefix = environment_block_prefix()
         if stage == "provider_recall":
+            if access_prefix:
+                return access_prefix + " 因此当前先把主阻塞记在 access / rescue / recall 这一层，不把它混成黑盒“没证据”。"
             if env_prefix:
                 return env_prefix + " 因此当前主要还停在检索召回阶段，暂不把这类环境失败当成事实错误。"
             if recall_probe_used > 0 and recall_probe_raw_hits <= 0:
@@ -9751,6 +10084,8 @@ def insufficient_evidence_reason(
                 return f"当前主要卡在检索召回：关键 claim 还没有拿到足够可用的原始材料，尤其缺少能直接回答“{program_need}”的证据，因此暂不判定为事实错误。"
             return "当前主要卡在检索召回，关键 claim 还没有拿到足够可用的原始材料，因此暂不判定为事实错误。"
         if stage == "retrieval_filter":
+            if access_prefix and access_path_state == "page_access_or_read_blocked":
+                return access_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"
             if env_prefix:
                 return env_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"
             if recoverable_filter_reason:
@@ -9771,7 +10106,8 @@ def insufficient_evidence_reason(
             gap_clause = candidate_gap_clause()
             if readiness_promotion_used > 0 and int(dominant_row.get("answer_candidate_total") or 0) > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "句层"
-                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                basis_clause = f" 当前最强候选句覆盖到 {candidate_slot_coverage_summary_text}。" if candidate_slot_coverage_summary_text else ""
+                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + basis_clause + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if readiness_promotion_used > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "页面到句子转换"
                 return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()

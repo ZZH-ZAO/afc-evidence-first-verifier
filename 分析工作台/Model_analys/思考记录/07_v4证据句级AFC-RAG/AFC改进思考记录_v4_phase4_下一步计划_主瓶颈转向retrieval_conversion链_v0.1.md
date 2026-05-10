@@ -761,3 +761,48 @@ AI/AJ/AK 这轮已经把句层诊断做真了，但也把新的收口问题暴�
 1. 先把 `structured detail retained but unresolved` 的 gap 再细化
 2. 再继续推 `slot_hit_but_indirect -> direct_candidate`
 3. 最后继续补 access / rescue 稳定性
+
+## AO/AP/AQ 首轮实施补记（2026-05-10）
+
+这轮已经完成首轮代码落地与最小验证，当前可以明确四点：
+
+1. 已经确认生效的部分
+   - `afc_0002` 继续稳定为 `1`
+   - supporting structured detail 的 retained-but-unresolved 不再只剩一个粗粒度 `no_logic_refutation_candidate`
+   - `claim_pipeline_diagnostics.items` 已能透出：
+     - `logic_refutation_state`
+     - `logic_refutation_closure_stage`
+     - `logic_refutation_block_reason`
+     - `direct_candidate_promotion_basis`
+     - `candidate_promotion_block_reason`
+     - `candidate_slot_coverage_summary`
+     - `access_path_state`
+     - `access_block_source`
+     - `rescue_attempt_state`
+
+2. 这轮顺手收住的新边界
+   - `afc_0001` 一度因为 supporting date detail 被旧新闻页误打成 `1`，现已收回到 `2`
+   - 对 supporting `date_fact / schedule_fact`，非官方且与现有 supporting signal 自相冲突的 `date_mismatch` 不再直接抬成 `secondary_detail_direct_refutation`
+   - 没有新增 `unsupported structured detail -> 1`
+
+3. 这轮得到的更真实瓶颈分层
+   - `structured detail` 侧已经能区分：
+     - `retained_without_logic_point`
+     - `logic_point_topic_mismatch`
+     - `same_topic_logic_point_unstable`
+     - `shadowed_by_direct_channel`
+   - 网页链路侧已经能区分：
+     - `source_access_blocked`
+     - `provider_recall_insufficient`
+     - `page_access_or_read_blocked`
+     - `partial_progress_available`
+
+4. 仍然没变的主瓶颈
+   - `0001 / 0003 / 0007` 仍大量停在 access / recall / filter 前段
+   - `0008 / 0010` 仍主要卡在 weak candidate 到 same-slot conversion 的后段
+
+所以从这轮结果反推，下一步优先级可以继续保持不变，但重点已经更清楚：
+
+1. 继续收 `same_topic_logic_point_unstable` 的闭合条件
+2. 继续把 `slot_hit_but_indirect` 稳定推向 `direct_candidate`
+3. 继续把 access blocked、provider recall insufficient、page read failed 的最终 reason 说得更一致
