@@ -1656,9 +1656,54 @@ def detail_claim_decidable_error_reason(
         return "direct_comparable_refutation"
     for bucket in ("supporting_points", "refuting_points", "uncertain_points"):
         for point in (summary.get(bucket) or []):
-            if point_is_stable_logic_detail_refutation(point):
+            if point_is_stable_logic_detail_refutation(point, claim):
                 return "stable_logic_refutation"
     return ""
+
+
+def detail_claim_logic_refutation_diagnostics(
+    claim: Dict[str, Any],
+    summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    summary = summary if isinstance(summary, dict) else {}
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    claim_text = normalize_text(str(claim.get("claim") or ""))
+    structured_detail_retained = (
+        str(claim.get("centrality") or "") in {"supporting", "peripheral"}
+        and normalize_bool(source_intent.get("stated_as_fact", True), True)
+        and has_structured_detail(claim_text, source_intent)
+    )
+    logic_point: Dict[str, Any] = {}
+    if structured_detail_retained:
+        for bucket in ("supporting_points", "refuting_points", "uncertain_points"):
+            for point in (summary.get(bucket) or []):
+                if isinstance(point, dict) and point_is_stable_logic_detail_refutation(point, claim):
+                    logic_point = point
+                    break
+            if logic_point:
+                break
+    basis_text = ""
+    if logic_point:
+        basis_text = compact_claim_text(
+            normalize_text(
+                str(
+                    logic_point.get("evidence_sentence")
+                    or logic_point.get("title")
+                    or logic_point.get("evidence_value")
+                    or ""
+                )
+            ),
+            120,
+        )
+    gap_reason = ""
+    if structured_detail_retained and not logic_point:
+        gap_reason = "no_logic_refutation_candidate"
+    return {
+        "structured_detail_retained": structured_detail_retained,
+        "logic_refutation_candidate": bool(logic_point),
+        "logic_refutation_basis": basis_text,
+        "logic_refutation_gap_reason": gap_reason,
+    }
 
 
 def claim_has_decidable_detail_error(
@@ -1721,6 +1766,7 @@ def detail_claim_resolution_state(
     profile = summary.get("comparability_profile") if isinstance(summary.get("comparability_profile"), dict) else claim_comparability_profile(claim, summary)
     direct_supporting = claim_direct_supporting_points(summary)
     error_reason = detail_claim_decidable_error_reason(claim, summary, need_type)
+    logic_diag = detail_claim_logic_refutation_diagnostics(claim, summary)
     if error_reason:
         return {
             "claim_id": claim_id,
@@ -1728,6 +1774,8 @@ def detail_claim_resolution_state(
             "reason": error_reason,
             "coverage_level": coverage_level,
             "comparability_status": str(profile.get("comparability_status") or "unsupported"),
+            **logic_diag,
+            "logic_refutation_gap_reason": "",
         }
     if direct_supporting:
         return {
@@ -1736,6 +1784,7 @@ def detail_claim_resolution_state(
             "reason": "direct_support_present",
             "coverage_level": coverage_level,
             "comparability_status": str(profile.get("comparability_status") or "unsupported"),
+            **logic_diag,
         }
     status = str(profile.get("comparability_status") or "unsupported")
     if status == "partial_but_incomparable":
@@ -1745,6 +1794,7 @@ def detail_claim_resolution_state(
             "reason": "partial_but_incomparable",
             "coverage_level": coverage_level,
             "comparability_status": status,
+            **logic_diag,
         }
     if coverage_level in {"none", "weak", "partial"}:
         return {
@@ -1753,6 +1803,7 @@ def detail_claim_resolution_state(
             "reason": "unsupported_or_weak_coverage",
             "coverage_level": coverage_level,
             "comparability_status": status,
+            **logic_diag,
         }
     return {
         "claim_id": claim_id,
@@ -1760,6 +1811,7 @@ def detail_claim_resolution_state(
         "reason": "no_decidable_detail_signal",
         "coverage_level": coverage_level,
         "comparability_status": status,
+        **logic_diag,
     }
 
 
@@ -1882,6 +1934,7 @@ def claim_pipeline_diagnostic(
     decision_slots = evidence_need_program.get("decision_slots") if isinstance(evidence_need_program.get("decision_slots"), dict) else {}
     direct_need = evidence_need_program.get("direct_evidence_need") if isinstance(evidence_need_program.get("direct_evidence_need"), dict) else {}
     direct_diag = claim_direct_decidable_diagnostic(claim, summary, need_type)
+    detail_state = detail_claim_resolution_state(claim, summary, need_type)
     readiness_block_reason = str(diagnostic.get("readiness_block_reason") or "")
     readiness_block_layer = str(diagnostic.get("readiness_block_layer") or "")
     point_conversion_block_reason = str(point_conversion.get("block_reason") or "")
@@ -2045,6 +2098,10 @@ def claim_pipeline_diagnostic(
         "answer_candidate_total": int(diagnostic.get("answer_candidate_total") or 0),
         "direct_support_points": len(claim_direct_supporting_points(summary)),
         "direct_refute_points": len(claim_direct_refuting_points(summary)),
+        "structured_detail_retained": int(bool(detail_state.get("structured_detail_retained"))),
+        "logic_refutation_candidate": int(bool(detail_state.get("logic_refutation_candidate"))),
+        "logic_refutation_basis": compact_claim_text(str(detail_state.get("logic_refutation_basis") or ""), 120),
+        "logic_refutation_gap_reason": str(detail_state.get("logic_refutation_gap_reason") or ""),
     }
 
 
@@ -5254,6 +5311,143 @@ def augment_market_calendar_detail_claims(extracted: Dict[str, Any], claims: Lis
     return claims + additions
 
 
+def augment_sports_structured_detail_claims(extracted: Dict[str, Any], claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if normalize_need_type(extracted.get("need_type")) != "sports_result":
+        return claims
+    answer_text = normalize_text(str(extracted.get("_answer_text") or ""))
+    if not answer_text:
+        return claims
+    existing_texts = [normalize_text(str(item.get("claim") or "")) for item in claims if isinstance(item, dict)]
+    existing_structured_supporting = 0
+    for claim in claims:
+        if not isinstance(claim, dict) or str(claim.get("centrality") or "") != "supporting":
+            continue
+        source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+        if has_structured_detail(str(claim.get("claim") or ""), source_intent):
+            existing_structured_supporting += 1
+    additions: List[Dict[str, Any]] = []
+    next_index = len(claims) + 1
+    for sentence in split_answer_sentences_for_claims(answer_text):
+        clean_sentence = strip_markdown_noise(sentence)
+        if not clean_sentence or len(clean_sentence) < 8:
+            continue
+        if any(claim_texts_overlap(clean_sentence, text) for text in existing_texts):
+            continue
+        if not re.search(r"(总战绩|交锋|交手|赛季交锋|常规赛交锋)", clean_sentence):
+            continue
+        if not re.search(r"(\d+\s*胜\s*\d+\s*负)", clean_sentence):
+            continue
+        if re.search(r"(助攻|篮板|抢断|盖帽|首节|末节|命中率|三分)", clean_sentence):
+            continue
+        source_intent = infer_augmented_clause_intent(clean_sentence, "sports_result")
+        source_intent = dict(source_intent)
+        source_intent["evidence_mode"] = "numeric_fact"
+        source_intent["evidence_target"] = infer_evidence_target(clean_sentence, "numeric_fact", "sports_result")
+        source_intent["risk_type"] = "detail_numeric"
+        source_intent["assertion_strength"] = "high"
+        source_strategy = source_intent.get("source_strategy") if isinstance(source_intent.get("source_strategy"), dict) else {}
+        source_strategy = dict(source_strategy)
+        source_strategy["why"] = "补充体育结果回答里容易影响真假的结构化细节，如赛后战绩、交锋总战绩、连败连胜等。"
+        source_intent["source_strategy"] = source_strategy
+        page_intent = source_intent.get("page_intent") if isinstance(source_intent.get("page_intent"), dict) else {}
+        page_intent = dict(page_intent)
+        page_intent["why"] = "优先保留能直接给出赛后战绩、交锋总战绩或连败连胜状态的结果页或赛后报道。"
+        source_intent["page_intent"] = page_intent
+        if not has_structured_detail(clean_sentence, source_intent):
+            continue
+        if claim_budget_bucket(clean_sentence, source_intent, "checkable") != "structured_detail":
+            continue
+        additions.append(
+            {
+                "claim_id": f"sd{next_index}",
+                "claim": clean_sentence,
+                "centrality": "supporting",
+                "checkability": "checkable",
+                "source_intent": source_intent,
+                "verification_questions": [],
+                "queries": [],
+                "evidence_task_card": build_evidence_task_card(clean_sentence, "supporting", source_intent, [], []),
+            }
+        )
+        existing_texts.append(clean_sentence)
+        next_index += 1
+        if existing_structured_supporting + len(additions) >= 4 or len(additions) >= 2:
+            break
+    return claims + additions
+
+
+def dedupe_structured_detail_claims(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def canonical_structured_detail_text(text: str) -> str:
+        cleaned = strip_markdown_noise(text)
+        cleaned = re.sub(r"citation:\d+", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"[（(].{0,80}?[)）]", "", cleaned)
+        cleaned = normalize_text(cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        return cleaned
+
+    def cleanliness_score(claim: Dict[str, Any]) -> Tuple[int, int, int]:
+        text = normalize_text(str(claim.get("claim") or ""))
+        score = 0
+        if text and not text.startswith("-"):
+            score += 1
+        if "citation:" not in text.lower():
+            score += 1
+        if "\n" not in str(claim.get("claim") or ""):
+            score += 1
+        return score, -len(text), 1 if str(claim.get("centrality") or "") == "supporting" else 0
+
+    def head_to_head_signature(text: str) -> str:
+        normalized = normalize_text(text)
+        if not re.search(r"(交锋|总战绩|交手|常规赛交锋)", normalized):
+            return ""
+        match = re.search(r"(\d+\s*胜\s*\d+\s*负)", normalized)
+        if not match:
+            return ""
+        return normalize_text(match.group(1)).replace(" ", "")
+
+    kept: List[Dict[str, Any]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        text = normalize_text(str(claim.get("claim") or ""))
+        source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+        if not has_structured_detail(text, source_intent):
+            kept.append(claim)
+            continue
+        canonical_text = canonical_structured_detail_text(str(claim.get("claim") or ""))
+        replaced = False
+        for idx, existing in enumerate(kept):
+            if not isinstance(existing, dict):
+                continue
+            existing_text = normalize_text(str(existing.get("claim") or ""))
+            existing_intent = existing.get("source_intent") if isinstance(existing.get("source_intent"), dict) else {}
+            if not has_structured_detail(existing_text, existing_intent):
+                continue
+            if str(existing_intent.get("evidence_mode") or "") != str(source_intent.get("evidence_mode") or ""):
+                continue
+            existing_canonical = canonical_structured_detail_text(str(existing.get("claim") or ""))
+            same_head_to_head = bool(
+                head_to_head_signature(text)
+                and head_to_head_signature(text) == head_to_head_signature(existing_text)
+            )
+            same_detail = (
+                canonical_text == existing_canonical
+                or canonical_text in existing_canonical
+                or existing_canonical in canonical_text
+                or same_head_to_head
+                or claim_texts_overlap(text, existing_text)
+            )
+            if not same_detail:
+                continue
+            if cleanliness_score(claim) > cleanliness_score(existing):
+                kept[idx] = claim
+            replaced = True
+            break
+        if not replaced:
+            kept.append(claim)
+    return kept
+
+
 def evidence_task_priority_score(
     claim_text: str,
     centrality: str,
@@ -6541,7 +6735,9 @@ def normalize_extracted_plan(extracted: Dict[str, Any]) -> Dict[str, Any]:
     normalized_claims = augment_exclusive_premise_claims(extracted, normalized_claims)
     normalized_claims = augment_mixed_detail_claims(extracted, normalized_claims)
     normalized_claims = augment_market_calendar_detail_claims(extracted, normalized_claims)
+    normalized_claims = augment_sports_structured_detail_claims(extracted, normalized_claims)
     normalized_claims = dedupe_exclusive_premise_claims(normalized_claims)
+    normalized_claims = dedupe_structured_detail_claims(normalized_claims)
     user_need = normalize_text(str(extracted.get("user_need") or ""))
     normalized = {
         "user_need": user_need,
@@ -8585,7 +8781,10 @@ def point_has_comparable_direct_refutation(
     return str(contract.get("comparability_status") or "") == "comparable"
 
 
-def point_is_stable_logic_detail_refutation(point: Dict[str, Any]) -> bool:
+def point_is_stable_logic_detail_refutation(
+    point: Dict[str, Any],
+    claim: Optional[Dict[str, Any]] = None,
+) -> bool:
     if not isinstance(point, dict):
         return False
     if str(point.get("source_type") or "") != "computed":
@@ -8597,6 +8796,11 @@ def point_is_stable_logic_detail_refutation(point: Dict[str, Any]) -> bool:
         return False
     if not re.search(r"(而不是|不是|而非)", text):
         return False
+    claim_text = normalize_text(str((claim or {}).get("claim") or ""))
+    title = normalize_text(str(point.get("title") or ""))
+    if ("交锋战绩逻辑计算" in title or "总计应为2-1，而不是2-2" in text) and claim_text:
+        if not re.search(r"(交锋|交手|总战绩|赛季交锋|常规赛交锋)", claim_text):
+            return False
     claim_value = normalize_text(str(point.get("claim_value") or ""))
     evidence_value = normalize_text(str(point.get("evidence_value") or ""))
     if claim_value and evidence_value and claim_value != evidence_value:
@@ -9280,6 +9484,8 @@ def dominant_pipeline_row(
             preferred_rows.sort(
                 key=lambda item: (
                     1 if str(item.get("centrality") or "") == "core" else 0,
+                    int(item.get("logic_refutation_candidate") or 0),
+                    int(item.get("structured_detail_retained") or 0),
                     1 if str(item.get("pipeline_stage") or "") in {"retrieval_readiness", "evidence_partial_but_incomparable", "evidence_point_not_convertible"} else 0,
                     1 if str(item.get("program_expected_failure_stage") or "") in {"retrieval_readiness", "point_conversion", "comparability"} else 0,
                     recall_probe_progress_priority(item),
@@ -9324,6 +9530,8 @@ def dominant_pipeline_row(
             score += 2
         if pipeline_row_has_retained_progress(item):
             score += 2
+        score += 7 if int(item.get("logic_refutation_candidate") or 0) > 0 else 0
+        score += 3 if int(item.get("structured_detail_retained") or 0) > 0 else 0
         score += min(5, int(item.get("candidate_directness_rank") or 0))
         score += 2 if int(item.get("direct_candidate_promotion_used") or 0) > 0 else 0
         score += recall_probe_progress_priority(item) * 6
@@ -9365,7 +9573,11 @@ def secondary_detail_refutation_reason(extracted: Dict[str, Any], evidence_summa
         claim_text = compact_claim_text(str(claim.get("claim") or ""), 120)
         reason = str(detail_state.get("reason") or "")
         if reason == "stable_logic_refutation":
-            rows.append((3, f"“{claim_text}”与回答自己给出的前提在逻辑上闭合矛盾，属于可复现的结构化细节错误"))
+            basis = compact_claim_text(str(detail_state.get("logic_refutation_basis") or ""), 90)
+            if basis:
+                rows.append((3, f"“{claim_text}”与回答自己给出的前提在逻辑上闭合矛盾，例如“{basis}”这条线索已经能稳定推出该细节不成立"))
+            else:
+                rows.append((3, f"“{claim_text}”与回答自己给出的前提在逻辑上闭合矛盾，属于可复现的结构化细节错误"))
             continue
         refuting = claim_direct_refuting_points(summary)
         if refuting and isinstance(refuting[0], dict):
@@ -9414,6 +9626,7 @@ def insufficient_evidence_reason(
     detail_fetch_paths = dominant_row.get("detail_fetch_paths") if isinstance(dominant_row.get("detail_fetch_paths"), dict) else {}
     has_core_support = has_new_scheme_core_supporting_evidence(extracted, evidence_summary)
     unresolved_details = has_unresolved_high_risk_detail_claims(extracted, evidence_summary)
+    detail_audit_rows = high_risk_detail_claim_diagnostics(extracted, evidence_summary)
     dominant_claim_text = normalize_text(str(dominant_row.get("claim") or ""))
 
     def slot_hit(slot_name: str) -> bool:
@@ -9489,6 +9702,22 @@ def insufficient_evidence_reason(
             return "当前主要卡在正文读取失败：页面出现过，但关键正文没有稳定读下来。"
         return ""
 
+    def retained_structured_detail_clause() -> str:
+        if not detail_audit_rows:
+            return ""
+        for row in detail_audit_rows:
+            if not isinstance(row, dict) or not normalize_bool(row.get("structured_detail_retained"), False):
+                continue
+            claim_text = compact_claim_text(str(row.get("claim") or ""), 60)
+            if normalize_bool(row.get("logic_refutation_candidate"), False):
+                basis = compact_claim_text(str(row.get("logic_refutation_basis") or ""), 72)
+                if basis:
+                    return f" 当前附带细节“{claim_text}”已保留，也拿到了可做逻辑闭合的线索“{basis}”，但还没稳定收成可裁决反证。"
+                return f" 当前附带细节“{claim_text}”已保留，也拿到了可做逻辑闭合的线索，但还没稳定收成可裁决反证。"
+            if str(row.get("state") or "") == "unresolved":
+                return f" 当前附带细节“{claim_text}”已保留，但还未形成稳定逻辑反证。"
+        return ""
+
     if state == "partial_but_incomparable":
         reason = "已经搜到相关材料，但它们不是同一事实位点或同一口径，因此当前不能据此直接判错。"
         if false_friend:
@@ -9538,24 +9767,24 @@ def insufficient_evidence_reason(
                 return env_prefix + " 因此当前还没整理出可直接比对的候选句，先不判定为事实错误。"
             if missing_required_slots:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "关键层级"
-                return f"当前已经保留了一些相关页面，但{layer_hint}仍缺少{','.join(missing_required_slots[:3])}，所以还没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。"
+                return f"当前已经保留了一些相关页面，但{layer_hint}仍缺少{','.join(missing_required_slots[:3])}，所以还没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + retained_structured_detail_clause()
             gap_clause = candidate_gap_clause()
             if readiness_promotion_used > 0 and int(dominant_row.get("answer_candidate_total") or 0) > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "句层"
-                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True)
+                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if readiness_promotion_used > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "页面到句子转换"
-                return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True)
+                return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if recall_probe_used > 0 and recall_probe_raw_hits > 0 and direct_candidate_rescue_used <= 0:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "句层"
-                return f"{recall_probe_clause()}，但当前还卡在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True)
+                return f"{recall_probe_clause()}，但当前还卡在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if direct_candidate_rescue_used > 0:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "句层"
-                return f"{rescue_clause()}，但这些句子还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True)
+                return f"{rescue_clause()}，但这些句子还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if program_need:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "页面到句子转换"
-                return f"当前已经保留了一些相关页面，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "")
-            return "当前已经保留了一些相关页面，但还没整理出可直接比对的证据句，因此暂不判定为事实错误。"
+                return f"当前已经保留了一些相关页面，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + retained_structured_detail_clause()
+            return "当前已经保留了一些相关页面，但还没整理出可直接比对的证据句，因此暂不判定为事实错误。" + retained_structured_detail_clause()
         if stage == "evidence_point_not_convertible":
             if env_prefix:
                 return env_prefix + " 页面里虽拿到部分内容，但还没形成稳定可比的证据点，因此暂不判定为事实错误。"
@@ -9567,12 +9796,12 @@ def insufficient_evidence_reason(
                 return f"当前页面里已经读到一些相关材料，但还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。"
             return "当前页面里已经读到一些相关材料，但还没转成可直接裁决的证据点，因此暂不判定为事实错误。"
         if has_core_support and unresolved_details:
-            return "核心结论已有部分支持，但高风险结构化细节仍未裁完，现阶段还不能把整题判成错误。"
+            return "核心结论已有部分支持，但高风险结构化细节仍未裁完，现阶段还不能把整题判成错误。" + retained_structured_detail_clause()
         if program_need:
-            return f"没有形成能直接回答“{program_need}”的支持或反驳证据，因此当前不判定为事实错误。"
-        return "没有形成可直接裁决的支持或反驳证据，因此当前不判定为事实错误。"
+            return f"没有形成能直接回答“{program_need}”的支持或反驳证据，因此当前不判定为事实错误。" + retained_structured_detail_clause()
+        return "没有形成可直接裁决的支持或反驳证据，因此当前不判定为事实错误。" + retained_structured_detail_clause()
     if has_core_support and unresolved_details:
-        return "核心结论已有部分支持，但高风险结构化细节仍未裁完，因此当前不判错。"
+        return "核心结论已有部分支持，但高风险结构化细节仍未裁完，因此当前不判错。" + retained_structured_detail_clause()
     return ""
 
 

@@ -530,3 +530,234 @@
 一句话收口：
 
 AI/AJ/AK 这轮已经把句层诊断做真了，但也把新的收口问题暴露得更彻底了。下一轮最该补的，不是 recall 数量，而是“弱候选句晋级”和“structured detail 可裁决错误不要丢”。
+
+---
+
+## AFC v4 Phase4 总的下一步计划（AL/AM/AN：双通道保真 + 逻辑反证保留 + 网页证据链继续推进）
+
+### Summary
+
+基于当前总文档、`AI/AJ/AK` 首轮状态、以及这次重新确认的 `afc_0002` 类回退，本轮需要把下一步计划正式收成一版“总计划”，不再把问题只看成单一的网页检索链问题。
+
+当前已经可以明确：
+
+1. 系统里至少存在两种真实、都应被保留的“可裁决错误”来源
+   - **网页 direct evidence 通道**
+     - 找到网页
+     - 保住页面
+     - 抽出 direct candidate
+     - 转成同位点 point
+   - **supporting structured detail 逻辑反证通道**
+     - 不一定依赖最强网页直裁句
+     - 但若题面中的细节 claim 本身已经形成稳定逻辑闭合
+     - 且现有证据足以推出“这个细节说法和事实拼不起来”
+     - 也应该稳定落到 `secondary_detail_direct_refutation`
+
+2. 这两条通道现在并没有很好共存
+   - `0001 / 0008 / 0010` 暴露的是网页 evidence chain 还在继续打磨
+   - `0002` 暴露的是 structured detail 的逻辑反证被句层主导逻辑盖过去了
+
+所以本轮的目标不是“多判一次”，而是把这两条本来就该共存的判错通道真正协议化，避免：
+
+- 一边继续推进网页 direct evidence
+- 一边又把原本可裁决的 structured detail 错误弄丢
+
+固定顺序：
+
+1. **AL：先把 structured detail 逻辑反证通道保回来**
+2. **AM：再把双通道的聚合优先级和互不吞噬关系写稳**
+3. **AN：最后继续沿网页 evidence chain 收真瓶颈**
+
+### Key Changes
+
+### AL：supporting structured detail 的保留与逻辑反证恢复
+
+- 目标不是放宽 `unsupported structured detail -> 1`
+- 目标是只把**本来就可裁决的 structured detail 错误**稳定保留下来
+
+- 只重点覆盖：
+  - `supporting structured detail claim`
+  - 其内容属于可核对的：
+    - 数量
+    - 日期
+    - 比分/战绩
+    - 身份/归属
+    - 金额/数值
+
+- 固定恢复两件事：
+  1. **claim surface 保留**
+     - 不让 `0002` 这类“2胜2负”细节在 claim 拆分、句层重排、supporting row 竞争中被悄悄冲掉
+  2. **stable logic refutation 再次可触发**
+     - 若 supporting detail 本身已经是明确事实位点
+     - 且现有网页/结构化句子已经足够推出逻辑闭合冲突
+     - 则允许继续落：
+       - `stable_logic_refutation`
+       - 最终 `secondary_detail_direct_refutation`
+
+- 恢复原则固定为：
+  - 必须是“细节本身可核对”
+  - 必须是“逻辑闭合后稳定冲突”
+  - 不能只是“看着不对劲”
+  - 不能因为没有 direct evidence point 就把 unsupported detail 硬抬成 `1`
+
+- 允许补充的内部 debug：
+  - `structured_detail_retained`
+  - `logic_refutation_candidate`
+  - `logic_refutation_basis`
+  - `logic_refutation_gap_reason`
+
+### AM：双通道聚合合同，禁止互相吞掉
+
+- 主改 `solve.py`，但不改顶层 label schema，不新增第二判标器。
+
+- 固定把最终可裁决错误分成两条来源：
+  1. **direct evidence refutation**
+     - 有 direct webpage point
+     - 同位点、同口径、可直接裁
+  2. **structured-detail logic refutation**
+     - 主需未必被 direct point 正面打穿
+     - 但 supporting detail 本身已经能被稳定逻辑反证
+
+- 聚合时固定几个规则：
+  - 如果 row 已经进入 `raw>0 && kept>0 && answer_candidate_total>0`
+    - 不能再被纯 `provider_recall` 抢主导
+  - 如果 supporting detail 已形成稳定逻辑反证
+    - 不能再被“句层还不够 direct”整行压掉
+  - 如果只有 weak sentence progress，没有可裁决逻辑反证
+    - 不能反过来假装成 `secondary_detail_direct_refutation`
+
+- 也就是说，最终不是“谁声音大谁赢”，而是：
+  - direct point 够，就走 direct point
+  - direct point 不够，但 structured detail 已稳定逻辑反证，就走 detail refutation
+  - 两边都不够，就老老实实留在 `2`
+
+- `insufficient_evidence_reason(...)` 也要同步收口：
+  - 有网页候选句但不够直裁：说句层/位点阻塞
+  - structured detail 已被保留但还不足以闭合：明确说“细节已保留，但还未形成稳定逻辑反证”
+
+### AN：网页证据链继续推进，但只打真瓶颈
+
+- 这部分继续沿当前 Phase4 主线推进，但不再把它当成唯一主线。
+
+- 固定只补三件事：
+  1. **access / rescue 稳定性**
+     - 减少 `source_access_blocked_without_rescue`
+     - 区分“世界上没证据”和“我们没拿到页”
+  2. **weak direct candidate 晋级**
+     - 继续压 `slot_hit_but_indirect`
+     - 让命中 `subject + time_scope + metric/status` 的句子更稳定升到 `direct_candidate`
+  3. **same-slot / same-role conversion 收口**
+     - 更稳定落出：
+       - `not_same_fact_slot`
+       - `date_role_mismatch`
+       - `result_granularity_mismatch`
+       - `numeric_not_normalizable`
+
+- 固定原则：
+  - 网页 evidence chain 继续推进
+  - 但它不能再把 structured detail 可裁决错误挤没
+  - structured detail 通道恢复后，也不能倒过来污染网页 direct evidence 的真实性要求
+
+### Important Internal Changes / Interfaces
+
+- 无外部提交 schema 变化
+- 无 label schema 变化
+- 无 `solve_submit.py` 合流
+- 无新增顶层 pipeline stage
+- 允许新增内部 debug 字段：
+  - `structured_detail_retained`
+  - `logic_refutation_candidate`
+  - `logic_refutation_basis`
+  - `logic_refutation_gap_reason`
+
+### Test Plan
+
+固定继续回看 5 个锚点：
+
+- `afc_0001`
+- `afc_0002`
+- `afc_0003`
+- `afc_0008`
+- `afc_0010`
+
+再补 2 个烟测：
+
+- 1 个 supporting structured detail 明显可做逻辑闭合反证的 case
+- 1 个 `date_fact / event_result` 非金融 fact-like case
+
+固定检查项：
+
+- `claim_pipeline_diagnostics.items`
+- `answer_candidate_total`
+- `sentence_candidate_profile`
+- `top_candidate_slot_match`
+- `direct_candidate_gap_reason`
+- `structured_detail_retained`
+- `logic_refutation_candidate`
+- `logic_refutation_basis`
+- `point_conversion.block_reason`
+- `_decision_basis`
+- `_decision_policy`
+
+### Acceptance Criteria
+
+1. **AL 包**
+   - `afc_0002` 这类原本可由 supporting detail 稳定逻辑反证落 `1` 的 case，至少恢复 1 个
+   - 但不允许新增 `unsupported structured detail -> 1`
+   - “2胜2负”这类逻辑闭合 detail 不再因为句层重排被静默丢失
+
+2. **AM 包**
+   - direct evidence 通道和 structured detail 通道能同时存在，不再互相吞掉
+   - 已有候选句的 row，不再把所有问题都打回泛 recall
+   - 已有稳定逻辑反证的 supporting detail，不再被泛 `candidate_not_direct` 压过去
+
+3. **AN 包**
+   - `afc_0001` 若仍为 `2` 也接受，但主因要真实停在 access / 句层 / 点层，不再混回黑盒 recall
+   - `afc_0008 / 0010` 继续保持 `2`，并维持 conversion / incomparability 主导
+   - 至少 1 个 fact-like case 的最强候选句继续向 `direct_candidate` 前移
+   - `afc_0003` 不被误伤
+
+### Assumptions
+
+- 主基线仍只有 `solve.py`
+- 当前 `N/O/P`、`Q/R/S`、`T/U/V`、`W/X/Y`、`Z/AA/AB`、`AC/AD/AE`、`AF/AG/AH`、`AI/AJ/AK` 默认有效，不回滚
+- 本轮默认不做：
+  - 新一轮 recall probe 扩张
+  - rescue 字段面继续扩张
+  - fallback 扩权
+  - `solve_submit.py` 合流
+  - few-shot
+  - structured outputs
+  - 上游 program 新字段
+
+- 本轮总原则固定为：
+  - **网页证据链继续推进**
+  - **structured detail 逻辑反证必须保留**
+  - **两条通道都要真实，谁也不能靠吞掉另一条来“看起来更强”**
+
+## AL/AM/AN 首轮实施补记（2026-05-10）
+
+这轮已经完成首轮代码落地与最小验证，当前可以明确三点：
+
+1. 已经确认生效的部分
+   - `afc_0002` 已恢复为 `1`
+   - 且这次不是靠宽松抬 unsupported detail，而是靠：
+     - supporting structured detail claim 被保留
+     - `computed` 逻辑点被同主题 detail claim 消费
+     - 最终重新落到 `secondary_detail_direct_refutation`
+   - `structured_detail_retained / logic_refutation_candidate / logic_refutation_basis / logic_refutation_gap_reason`
+     已经能稳定透传到 debug
+
+2. 这轮顺手收住的新边界
+   - 交锋总战绩的逻辑反证不能泛化误伤“赛后战绩 40胜36负”这类别的 numeric detail
+   - 没有新增 `unsupported structured detail -> 1`
+
+3. 仍然没变的主瓶颈
+   - `0001 / 0003 / 0007` 仍大量停在 recall / access
+   - `0008 / 0010` 仍主要卡在句层 directness 或同位点 conversion
+
+所以从这轮结果反推，下一步优先级可以继续保持不变，但重点更清晰了：
+
+1. 先把 `structured detail retained but unresolved` 的 gap 再细化
+2. 再继续推 `slot_hit_but_indirect -> direct_candidate`
+3. 最后继续补 access / rescue 稳定性

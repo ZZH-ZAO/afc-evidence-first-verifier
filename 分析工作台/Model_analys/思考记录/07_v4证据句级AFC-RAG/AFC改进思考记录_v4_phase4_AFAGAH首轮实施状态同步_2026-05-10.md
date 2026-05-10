@@ -429,3 +429,102 @@
    - `result_granularity_mismatch`
    - `not_same_fact_slot`
    - 是否能在更多 `date_fact / schedule_fact / event_result` 上稳定落出真实阻塞层
+
+## 2026-05-10 网页找证据能力现状后的下一步提升判断
+
+### 分类
+
+证据链路 / Workflow / 测试与回看
+
+### 这次要做什么？
+
+基于最新子集 debug 回看，明确当前“从网页找证据”的真实能力边界，并把下一步提升重点从泛 recall 继续收口到：
+
+1. 外站 access / 反爬恢复能力
+2. near-miss 页面保留后的句层晋级
+3. fact-like claim 的同位点消费稳定性
+
+### 动机是什么？
+
+现在系统已经不是一律“找不回来”了，而是出现了三种不同状态混在一起：
+
+1. 有些 case 已经能把网页结果找回来、保住，并抽出候选句
+2. 有些 case 能找回来，但句子还不够 direct，或不是同一事实位点
+3. 还有一些 case 仍然被外站访问阻塞卡在 `raw=0`
+
+如果这三种状态不拆开，后面的优化就很容易继续发散，要么误以为都该补 recall，要么误以为都该补句层 directness。
+
+### 对我们的项目有什么实际作用？
+
+这次判断把“网页找证据能力”拆成了更真实的三段：
+
+1. 找不找得回来
+2. 留不留得下来
+3. 吃不吃得进去
+
+拆开之后，后续每一轮提升就能更聚焦：
+
+- `0001 / 0003 / 0007` 更像 access / recall 问题
+- `0004 / 0008 / 0010` 更像 retained-page 之后的句层或点层问题
+- `0002` 说明网页证据链并不是空的，只是它和 structured contradiction 机制要共存，不能互相吞掉
+
+### 具体场景又是什么？
+
+这次回看的典型状态是：
+
+1. `afc_0010`
+   - 已经能稳定出现 `raw>0 / kept>0 / candidate>0`
+   - 说明网页找证据、保页、抽句三层已经跑起来
+
+2. `afc_0008`
+   - 一部分 row 已经能保住页并拿到候选句
+   - 但最后仍停在 conversion / incomparability
+
+3. `afc_0001`
+   - 这次又被 `source_access_blocked_without_rescue` 拉回 `raw=0`
+   - 说明它当前第一瓶颈还是 access / recall，不是纯句层消费
+
+### 我应该怎么去使用？
+
+后面再看 debug 时，建议先分层判断，不要先入为主地说“网页能力强了”或“网页能力不行”：
+
+1. 先看 `raw_results`
+   - 如果还是 0，优先怀疑 recall / access
+
+2. 再看 `kept_web`
+   - 如果 `raw>0` 但 `kept=0`，优先看 filter / keep review
+
+3. 最后看 `answer_candidate_total`
+   - 如果 `raw>0 && kept>0 && candidate>0`，优先看 directness / same-slot conversion
+
+### 对用户意味着什么？
+
+这说明系统现在从网页找证据已经进入“部分可用但不稳定”的状态：
+
+- 不是完全找不回来
+- 也不是已经稳定能直接裁决
+- 而是已经有一批 case 能跑到网页证据链中后段，但最后还卡在句层直裁或同位点消费
+
+### 对开发者意味着什么？
+
+对开发侧来说，下一步不该再把大量精力均匀撒在 recall、prompt 解释层、structured taxonomy 扩张上，而应该按优先级收成三刀：
+
+1. 先补外站 access rescue 的稳定性
+2. 再补 retained page 上 weak direct candidate 的真晋级
+3. 最后继续把 `date_role_mismatch / result_granularity_mismatch / not_same_fact_slot` 泛化稳
+
+### 当前结论
+
+当前网页找证据能力的真实判断是：
+
+- 已经比前几轮明显强
+- 已经能在部分 fact-like claim 上稳定做到“找回页 + 保住页 + 抽出候选句”
+- 但整体还不稳，外站访问恢复和句层到点层的消费仍然是主短板
+
+### 下一步建议
+
+下一轮建议固定按下面顺序推进：
+
+1. 先补 access-rescue 稳定性，减少 `raw=0` 被环境阻塞主导
+2. 再补 weak direct candidate 晋级，把 `slot_hit_but_indirect` 继续往 `direct_candidate` 推
+3. 最后补同位点消费，让已有候选句更稳定落到 `not_same_fact_slot / date_role_mismatch / result_granularity_mismatch`
