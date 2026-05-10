@@ -682,6 +682,64 @@ SYSTEM_SEARCH_PLANNER = """你是 AFC 检索规划器。你不会联网，不判
 # Backward-compatible name for existing call sites.
 SYSTEM_REWRITE = SYSTEM_SEARCH_PLANNER
 
+SYSTEM_DECISION_QUERY_PLANNER = """你是 AFC 的中层 query planner。你不会联网，不判断 final_label，只把 claim 转成更有裁决价值的检索计划。
+
+要求：
+1. 只能输出严格 JSON，不要输出解释文字。
+2. 不要给 0/1/2，不要判断真假。
+3. 你的任务是判断这条 claim 更像哪类 claim_family，以及更适合 direct_web_evidence、closure_refutation 还是 insufficient_or_unresolved 通道。
+4. query_family_plan 只能从 ["mirror","slot","closure","refute","distinguish"] 中选择，最多 3 个。
+5. bridge_fact_plan 只写 1-4 个短词，帮助后续拼接 query，比如“星期”“交易日历”“发布日”“生效日”“最终结果”“替代路径”。
+6. 如果 claim 是 date_fact / schedule_fact / route_fact / event_result，优先帮助区分同名不同位点，而不是重复 claim 原句。
+7. 不要猜域名，不要编造证据，不要写长句。
+
+输出格式：
+{
+  "claim_family": "date_fact|schedule_fact|route_fact|event_result|numeric_count_detail|numeric_fact|general_fact",
+  "intended_decision_channel": "direct_web_evidence|closure_refutation|insufficient_or_unresolved",
+  "query_family_plan": ["closure", "distinguish"],
+  "bridge_fact_plan": ["星期", "交易日历"]
+}
+"""
+
+SYSTEM_EVIDENCE_REFINER = """你是 AFC 的中层 evidence refiner。你不会联网，也不会输出 final_label。
+
+任务：
+根据 claim、decision slots 和 top candidate sentence，把候选句整理成一个结构化证据卡，帮助后续判断它到底是：
+- 同一事实位点
+- 不同日期角色
+- 不同结果粒度
+- 还是只碰到背景/评论
+
+要求：
+1. 只能基于输入文本，不能补外部常识。
+2. 不要判断真假，不要输出 0/1/2。
+3. evidence_directness 只能写：
+   - direct
+   - slot_hit_but_indirect
+   - numeric_or_date_reference_only
+   - background_commentary
+4. possible_confusions 最多 4 个短词，优先写：
+   - date_role_mismatch
+   - result_granularity_mismatch
+   - not_same_fact_slot
+   - candidate_not_direct
+   - commentary_only
+5. 若某字段句中根本没有，写空字符串。
+
+输出格式：
+{
+  "subject": "",
+  "time_scope": "",
+  "metric_or_relation": "",
+  "status_or_result": "",
+  "date_role": "",
+  "result_granularity": "",
+  "evidence_directness": "direct|slot_hit_but_indirect|numeric_or_date_reference_only|background_commentary",
+  "possible_confusions": ["date_role_mismatch"]
+}
+"""
+
 SYSTEM_ROUTE_POINT_CONVERSION = """你是 AFC 的 route_fact 句级证据点转换器。
 你的任务不是复述 claim，也不是做最终裁决，而是判断给定候选句里，是否存在“单句就能直接说明主体与路线/领空/区域关系”的证据。
 
@@ -2097,6 +2155,158 @@ def infer_rescue_attempt_state(
     return ""
 
 
+DECISION_CHANNEL_DIRECT_WEB = "direct_web_evidence"
+DECISION_CHANNEL_CLOSURE = "closure_refutation"
+DECISION_CHANNEL_UNRESOLVED = "insufficient_or_unresolved"
+
+LLM_QUERY_PLANNER_FAMILIES = {"date_fact", "schedule_fact", "route_fact", "event_result"}
+LLM_EVIDENCE_REFINER_FAMILIES = {"date_fact", "schedule_fact", "route_fact", "event_result"}
+LLM_EVIDENCE_REFINER_BLOCK_REASONS = {
+    "candidate_not_direct",
+    "not_same_fact_slot",
+    "date_role_mismatch",
+    "result_granularity_mismatch",
+}
+
+
+def claim_is_count_like_detail(claim: Dict[str, Any], source_intent: Dict[str, Any]) -> bool:
+    claim_text = normalize_text(str(claim.get("claim") or ""))
+    target = normalize_text(str(source_intent.get("evidence_target") or ""))
+    if target in {"count", "total", "aggregate", "quantity", "match_result"}:
+        return True
+    return bool(
+        re.search(r"(\d+|数量|总数|合计|累计|票房|金额|价格|市值|战绩|比分|共计|名|个|次|场)", claim_text)
+    )
+
+
+def infer_claim_family(
+    claim: Optional[Dict[str, Any]],
+    summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    claim = claim if isinstance(claim, dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    centrality = str(claim.get("centrality") or "")
+    evidence_mode = str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or "")
+    evidence_target = str(source_intent.get("evidence_target") or "")
+    if evidence_mode in {"date_fact", "schedule_fact", "route_fact", "event_result"}:
+        return evidence_mode
+    if evidence_mode == "numeric_fact":
+        if centrality in {"supporting", "peripheral"} and claim_is_count_like_detail(claim, source_intent):
+            return "numeric_count_detail"
+        return "numeric_fact"
+    if evidence_mode == "policy_fact":
+        return "policy_fact"
+    if evidence_target in {"market_calendar", "publication_date", "effective_date", "event_date"}:
+        return "date_fact"
+    if evidence_target in {"route_relation", "position_distance"}:
+        return "route_fact"
+    return evidence_mode or "general_fact"
+
+
+def infer_core_binding_strength(
+    claim: Dict[str, Any],
+    decision_slots: Optional[Dict[str, Any]],
+    direct_need: Optional[Dict[str, Any]],
+) -> str:
+    slots = decision_slots if isinstance(decision_slots, dict) else {}
+    need = direct_need if isinstance(direct_need, dict) else {}
+    filled = 0
+    for key in ("subject", "object", "time_scope", "metric_or_relation", "status_or_result"):
+        if normalize_text(str(slots.get(key) or "")):
+            filled += 1
+    must_answer = normalize_text(str(need.get("must_answer") or ""))
+    centrality = str(claim.get("centrality") or "")
+    if centrality == "core" and (filled >= 3 or (filled >= 2 and must_answer)):
+        return "strong"
+    if filled >= 2 or must_answer:
+        return "medium"
+    return "weak"
+
+
+def infer_secondary_detail_scope(claim: Dict[str, Any], detail_state: Optional[Dict[str, Any]]) -> str:
+    detail_state = detail_state if isinstance(detail_state, dict) else {}
+    centrality = str(claim.get("centrality") or "")
+    if centrality not in {"supporting", "peripheral"}:
+        return ""
+    if normalize_bool(detail_state.get("structured_detail_retained"), False):
+        return "structured_detail"
+    return "supporting_claim"
+
+
+def infer_intended_decision_channel(
+    claim: Dict[str, Any],
+    claim_family: str,
+    secondary_detail_scope: str,
+) -> str:
+    centrality = str(claim.get("centrality") or "")
+    if secondary_detail_scope == "structured_detail":
+        return DECISION_CHANNEL_CLOSURE
+    if centrality == "core":
+        return DECISION_CHANNEL_DIRECT_WEB
+    if claim_family in {"date_fact", "schedule_fact", "route_fact", "event_result", "numeric_fact", "numeric_count_detail"}:
+        return DECISION_CHANNEL_DIRECT_WEB
+    return DECISION_CHANNEL_UNRESOLVED
+
+
+def infer_channel_decision_candidate(
+    direct_diag: Optional[Dict[str, Any]],
+    detail_state: Optional[Dict[str, Any]],
+    raw_results: int,
+    kept_web: int,
+    answer_candidate_total: int,
+    pipeline_stage: str,
+) -> str:
+    direct_diag = direct_diag if isinstance(direct_diag, dict) else {}
+    detail_state = detail_state if isinstance(detail_state, dict) else {}
+    detail_reason = str(detail_state.get("reason") or "")
+    logic_state = str(detail_state.get("logic_refutation_state") or "")
+    if detail_reason == "stable_logic_refutation" or logic_state == "stable_logic_refutation_ready":
+        return DECISION_CHANNEL_CLOSURE
+    if normalize_bool(detail_state.get("logic_refutation_candidate"), False) or normalize_bool(detail_state.get("structured_detail_retained"), False):
+        if logic_state in {
+            "same_topic_logic_point_unstable",
+            "logic_point_topic_mismatch",
+            "shadowed_by_direct_channel",
+            "retained_without_logic_point",
+        }:
+            return DECISION_CHANNEL_CLOSURE
+    if normalize_bool(direct_diag.get("decidable"), False):
+        return DECISION_CHANNEL_DIRECT_WEB
+    if raw_results > 0 or kept_web > 0 or answer_candidate_total > 0 or pipeline_stage in {
+        "retrieval_filter",
+        "retrieval_readiness",
+        "evidence_point_not_convertible",
+        "evidence_partial_but_incomparable",
+    }:
+        return DECISION_CHANNEL_DIRECT_WEB
+    return DECISION_CHANNEL_UNRESOLVED
+
+
+def infer_channel_decision_confidence(
+    direct_diag: Optional[Dict[str, Any]],
+    detail_state: Optional[Dict[str, Any]],
+    raw_results: int,
+    kept_web: int,
+    answer_candidate_total: int,
+) -> float:
+    direct_diag = direct_diag if isinstance(direct_diag, dict) else {}
+    detail_state = detail_state if isinstance(detail_state, dict) else {}
+    if str(detail_state.get("logic_refutation_state") or "") == "stable_logic_refutation_ready":
+        return 0.86
+    if normalize_bool(direct_diag.get("decidable"), False):
+        return 0.95
+    if normalize_bool(detail_state.get("logic_refutation_candidate"), False):
+        return 0.68
+    if answer_candidate_total > 0:
+        return 0.62
+    if kept_web > 0:
+        return 0.52
+    if raw_results > 0:
+        return 0.38
+    return 0.18
+
+
 def claim_direct_decidable_diagnostic(
     claim: Dict[str, Any],
     summary: Optional[Dict[str, Any]],
@@ -2247,6 +2457,14 @@ def claim_pipeline_diagnostic(
         rescue_promoted_from_filter,
         playwright_rescued,
     )
+    claim_family = infer_claim_family(claim, summary)
+    core_binding_strength = infer_core_binding_strength(claim, decision_slots, direct_need)
+    secondary_detail_scope = infer_secondary_detail_scope(claim, detail_state)
+    intended_decision_channel = infer_intended_decision_channel(
+        claim,
+        claim_family,
+        secondary_detail_scope,
+    )
     if direct_diag.get("decidable"):
         blocked_at = str(direct_diag.get("stage") or "evidence_direct_decidable")
         boundary_reason = str(direct_diag.get("reason") or "direct_decidable")
@@ -2311,11 +2529,32 @@ def claim_pipeline_diagnostic(
             blocked_at = "mixed_or_review_needed"
             boundary_reason = "当前链路不是单点阻塞，更像多层薄弱信号叠加"
             pipeline_layer = "mixed"
+    channel_decision_candidate = infer_channel_decision_candidate(
+        direct_diag,
+        detail_state,
+        raw_results,
+        kept_web,
+        answer_candidate_total,
+        blocked_at,
+    )
+    channel_decision_confidence = infer_channel_decision_confidence(
+        direct_diag,
+        detail_state,
+        raw_results,
+        kept_web,
+        answer_candidate_total,
+    )
     return {
         "claim_id": claim_id,
         "claim": normalize_text(str(claim.get("claim") or ""))[:160],
         "centrality": str(claim.get("centrality") or "supporting"),
         "evidence_mode": str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or ""),
+        "claim_family": claim_family,
+        "intended_decision_channel": intended_decision_channel,
+        "core_binding_strength": core_binding_strength,
+        "secondary_detail_scope": secondary_detail_scope,
+        "channel_decision_candidate": channel_decision_candidate,
+        "channel_decision_confidence": round(channel_decision_confidence, 3),
         "pipeline_layer": pipeline_layer,
         "pipeline_stage": blocked_at,
         "pipeline_reason": boundary_reason,
@@ -5256,6 +5495,9 @@ def merge_query_rows(query_rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         source_preference = [normalize_text(str(item)) for item in raw_preference if normalize_text(str(item))][:3]
         if source_preference:
             query_row["source_preference"] = source_preference
+        query_family_role = normalize_query_family_role(row.get("query_family_role"))
+        if query_family_role != "mirror" or normalize_text(str(row.get("query_family_role") or "")) == "mirror":
+            query_row["query_family_role"] = query_family_role
         for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
             extra_value = normalize_text(str(row.get(extra_key) or ""))
             if extra_value:
@@ -6397,6 +6639,194 @@ def infer_program_query_goal(source_intent: Dict[str, Any]) -> str:
         return "find_policy"
     return "general_verify"
 
+def normalize_query_family_role(value: Any) -> str:
+    role = normalize_text(str(value or ""))
+    return role if role in {"mirror", "slot", "closure", "refute", "distinguish"} else "mirror"
+
+
+def normalize_query_planner_hint(raw_obj: Optional[Dict[str, Any]], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    base = dict(fallback)
+    raw_obj = raw_obj if isinstance(raw_obj, dict) else {}
+    claim_family = normalize_text(str(raw_obj.get("claim_family") or "")) or str(base.get("claim_family") or "general_fact")
+    intended_channel = normalize_text(str(raw_obj.get("intended_decision_channel") or "")) or str(base.get("intended_decision_channel") or DECISION_CHANNEL_UNRESOLVED)
+    query_plan = [
+        normalize_query_family_role(item)
+        for item in (raw_obj.get("query_family_plan") or [])
+        if normalize_query_family_role(item) in {"closure", "refute", "distinguish", "slot", "mirror"}
+    ] if isinstance(raw_obj.get("query_family_plan"), list) else []
+    bridge_facts = compact_term_list(raw_obj.get("bridge_fact_plan") or [], 4, 24) if isinstance(raw_obj.get("bridge_fact_plan"), list) else []
+    if query_plan:
+        base["query_family_plan"] = dedupe_keep_order(query_plan)[:3]
+    if bridge_facts:
+        base["bridge_fact_plan"] = bridge_facts[:4]
+    base["claim_family"] = claim_family
+    if intended_channel in {DECISION_CHANNEL_DIRECT_WEB, DECISION_CHANNEL_CLOSURE, DECISION_CHANNEL_UNRESOLVED}:
+        base["intended_decision_channel"] = intended_channel
+    return base
+
+
+def default_query_planner_hint(claim: Dict[str, Any], program: Dict[str, Any]) -> Dict[str, Any]:
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    claim_family = infer_claim_family(claim, {"evidence_mode": source_intent.get("evidence_mode")})
+    secondary_detail_scope = infer_secondary_detail_scope(claim, {"structured_detail_retained": str(claim.get("centrality") or "") in {"supporting", "peripheral"}})
+    intended_channel = infer_intended_decision_channel(claim, claim_family, secondary_detail_scope)
+    claim_text = normalize_text(str(claim.get("claim") or ""))
+    bridge: List[str] = []
+    plan: List[str] = []
+    if claim_family in {"date_fact", "schedule_fact"}:
+        plan = ["closure", "distinguish"]
+        if re.search(r"(星期|周几|交易日|休市|holiday|calendar)", claim_text, flags=re.I):
+            bridge.extend(["星期", "交易日历"])
+        if re.search(r"(生效|实施)", claim_text):
+            bridge.extend(["生效日", "发布日期"])
+        elif re.search(r"(发布|公布|公告)", claim_text):
+            bridge.extend(["发布日期", "生效日"])
+        else:
+            bridge.extend(["官方日程", "发布日期"])
+    elif claim_family == "route_fact":
+        plan = ["closure", "refute"]
+        bridge.extend(["替代路径", "其他路线", "并非唯一"])
+    elif claim_family == "event_result":
+        plan = ["distinguish", "closure"]
+        bridge.extend(["最终结果", "过程结果", "局部结果"])
+    elif claim_family == "numeric_count_detail":
+        plan = ["closure"]
+        bridge.extend(["总数", "累计", "合计"])
+    return {
+        "claim_family": claim_family,
+        "intended_decision_channel": intended_channel,
+        "query_family_plan": plan[:3],
+        "bridge_fact_plan": dedupe_keep_order(bridge)[:4],
+    }
+
+
+def build_query_planner_prompt(claim: Dict[str, Any], program: Dict[str, Any], need_type: str) -> str:
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    payload = {
+        "need_type": need_type,
+        "claim": str(claim.get("claim") or ""),
+        "centrality": str(claim.get("centrality") or ""),
+        "evidence_mode": str(source_intent.get("evidence_mode") or ""),
+        "evidence_target": str(source_intent.get("evidence_target") or ""),
+        "decision_slots": {
+            "subject": str(decision_slots.get("subject") or ""),
+            "object": str(decision_slots.get("object") or ""),
+            "time_scope": str(decision_slots.get("time_scope") or ""),
+            "metric_or_relation": str(decision_slots.get("metric_or_relation") or ""),
+            "status_or_result": str(decision_slots.get("status_or_result") or ""),
+        },
+        "must_answer": str(direct_need.get("must_answer") or ""),
+        "must_include": compact_term_list(direct_need.get("must_include") or [], 4, 24),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def build_claim_query_planner_hint(claim: Dict[str, Any], program: Dict[str, Any], need_type: str) -> Dict[str, Any]:
+    fallback = default_query_planner_hint(claim, program)
+    if str(fallback.get("claim_family") or "") not in LLM_QUERY_PLANNER_FAMILIES:
+        return fallback
+    planner_obj, _raw = llm_chat(
+        SYSTEM_DECISION_QUERY_PLANNER,
+        build_query_planner_prompt(claim, program, need_type),
+        retries=0,
+    )
+    return normalize_query_planner_hint(planner_obj, fallback)
+
+
+def query_row(
+    q: str,
+    goal: str,
+    role: str,
+    origin: str,
+    variant_origin: str,
+) -> Dict[str, str]:
+    return {
+        "q": normalize_text(q),
+        "goal": goal,
+        "origin": origin,
+        "query_variant_origin": variant_origin,
+        "query_family_role": normalize_query_family_role(role),
+    }
+
+
+def family_query_terms_for_role(
+    claim: Dict[str, Any],
+    program: Dict[str, Any],
+    planner_hint: Optional[Dict[str, Any]],
+    role: str,
+) -> List[str]:
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    claim_family = str((planner_hint or {}).get("claim_family") or infer_claim_family(claim, {"evidence_mode": source_intent.get("evidence_mode")}))
+    subject = compact_claim_text(str(decision_slots.get("subject") or ""), 32)
+    object_term = compact_claim_text(str(decision_slots.get("object") or ""), 24)
+    time_scope = compact_claim_text(str(decision_slots.get("time_scope") or ""), 24)
+    metric = compact_claim_text(str(decision_slots.get("metric_or_relation") or ""), 24)
+    status = compact_claim_text(str(decision_slots.get("status_or_result") or ""), 24)
+    bridge = compact_term_list((planner_hint or {}).get("bridge_fact_plan") or [], 4, 20)
+    must_include = compact_term_list(direct_need.get("must_include") or [], 2, 18)
+    base = [subject, object_term, time_scope]
+    if claim_family in {"date_fact", "schedule_fact"}:
+        if role == "closure":
+            extras = bridge[:2] or ["星期", "官方日程"]
+        elif role == "distinguish":
+            extras = bridge[:2] or ["发布日期", "生效日"]
+        else:
+            extras = [metric, status]
+    elif claim_family == "route_fact":
+        if role == "closure":
+            extras = bridge[:2] or ["替代路径", "绕行"]
+        elif role == "refute":
+            extras = bridge[:3] or ["其他路线", "并非唯一", "经由"]
+        else:
+            extras = [metric, status]
+    elif claim_family == "event_result":
+        if role == "distinguish":
+            extras = bridge[:3] or ["最终结果", "过程结果", "局部结果"]
+        elif role == "closure":
+            extras = bridge[:2] or ["最终比分", "赛后战绩"]
+        else:
+            extras = [metric, status]
+    elif claim_family == "numeric_count_detail":
+        extras = bridge[:3] or ["总数", "累计", "合计"]
+    else:
+        extras = bridge[:2] or [metric, status]
+    return compact_term_list(base + extras + [metric, status] + must_include, 7, 22)
+
+
+def build_family_query_rows(
+    claim: Dict[str, Any],
+    program: Dict[str, Any],
+    planner_hint: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    roles = [
+        normalize_query_family_role(item)
+        for item in ((planner_hint or {}).get("query_family_plan") or [])
+        if normalize_query_family_role(item) in {"closure", "refute", "distinguish"}
+    ]
+    if not roles:
+        return []
+    goal = infer_program_query_goal(source_intent)
+    rows: List[Dict[str, str]] = []
+    for role in roles[:2]:
+        query_text = compact_query_text_local(" ".join(family_query_terms_for_role(claim, program, planner_hint, role)), 96)
+        if not query_text:
+            continue
+        rows.append(
+            query_row(
+                query_text,
+                goal,
+                role,
+                f"{role}_query",
+                f"{role}_query",
+            )
+        )
+    return merge_query_rows(rows)
+
 
 FACT_SLOT_QUERY_MODES = {
     EVIDENCE_MODE_NUMERIC,
@@ -6526,6 +6956,7 @@ def build_fact_slot_query_row(claim: Dict[str, Any], program: Dict[str, Any]) ->
                 "goal": infer_program_query_goal(source_intent),
                 "origin": "fact_slot_query",
                 "query_variant_origin": "fact_slot_query_reused",
+                "query_family_role": "slot",
             }
     if not query_text:
         fallback_text = compact_query_text_local(" ".join(term for term in [normalized_assertion, subject, time_scope, metric] if term), 96)
@@ -6537,6 +6968,7 @@ def build_fact_slot_query_row(claim: Dict[str, Any], program: Dict[str, Any]) ->
         "goal": infer_program_query_goal(source_intent),
         "origin": "fact_slot_query",
         "query_variant_origin": "fact_slot_query",
+        "query_family_role": "slot",
     }
 
 
@@ -6556,10 +6988,20 @@ def build_program_queries(claim: Dict[str, Any], program: Dict[str, Any]) -> Lis
     base_terms = compact_term_list([subject, object_term, time_scope, metric] + must_include, 5, 40)
     primary = normalized_assertion if len(normalized_assertion) <= 42 else " ".join(base_terms[:4]) or claim_text
     queries: List[Dict[str, Any]] = []
+    planner_hint = claim.get("query_planner_hint") if isinstance(claim.get("query_planner_hint"), dict) else {}
     fact_slot_query = build_fact_slot_query_row(claim, program)
+    family_queries = build_family_query_rows(claim, program, planner_hint)
     if fact_slot_query:
         queries.append(fact_slot_query)
-    queries.append({"q": primary, "goal": infer_program_query_goal(source_intent)})
+    primary_row = query_row(
+        primary,
+        infer_program_query_goal(source_intent),
+        "mirror",
+        "program_primary_query",
+        "program_primary_query",
+    )
+    if not fact_slot_query:
+        queries.append(primary_row)
     evidence_mode = str(source_intent.get("evidence_mode") or "")
     evidence_target = str(source_intent.get("evidence_target") or "")
     if evidence_target == "route_relation" or evidence_mode == "route_fact":
@@ -6575,9 +7017,22 @@ def build_program_queries(claim: Dict[str, Any], program: Dict[str, Any]) -> Lis
     else:
         second = " ".join(compact_term_list(base_terms + ["官方"], 5, 18))
     second = normalize_text(second)
-    existing_query_texts = {normalize_text(str(item.get("q") or "")) for item in queries if isinstance(item, dict)}
-    if second and second != primary and second not in existing_query_texts:
-        queries.append({"q": second, "goal": infer_program_query_goal(source_intent)})
+    if family_queries:
+        queries.extend(family_queries[:1])
+    else:
+        existing_query_texts = {normalize_text(str(item.get("q") or "")) for item in queries if isinstance(item, dict)}
+        if second and second != primary and second not in existing_query_texts:
+            queries.append(
+                query_row(
+                    second,
+                    infer_program_query_goal(source_intent),
+                    "mirror",
+                    "program_secondary_query",
+                    "program_secondary_query",
+                )
+            )
+        elif fact_slot_query and primary_row.get("q"):
+            queries.append(primary_row)
     return merge_query_rows(queries)[:2]
 
 
@@ -6600,8 +7055,20 @@ def merge_program_queries(existing: Any, generated: List[Dict[str, str]]) -> Lis
             or normalize_text(str(row.get("query_variant_origin") or "")).startswith("fact_slot_query")
         )
     ]
-    other_generated = [row for row in generated if row not in fact_slot_generated]
-    merged = merge_query_rows(list(fact_slot_generated) + list(existing_queries) + list(other_generated))
+    family_generated = [
+        row for row in generated
+        if isinstance(row, dict)
+        and normalize_query_family_role(row.get("query_family_role")) in {"closure", "refute", "distinguish"}
+    ]
+    other_generated = [row for row in generated if row not in fact_slot_generated and row not in family_generated]
+    prioritized_existing = [
+        row for row in existing_queries
+        if not (
+            isinstance(row, dict)
+            and normalize_query_family_role(row.get("query_family_role")) in {"closure", "refute", "distinguish"}
+        )
+    ]
+    merged = merge_query_rows(list(fact_slot_generated) + list(family_generated) + list(prioritized_existing) + list(other_generated))
     if merged:
         return merged[:2]
     return generated[:2]
@@ -6679,6 +7146,7 @@ def finalize_claim_with_evidence_need_program(claim: Dict[str, Any], need_type: 
         claim.get("verification_questions"),
         build_program_verification_questions(updated, program),
     )
+    updated["query_planner_hint"] = build_claim_query_planner_hint(updated, program, need_type)
     updated["queries"] = merge_program_queries(
         claim.get("queries"),
         build_program_queries(updated, program),
@@ -6778,6 +7246,161 @@ def build_evidence_task_card(
         "must_not_confuse": [compact_claim_text(str(term), 70) for term in confusion_terms[:4] if str(term).strip()],
         "task_semantics": task_semantics,
     }
+
+
+def should_run_llm_evidence_refiner(claim: Dict[str, Any], summary: Dict[str, Any]) -> bool:
+    if CLIENT is None:
+        return False
+    claim_family = infer_claim_family(claim, summary)
+    if claim_family not in LLM_EVIDENCE_REFINER_FAMILIES:
+        return False
+    point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+    block_reason = normalize_text(str(point_conversion.get("block_reason") or ""))
+    gap_reason = normalize_text(str(point_conversion.get("direct_candidate_gap_reason") or ""))
+    stage = str(point_conversion.get("stage") or "")
+    candidates = [item for item in (summary.get("evidence_sentence_candidates") or []) if isinstance(item, dict)]
+    if not candidates:
+        return False
+    if block_reason in LLM_EVIDENCE_REFINER_BLOCK_REASONS:
+        return True
+    if gap_reason in {"date_role_mismatch", "result_granularity_mismatch", "commentary_only"}:
+        return True
+    return stage in {"direct_not_converted", "no_direct"}
+
+
+def build_evidence_refiner_prompt(claim: Dict[str, Any], summary: Dict[str, Any]) -> str:
+    evidence_need_program = summary.get("evidence_need_program") if isinstance(summary.get("evidence_need_program"), dict) else {}
+    decision_slots = evidence_need_program.get("decision_slots") if isinstance(evidence_need_program.get("decision_slots"), dict) else {}
+    point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+    candidates = [
+        {
+            "sentence": str(candidate.get("sentence") or ""),
+            "title": str(candidate.get("title") or ""),
+            "candidate_slot_match": str(candidate.get("candidate_slot_match") or ""),
+            "candidate_profile": str(candidate.get("sentence_candidate_profile") or ""),
+            "directness_rank": int(candidate.get("candidate_directness_rank") or 0),
+        }
+        for candidate in (summary.get("evidence_sentence_candidates") or [])
+        if isinstance(candidate, dict)
+    ][:2]
+    payload = {
+        "claim": str(claim.get("claim") or ""),
+        "claim_family": infer_claim_family(claim, summary),
+        "decision_slots": {
+            "subject": str(decision_slots.get("subject") or ""),
+            "object": str(decision_slots.get("object") or ""),
+            "time_scope": str(decision_slots.get("time_scope") or ""),
+            "metric_or_relation": str(decision_slots.get("metric_or_relation") or ""),
+            "status_or_result": str(decision_slots.get("status_or_result") or ""),
+        },
+        "current_point_block_reason": str(point_conversion.get("block_reason") or ""),
+        "current_direct_gap_reason": str(point_conversion.get("direct_candidate_gap_reason") or ""),
+        "top_candidates": candidates,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def normalize_evidence_refiner_card(raw_obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw_obj = raw_obj if isinstance(raw_obj, dict) else {}
+    directness = normalize_text(str(raw_obj.get("evidence_directness") or ""))
+    if directness not in {"direct", "slot_hit_but_indirect", "numeric_or_date_reference_only", "background_commentary"}:
+        directness = "slot_hit_but_indirect"
+    allowed_confusions = {
+        "date_role_mismatch",
+        "result_granularity_mismatch",
+        "not_same_fact_slot",
+        "candidate_not_direct",
+        "commentary_only",
+    }
+    possible_confusions = [
+        normalize_text(str(item))
+        for item in (raw_obj.get("possible_confusions") or [])
+        if normalize_text(str(item)) in allowed_confusions
+    ] if isinstance(raw_obj.get("possible_confusions"), list) else []
+    return {
+        "subject": compact_claim_text(str(raw_obj.get("subject") or ""), 48),
+        "time_scope": compact_claim_text(str(raw_obj.get("time_scope") or ""), 48),
+        "metric_or_relation": compact_claim_text(str(raw_obj.get("metric_or_relation") or ""), 48),
+        "status_or_result": compact_claim_text(str(raw_obj.get("status_or_result") or ""), 48),
+        "date_role": compact_claim_text(str(raw_obj.get("date_role") or ""), 32),
+        "result_granularity": compact_claim_text(str(raw_obj.get("result_granularity") or ""), 32),
+        "evidence_directness": directness,
+        "possible_confusions": dedupe_keep_order(possible_confusions)[:4],
+    }
+
+
+def infer_refiner_gap_reason(card: Dict[str, Any]) -> str:
+    possible_confusions = set(card.get("possible_confusions") or []) if isinstance(card.get("possible_confusions"), list) else set()
+    date_role = normalize_text(str(card.get("date_role") or ""))
+    result_granularity = normalize_text(str(card.get("result_granularity") or ""))
+    directness = normalize_text(str(card.get("evidence_directness") or ""))
+    if "date_role_mismatch" in possible_confusions or re.search(r"(发布|公布|生效|报道|举办|开赛)", date_role):
+        return "date_role_mismatch"
+    if "result_granularity_mismatch" in possible_confusions or re.search(r"(过程|局部|单节|半场|盘中|收盘)", result_granularity):
+        return "result_granularity_mismatch"
+    if "not_same_fact_slot" in possible_confusions:
+        return "not_same_fact_slot"
+    if directness == "background_commentary" or "commentary_only" in possible_confusions:
+        return "commentary_only"
+    if directness == "slot_hit_but_indirect" or "candidate_not_direct" in possible_confusions:
+        return "candidate_not_direct"
+    return ""
+
+
+def apply_llm_evidence_refiners(
+    claims: List[Dict[str, Any]],
+    evidence_summary: Optional[Dict[str, Any]],
+    debug_bucket: Optional[Dict[str, Any]] = None,
+) -> None:
+    if CLIENT is None or not isinstance(evidence_summary, dict):
+        return
+    summaries = evidence_summary.get("claim_summaries") if isinstance(evidence_summary.get("claim_summaries"), dict) else {}
+    if not isinstance(summaries, dict):
+        return
+    refiner_debug: Dict[str, Any] = {}
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+        summary = summaries.get(claim_id)
+        if not isinstance(summary, dict) or not should_run_llm_evidence_refiner(claim, summary):
+            continue
+        refiner_obj, raw = llm_chat(
+            SYSTEM_EVIDENCE_REFINER,
+            build_evidence_refiner_prompt(claim, summary),
+            retries=0,
+        )
+        card = normalize_evidence_refiner_card(refiner_obj)
+        point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+        point_conversion["llm_evidence_refiner_used"] = True
+        point_conversion["llm_evidence_refiner"] = card
+        refined_gap_reason = infer_refiner_gap_reason(card)
+        if refined_gap_reason:
+            point_conversion["llm_refined_gap_reason"] = refined_gap_reason
+            current_block_reason = normalize_text(str(point_conversion.get("block_reason") or ""))
+            current_gap_reason = normalize_text(str(point_conversion.get("direct_candidate_gap_reason") or ""))
+            if current_block_reason in {"", "candidate_not_direct", "related_but_not_assertive"} and refined_gap_reason in {
+                "date_role_mismatch",
+                "result_granularity_mismatch",
+                "not_same_fact_slot",
+            }:
+                point_conversion["block_reason"] = refined_gap_reason
+            if current_gap_reason in {"", "candidate_not_direct"} and refined_gap_reason in {
+                "date_role_mismatch",
+                "result_granularity_mismatch",
+                "commentary_only",
+            }:
+                point_conversion["direct_candidate_gap_reason"] = refined_gap_reason
+        summary["point_conversion"] = point_conversion
+        refiner_debug[claim_id] = {
+            "used": True,
+            "raw": raw,
+            "card": card,
+            "refined_gap_reason": refined_gap_reason,
+        }
+    if isinstance(debug_bucket, dict):
+        debug_bucket["llm_evidence_refiner"] = refiner_debug
+
 
 def claim_budget_priority(claim: Dict[str, Any]) -> Tuple[int, int, int]:
     text = str(claim.get("claim") or "")
@@ -9258,6 +9881,9 @@ def evidence_first_decision_signal(
                 "label": LABEL_0,
                 "decision_basis": "evidence_refutation",
                 "policy": "evidence_first_core_direct_refutation",
+                "decision_channel": DECISION_CHANNEL_DIRECT_WEB,
+                "decision_scope": "core",
+                "decision_channel_confidence": 0.95,
             }
     for claim in claims:
         if not isinstance(claim, dict):
@@ -9268,16 +9894,25 @@ def evidence_first_decision_signal(
         summary = summaries.get(claim_id) if isinstance(summaries.get(claim_id), dict) else {}
         detail_state = detail_claim_resolution_state(claim, summary, need_type)
         if str(detail_state.get("state") or "") == "decidable_error":
+            detail_reason = str(detail_state.get("reason") or "")
             return {
                 "label": LABEL_1,
                 "decision_basis": "evidence_refutation",
                 "policy": "secondary_detail_direct_refutation",
+                "decision_channel": (
+                    DECISION_CHANNEL_CLOSURE if detail_reason == "stable_logic_refutation" else DECISION_CHANNEL_DIRECT_WEB
+                ),
+                "decision_scope": "secondary_detail",
+                "decision_channel_confidence": 0.86 if detail_reason == "stable_logic_refutation" else 0.9,
             }
     if has_new_scheme_core_supporting_evidence(extracted, evidence_summary) and not has_unresolved_high_risk_detail_claims(extracted, evidence_summary):
         return {
             "label": LABEL_2,
             "decision_basis": "evidence_support",
             "policy": "evidence_first_core_direct_support",
+            "decision_channel": DECISION_CHANNEL_UNRESOLVED,
+            "decision_scope": "core_supported",
+            "decision_channel_confidence": 0.7,
         }
     return {}
 
@@ -9375,6 +10010,47 @@ def build_evidence_non_decidable_state(
         "partial_but_incomparable_count": partial_but_incomparable_count,
         "has_fictional_contamination": fictional_contamination,
         "certainty_profile": certainty_profile,
+    }
+
+
+def aggregate_decision_channel_protocol(
+    extracted: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]],
+    evidence_non_decidable_state: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    evidence_signal = evidence_first_decision_signal(extracted, evidence_summary)
+    if evidence_signal:
+        channel = str(evidence_signal.get("decision_channel") or DECISION_CHANNEL_DIRECT_WEB)
+        label = str(evidence_signal.get("label") or LABEL_2)
+        return {
+            "decision_channel": channel,
+            "channel_decision_candidate": channel,
+            "channel_decision_confidence": float(evidence_signal.get("decision_channel_confidence") or 0.9),
+            "channel_label_candidate": label,
+            "channel_scope": str(evidence_signal.get("decision_scope") or ""),
+        }
+    dominant_row = dominant_pipeline_row(claim_pipeline_diagnostics, evidence_non_decidable_state)
+    if dominant_row:
+        channel = str(dominant_row.get("channel_decision_candidate") or DECISION_CHANNEL_UNRESOLVED)
+        centrality = str(dominant_row.get("centrality") or "")
+        structured_detail = str(dominant_row.get("secondary_detail_scope") or "")
+        label = LABEL_1 if channel == DECISION_CHANNEL_CLOSURE or structured_detail == "structured_detail" else LABEL_2
+        if channel == DECISION_CHANNEL_DIRECT_WEB and centrality == "core":
+            label = LABEL_2
+        return {
+            "decision_channel": channel,
+            "channel_decision_candidate": channel,
+            "channel_decision_confidence": float(dominant_row.get("channel_decision_confidence") or 0.3),
+            "channel_label_candidate": label,
+            "channel_scope": structured_detail or centrality,
+        }
+    return {
+        "decision_channel": DECISION_CHANNEL_UNRESOLVED,
+        "channel_decision_candidate": DECISION_CHANNEL_UNRESOLVED,
+        "channel_decision_confidence": 0.1,
+        "channel_label_candidate": LABEL_2,
+        "channel_scope": "",
     }
 
 
@@ -9779,6 +10455,7 @@ def dominant_pipeline_row(
             preferred_rows.sort(
                 key=lambda item: (
                     1 if str(item.get("centrality") or "") == "core" else 0,
+                    1 if str(item.get("channel_decision_candidate") or "") == DECISION_CHANNEL_DIRECT_WEB else 0,
                     int(item.get("logic_refutation_candidate") or 0),
                     int(item.get("structured_detail_retained") or 0),
                     1 if str(item.get("logic_refutation_state") or "") in {"same_topic_logic_point_unstable", "shadowed_by_direct_channel"} else 0,
@@ -9826,6 +10503,10 @@ def dominant_pipeline_row(
             score += 2
         if pipeline_row_has_retained_progress(item):
             score += 2
+        if str(item.get("channel_decision_candidate") or "") == DECISION_CHANNEL_DIRECT_WEB:
+            score += 3
+        elif str(item.get("channel_decision_candidate") or "") == DECISION_CHANNEL_CLOSURE:
+            score += 4
         score += 7 if int(item.get("logic_refutation_candidate") or 0) > 0 else 0
         score += 3 if int(item.get("structured_detail_retained") or 0) > 0 else 0
         score += 2 if str(item.get("logic_refutation_state") or "") in {"same_topic_logic_point_unstable", "shadowed_by_direct_channel"} else 0
@@ -10411,6 +11092,10 @@ def classify_decision_basis(
 ) -> str:
     if policy in RUBRIC_FALLBACK_POLICIES:
         return "rubric_fallback"
+    if policy in {"evidence_first_core_direct_refutation", "secondary_detail_direct_refutation"}:
+        return "evidence_refutation"
+    if policy == "evidence_first_core_direct_support":
+        return "evidence_support"
     if label in {LABEL_0, LABEL_1} and has_direct_refuting_evidence(evidence_summary):
         return "evidence_refutation"
     if (
@@ -10887,6 +11572,17 @@ def aggregate_by_confidence(
         result["analyse"] = result.get("_aggregation_analyse") or "未发现明确事实错误"
     if not result.get("_decision_basis"):
         result["_decision_basis"] = classify_decision_basis(final_label, "", evidence_summary, extracted)
+    channel_protocol = aggregate_decision_channel_protocol(
+        extracted,
+        evidence_summary,
+        claim_pipeline_diagnostics,
+        result.get("_evidence_non_decidable_state"),
+    )
+    result["_decision_channel"] = channel_protocol.get("decision_channel") or ""
+    result["_channel_decision_candidate"] = channel_protocol.get("channel_decision_candidate") or ""
+    result["_channel_decision_confidence"] = float(channel_protocol.get("channel_decision_confidence") or 0.0)
+    result["_channel_label_candidate"] = channel_protocol.get("channel_label_candidate") or LABEL_2
+    result["_channel_scope"] = channel_protocol.get("channel_scope") or ""
     result["analyse"] = normalize_reason_by_decision_basis(
         str(result.get("analyse") or ""),
         final_label,
@@ -10962,6 +11658,7 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     evidence_summary = summarize_claim_evidence(claims, evidence_bundle.get("evidence_by_claim", {}) if isinstance(evidence_bundle, dict) else {})
     attach_comparability_profiles(extracted, evidence_summary)
     refine_route_claim_points_with_llm(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
+    apply_llm_evidence_refiners(claims, evidence_summary, debug)
     evidence_summary["_qa_evidence"] = build_qa_evidence(claims, evidence_summary)
     mark_timing("initial_summary")
     debug["initial_evidence_summary"] = evidence_summary
@@ -11030,6 +11727,7 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     evidence_summary = summarize_claim_evidence(claims, evidence_bundle.get("evidence_by_claim", {}) if isinstance(evidence_bundle, dict) else {})
     attach_comparability_profiles(extracted, evidence_summary)
     refine_route_claim_points_with_llm(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
+    apply_llm_evidence_refiners(claims, evidence_summary, debug)
     evidence_summary["_qa_evidence"] = build_qa_evidence(claims, evidence_summary)
     mark_timing("final_summary")
     debug["evidence_summary"] = evidence_summary
