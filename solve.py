@@ -2307,6 +2307,45 @@ def infer_channel_decision_confidence(
     return 0.18
 
 
+def infer_closure_chain_family(
+    claim_family: str,
+    secondary_detail_scope: str,
+) -> str:
+    if secondary_detail_scope != "structured_detail":
+        return ""
+    mapping = {
+        "date_fact": "date_closure",
+        "schedule_fact": "schedule_closure",
+        "route_fact": "route_closure",
+        "event_result": "result_closure",
+        "numeric_count_detail": "count_closure",
+        "numeric_fact": "count_closure",
+    }
+    return mapping.get(claim_family, "")
+
+
+def infer_closure_chain_state(
+    detail_state: Optional[Dict[str, Any]],
+    closure_chain_family: str,
+) -> str:
+    detail_state = detail_state if isinstance(detail_state, dict) else {}
+    if not closure_chain_family:
+        return ""
+    logic_state = str(detail_state.get("logic_refutation_state") or "")
+    if logic_state == "stable_logic_refutation_ready":
+        return "stable_ready"
+    if logic_state in {
+        "same_topic_logic_point_unstable",
+        "logic_point_topic_mismatch",
+        "retained_without_logic_point",
+        "shadowed_by_direct_channel",
+    }:
+        return logic_state
+    if normalize_bool(detail_state.get("structured_detail_retained"), False):
+        return "retained_unresolved"
+    return ""
+
+
 def claim_direct_decidable_diagnostic(
     claim: Dict[str, Any],
     summary: Optional[Dict[str, Any]],
@@ -2391,6 +2430,14 @@ def claim_pipeline_diagnostic(
     direct_candidate_gap_reason = str(point_conversion.get("direct_candidate_gap_reason") or "")
     candidate_directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
     point_direct_candidate_promotion_used = int(bool(point_conversion.get("direct_candidate_promotion_used")))
+    query_effective_role = str(point_conversion.get("query_effective_role") or query_effective_role_for_claim(claim))
+    page_utility_score = int(point_conversion.get("page_utility_score") or 0)
+    page_utility_profile = str(point_conversion.get("page_utility_profile") or "")
+    decision_useful_hit = int(bool(point_conversion.get("decision_useful_hit")))
+    candidate_utility_score = int(point_conversion.get("candidate_utility_score") or 0)
+    slot_review_outcome = str(point_conversion.get("slot_review_outcome") or "")
+    refiner_consumed = int(bool(point_conversion.get("refiner_consumed")))
+    point_consumption_state = str(point_conversion.get("point_consumption_state") or "")
     direct_candidate_promotion_basis = infer_candidate_promotion_basis(
         point_direct_candidate_promotion_used,
         candidate_slot_coverage,
@@ -2460,6 +2507,9 @@ def claim_pipeline_diagnostic(
     claim_family = infer_claim_family(claim, summary)
     core_binding_strength = infer_core_binding_strength(claim, decision_slots, direct_need)
     secondary_detail_scope = infer_secondary_detail_scope(claim, detail_state)
+    closure_chain_family = infer_closure_chain_family(claim_family, secondary_detail_scope)
+    closure_chain_state = infer_closure_chain_state(detail_state, closure_chain_family)
+    closure_chain_block_reason = str(detail_state.get("logic_refutation_block_reason") or "")
     intended_decision_channel = infer_intended_decision_channel(
         claim,
         claim_family,
@@ -2551,6 +2601,14 @@ def claim_pipeline_diagnostic(
         "evidence_mode": str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or ""),
         "claim_family": claim_family,
         "intended_decision_channel": intended_decision_channel,
+        "query_effective_role": query_effective_role,
+        "page_utility_score": page_utility_score,
+        "page_utility_profile": page_utility_profile,
+        "decision_useful_hit": decision_useful_hit,
+        "candidate_utility_score": candidate_utility_score,
+        "slot_review_outcome": slot_review_outcome,
+        "refiner_consumed": refiner_consumed,
+        "point_consumption_state": point_consumption_state,
         "core_binding_strength": core_binding_strength,
         "secondary_detail_scope": secondary_detail_scope,
         "channel_decision_candidate": channel_decision_candidate,
@@ -2612,6 +2670,9 @@ def claim_pipeline_diagnostic(
         "logic_refutation_state": str(detail_state.get("logic_refutation_state") or ""),
         "logic_refutation_closure_stage": str(detail_state.get("logic_refutation_closure_stage") or ""),
         "logic_refutation_block_reason": str(detail_state.get("logic_refutation_block_reason") or ""),
+        "closure_chain_state": closure_chain_state,
+        "closure_chain_family": closure_chain_family,
+        "closure_chain_block_reason": closure_chain_block_reason,
         "direct_candidate_promotion_basis": direct_candidate_promotion_basis,
         "candidate_promotion_block_reason": candidate_promotion_block_reason,
         "candidate_slot_coverage_summary": candidate_slot_coverage_summary_text,
@@ -6644,6 +6705,36 @@ def normalize_query_family_role(value: Any) -> str:
     return role if role in {"mirror", "slot", "closure", "refute", "distinguish"} else "mirror"
 
 
+def query_family_role_priority(claim_family: str, role: str) -> int:
+    role = normalize_query_family_role(role)
+    priorities: Dict[str, Dict[str, int]] = {
+        "date_fact": {"closure": 30, "distinguish": 26, "slot": 18, "mirror": 10},
+        "schedule_fact": {"closure": 30, "distinguish": 26, "slot": 18, "mirror": 10},
+        "route_fact": {"closure": 30, "refute": 28, "distinguish": 24, "slot": 16, "mirror": 10},
+        "event_result": {"distinguish": 30, "refute": 28, "closure": 22, "slot": 16, "mirror": 10},
+        "numeric_count_detail": {"closure": 30, "refute": 26, "slot": 18, "mirror": 10},
+        "numeric_fact": {"slot": 26, "closure": 20, "distinguish": 18, "mirror": 10},
+    }
+    return priorities.get(claim_family, {}).get(role, {"slot": 18, "mirror": 10}.get(role, 8))
+
+
+def query_source_preference_for_role(claim_family: str, role: str) -> List[str]:
+    role = normalize_query_family_role(role)
+    if claim_family in {"date_fact", "schedule_fact"}:
+        if role in {"closure", "distinguish"}:
+            return ["official", "html", "news"]
+        return ["html", "official", "news"]
+    if claim_family == "route_fact":
+        if role in {"closure", "refute", "distinguish"}:
+            return ["news", "html", "official"]
+        return ["html", "news", "official"]
+    if claim_family == "event_result":
+        return ["news", "html", "official"] if role in {"distinguish", "refute"} else ["html", "news", "official"]
+    if claim_family in {"numeric_count_detail", "numeric_fact"}:
+        return ["official", "html", "news"] if role == "closure" else ["html", "official", "news"]
+    return ["html", "news", "official"]
+
+
 def normalize_query_planner_hint(raw_obj: Optional[Dict[str, Any]], fallback: Dict[str, Any]) -> Dict[str, Any]:
     base = dict(fallback)
     raw_obj = raw_obj if isinstance(raw_obj, dict) else {}
@@ -6741,14 +6832,24 @@ def query_row(
     role: str,
     origin: str,
     variant_origin: str,
+    source_preference: Optional[List[str]] = None,
 ) -> Dict[str, str]:
-    return {
+    row: Dict[str, Any] = {
         "q": normalize_text(q),
         "goal": goal,
         "origin": origin,
         "query_variant_origin": variant_origin,
         "query_family_role": normalize_query_family_role(role),
     }
+    if isinstance(source_preference, list):
+        normalized_preference = [
+            normalize_text(str(item))
+            for item in source_preference
+            if normalize_text(str(item))
+        ]
+        if normalized_preference:
+            row["source_preference"] = dedupe_keep_order(normalized_preference)[:3]
+    return row
 
 
 def family_query_terms_for_role(
@@ -6811,8 +6912,14 @@ def build_family_query_rows(
     if not roles:
         return []
     goal = infer_program_query_goal(source_intent)
+    claim_family = str((planner_hint or {}).get("claim_family") or infer_claim_family(claim, {"evidence_mode": source_intent.get("evidence_mode") or ""}))
     rows: List[Dict[str, str]] = []
-    for role in roles[:2]:
+    ranked_roles = sorted(
+        dedupe_keep_order(roles),
+        key=lambda item: query_family_role_priority(claim_family, item),
+        reverse=True,
+    )
+    for role in ranked_roles[:3]:
         query_text = compact_query_text_local(" ".join(family_query_terms_for_role(claim, program, planner_hint, role)), 96)
         if not query_text:
             continue
@@ -6823,6 +6930,7 @@ def build_family_query_rows(
                 role,
                 f"{role}_query",
                 f"{role}_query",
+                source_preference=query_source_preference_for_role(claim_family, role),
             )
         )
     return merge_query_rows(rows)
@@ -6989,8 +7097,13 @@ def build_program_queries(claim: Dict[str, Any], program: Dict[str, Any]) -> Lis
     primary = normalized_assertion if len(normalized_assertion) <= 42 else " ".join(base_terms[:4]) or claim_text
     queries: List[Dict[str, Any]] = []
     planner_hint = claim.get("query_planner_hint") if isinstance(claim.get("query_planner_hint"), dict) else {}
+    claim_family = str((planner_hint or {}).get("claim_family") or infer_claim_family(claim, {"evidence_mode": source_intent.get("evidence_mode")}))
     fact_slot_query = build_fact_slot_query_row(claim, program)
-    family_queries = build_family_query_rows(claim, program, planner_hint)
+    family_queries = sorted(
+        build_family_query_rows(claim, program, planner_hint),
+        key=lambda row: query_family_role_priority(claim_family, str(row.get("query_family_role") or "")),
+        reverse=True,
+    )
     if fact_slot_query:
         queries.append(fact_slot_query)
     primary_row = query_row(
@@ -6999,9 +7112,8 @@ def build_program_queries(claim: Dict[str, Any], program: Dict[str, Any]) -> Lis
         "mirror",
         "program_primary_query",
         "program_primary_query",
+        source_preference=query_source_preference_for_role(claim_family, "mirror"),
     )
-    if not fact_slot_query:
-        queries.append(primary_row)
     evidence_mode = str(source_intent.get("evidence_mode") or "")
     evidence_target = str(source_intent.get("evidence_target") or "")
     if evidence_target == "route_relation" or evidence_mode == "route_fact":
@@ -7017,10 +7129,30 @@ def build_program_queries(claim: Dict[str, Any], program: Dict[str, Any]) -> Lis
     else:
         second = " ".join(compact_term_list(base_terms + ["官方"], 5, 18))
     second = normalize_text(second)
+    existing_query_texts = {normalize_text(str(item.get("q") or "")) for item in queries if isinstance(item, dict)}
     if family_queries:
-        queries.extend(family_queries[:1])
+        if claim_family in {"date_fact", "schedule_fact", "numeric_fact"} and fact_slot_query:
+            queries.extend(
+                row for row in family_queries
+                if normalize_text(str(row.get("q") or "")) not in existing_query_texts
+            )
+        elif claim_family in {"route_fact", "event_result", "numeric_count_detail"}:
+            queries.extend(
+                row for row in family_queries
+                if normalize_text(str(row.get("q") or "")) not in existing_query_texts
+            )
+            if not queries:
+                queries.append(primary_row)
+        else:
+            if not fact_slot_query:
+                queries.append(primary_row)
+            queries.extend(
+                row for row in family_queries
+                if normalize_text(str(row.get("q") or "")) not in existing_query_texts
+            )
     else:
-        existing_query_texts = {normalize_text(str(item.get("q") or "")) for item in queries if isinstance(item, dict)}
+        if not fact_slot_query:
+            queries.append(primary_row)
         if second and second != primary and second not in existing_query_texts:
             queries.append(
                 query_row(
@@ -7029,6 +7161,7 @@ def build_program_queries(claim: Dict[str, Any], program: Dict[str, Any]) -> Lis
                     "mirror",
                     "program_secondary_query",
                     "program_secondary_query",
+                    source_preference=query_source_preference_for_role(claim_family, "mirror"),
                 )
             )
         elif fact_slot_query and primary_row.get("q"):
@@ -7400,6 +7533,270 @@ def apply_llm_evidence_refiners(
         }
     if isinstance(debug_bucket, dict):
         debug_bucket["llm_evidence_refiner"] = refiner_debug
+
+
+def query_effective_role_for_claim(claim: Dict[str, Any]) -> str:
+    queries = claim.get("queries") if isinstance(claim.get("queries"), list) else []
+    roles = [
+        normalize_query_family_role(row.get("query_family_role"))
+        for row in queries
+        if isinstance(row, dict)
+    ]
+    if not roles:
+        planner_hint = claim.get("query_planner_hint") if isinstance(claim.get("query_planner_hint"), dict) else {}
+        planned_roles = [
+            normalize_query_family_role(item)
+            for item in (planner_hint.get("query_family_plan") or [])
+            if normalize_query_family_role(item) in {"closure", "refute", "distinguish", "slot", "mirror"}
+        ] if isinstance(planner_hint.get("query_family_plan"), list) else []
+        roles = planned_roles
+    if not roles:
+        return "mirror"
+    if any(role in {"closure", "refute", "distinguish"} for role in roles):
+        claim_family = str(
+            (claim.get("query_planner_hint") or {}).get("claim_family")
+            if isinstance(claim.get("query_planner_hint"), dict)
+            else ""
+        ) or infer_claim_family(claim, {"evidence_mode": (claim.get("source_intent") or {}).get("evidence_mode") if isinstance(claim.get("source_intent"), dict) else ""})
+        ranked_roles = sorted(
+            [role for role in roles if role in {"closure", "refute", "distinguish"}],
+            key=lambda item: query_family_role_priority(claim_family, item),
+            reverse=True,
+        )
+        if ranked_roles:
+            return ranked_roles[0]
+    if "slot" in roles:
+        return "slot"
+    return "mirror"
+
+
+def candidate_page_utility_profile(
+    claim_family: str,
+    query_role: str,
+    candidate: Dict[str, Any],
+) -> str:
+    page_type = normalize_text(str(candidate.get("page_utility_page_type") or ""))
+    page_focus = normalize_text(str(candidate.get("page_utility_page_focus") or ""))
+    title = normalize_text(str(candidate.get("title") or ""))
+    surface = " ".join(part for part in [page_type, page_focus, title] if part)
+    if claim_family in {"date_fact", "schedule_fact"} and re.search(r"(calendar|交易日历|休市|公告|notice|schedule|假期|holiday)", surface, flags=re.I):
+        return "official_calendar_or_notice"
+    if claim_family == "route_fact" and re.search(r"(route|路线|航线|通道|绕行|替代|alternative|corridor|bypass)", surface, flags=re.I):
+        return "alternative_route_or_route_analysis"
+    if claim_family == "event_result" and re.search(r"(result|score|比分|赛果|box score|战绩|交锋)", surface, flags=re.I):
+        return "result_or_score_page"
+    if claim_family in {"numeric_fact", "numeric_count_detail"} and re.search(r"(table|data|quote|official|统计|数据|公告|notice|合计)", surface, flags=re.I):
+        return "table_or_data_page"
+    if re.search(r"(landing|search|首页|搜索结果|专题|commentary|analysis|评论|解读)", surface, flags=re.I):
+        return "background_or_landing_page"
+    if query_role in {"closure", "refute", "distinguish"}:
+        return f"{query_role}_aligned_general_page"
+    return page_type or "general_page"
+
+
+def candidate_page_utility_score(
+    claim_family: str,
+    query_role: str,
+    candidate: Dict[str, Any],
+) -> int:
+    score = 0
+    source_type = normalize_text(str(candidate.get("source_type") or ""))
+    page_profile = candidate_page_utility_profile(claim_family, query_role, candidate)
+    title = normalize_text(str(candidate.get("title") or ""))
+    if source_type == "official":
+        score += 12
+    elif source_type == "news":
+        score += 6
+    profile_bonus = {
+        "official_calendar_or_notice": 24,
+        "alternative_route_or_route_analysis": 22,
+        "result_or_score_page": 20,
+        "table_or_data_page": 20,
+        "background_or_landing_page": -12,
+    }
+    score += profile_bonus.get(page_profile, 8 if query_role in {"closure", "refute", "distinguish"} else 4)
+    if query_role == "closure" and re.search(r"(官方|official|公告|notice|calendar|日历|合计|总数|累计)", title, flags=re.I):
+        score += 6
+    if query_role == "refute" and re.search(r"(alternative|并非|not|instead|绕开|替代)", title, flags=re.I):
+        score += 6
+    if query_role == "distinguish" and re.search(r"(发布|生效|最终|过程|开盘|收盘|盘中)", title, flags=re.I):
+        score += 6
+    return score
+
+
+def candidate_decision_useful_score(
+    claim: Dict[str, Any],
+    summary: Dict[str, Any],
+    candidate: Dict[str, Any],
+) -> int:
+    claim_family = infer_claim_family(claim, summary)
+    query_role = query_effective_role_for_claim(claim)
+    coverage = candidate.get("candidate_slot_coverage") if isinstance(candidate.get("candidate_slot_coverage"), dict) else {}
+    slot_count = int(coverage.get("slot_count") or 0)
+    directness_rank = int(candidate.get("candidate_directness_rank") or 0)
+    sentence_utility_score = int(candidate.get("sentence_utility_score") or 0)
+    sentence_profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
+    gap_reason = normalize_text(str(candidate.get("direct_candidate_gap_reason") or ""))
+    directness = normalize_text(str(candidate.get("sentence_directness") or ""))
+    score = sentence_utility_score
+    score += min(20, directness_rank * 4)
+    score += min(16, slot_count * 4)
+    score += candidate_page_utility_score(claim_family, query_role, candidate)
+    if sentence_profile == "direct_candidate":
+        score += 20
+    elif sentence_profile == "slot_hit_but_indirect":
+        score += 10
+    elif sentence_profile in {"numeric_reference_only", "date_reference_only"}:
+        score += 2
+    elif sentence_profile == "background_commentary":
+        score -= 14
+    if directness == "direct":
+        score += 8
+    elif directness == "partial":
+        score += 2
+    if gap_reason in {"commentary_only", "background_commentary_topranked"}:
+        score -= 10
+    elif gap_reason in {"numeric_reference_only", "date_reference_only"}:
+        score -= 4
+    elif gap_reason in {"date_role_mismatch", "result_granularity_mismatch", "opening_slot_mismatch"}:
+        score += 2
+    return score
+
+
+def decision_useful_hit_for_candidate(candidate: Dict[str, Any]) -> bool:
+    utility = int(candidate.get("candidate_utility_score") or 0)
+    slot_count = int(((candidate.get("candidate_slot_coverage") or {}) if isinstance(candidate.get("candidate_slot_coverage"), dict) else {}).get("slot_count") or 0)
+    profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
+    return utility >= 36 and slot_count >= 2 and profile != "background_commentary"
+
+
+def apply_decision_useful_candidate_rerank(
+    claims: List[Dict[str, Any]],
+    evidence_bundle: Optional[Dict[str, Any]],
+    evidence_summary: Optional[Dict[str, Any]],
+    debug_bucket: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not isinstance(evidence_summary, dict):
+        return
+    summaries = evidence_summary.get("claim_summaries") if isinstance(evidence_summary.get("claim_summaries"), dict) else {}
+    evidence_by_claim = evidence_bundle.get("evidence_by_claim") if isinstance(evidence_bundle, dict) and isinstance(evidence_bundle.get("evidence_by_claim"), dict) else {}
+    rerank_debug: Dict[str, Any] = {}
+    if not isinstance(summaries, dict):
+        return
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+        summary = summaries.get(claim_id)
+        if not isinstance(summary, dict):
+            continue
+        candidates = [item for item in (summary.get("evidence_sentence_candidates") or []) if isinstance(item, dict)]
+        if not candidates:
+            continue
+        query_role = query_effective_role_for_claim(claim)
+        claim_family = infer_claim_family(claim, summary)
+        for candidate in candidates:
+            page_profile = candidate_page_utility_profile(claim_family, query_role, candidate)
+            page_score = candidate_page_utility_score(claim_family, query_role, candidate)
+            candidate_score = candidate_decision_useful_score(claim, summary, candidate)
+            candidate["page_utility_profile"] = page_profile
+            candidate["page_utility_score"] = page_score
+            candidate["candidate_utility_score"] = candidate_score
+            candidate["decision_useful_hit"] = decision_useful_hit_for_candidate({"candidate_utility_score": candidate_score, **candidate})
+        candidates.sort(
+            key=lambda item: (
+                int(item.get("candidate_utility_score") or 0),
+                int(item.get("candidate_directness_rank") or 0),
+                int(((item.get("candidate_slot_coverage") or {}) if isinstance(item.get("candidate_slot_coverage"), dict) else {}).get("slot_count") or 0),
+                int(item.get("sentence_utility_score") or 0),
+            ),
+            reverse=True,
+        )
+        summary["evidence_sentence_candidates"] = candidates
+        evidence_mode = str(summary.get("evidence_mode") or "")
+        coverage = claim_coverage(claim_id, evidence_mode, evidence_by_claim.get(claim_id, []), summary)
+        summary["coverage"] = coverage
+        summary["point_conversion"] = point_conversion_diagnostics(summary, coverage)
+        summary["evidence_events"] = evidence_event_summary(summary, coverage)
+        top_candidate = candidates[0] if candidates else {}
+        point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+        point_conversion["query_effective_role"] = query_role
+        point_conversion["page_utility_score"] = int(top_candidate.get("page_utility_score") or 0)
+        point_conversion["page_utility_profile"] = str(top_candidate.get("page_utility_profile") or "")
+        point_conversion["decision_useful_hit"] = bool(top_candidate.get("decision_useful_hit"))
+        point_conversion["candidate_utility_score"] = int(top_candidate.get("candidate_utility_score") or 0)
+        summary["point_conversion"] = point_conversion
+        rerank_debug[claim_id] = {
+            "query_effective_role": query_role,
+            "claim_family": claim_family,
+            "top_candidate_score": int(top_candidate.get("candidate_utility_score") or 0),
+            "top_candidate_profile": str(top_candidate.get("sentence_candidate_profile") or ""),
+            "top_page_profile": str(top_candidate.get("page_utility_profile") or ""),
+        }
+    if isinstance(debug_bucket, dict):
+        debug_bucket["decision_useful_rerank"] = rerank_debug
+
+
+def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
+    point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+    block_reason = normalize_text(str(point_conversion.get("block_reason") or ""))
+    candidate_score = int(point_conversion.get("candidate_utility_score") or 0)
+    slot_coverage = point_conversion.get("candidate_slot_coverage") if isinstance(point_conversion.get("candidate_slot_coverage"), dict) else {}
+    slot_count = int(slot_coverage.get("slot_count") or 0)
+    if claim_direct_refuting_points(summary) or claim_direct_supporting_points(summary):
+        return "stable_direct_point"
+    if candidate_score >= 36 and slot_count >= 2 and block_reason in {
+        "not_same_fact_slot",
+        "date_role_mismatch",
+        "result_granularity_mismatch",
+        "numeric_not_normalizable",
+    }:
+        return f"same_slot_review_blocked:{block_reason}"
+    if candidate_score >= 28 and block_reason in {"candidate_not_direct", "related_but_not_assertive"}:
+        return "same_slot_review_not_direct"
+    if int(summary.get("answer_candidate_total") or 0) > 0:
+        return "weak_candidate_retained"
+    return "unresolved"
+
+
+def infer_point_consumption_state(summary: Dict[str, Any], slot_review_outcome: str) -> str:
+    if slot_review_outcome == "stable_direct_point":
+        return "stable_direct_point"
+    if slot_review_outcome.startswith("same_slot_review_blocked") or slot_review_outcome == "same_slot_review_not_direct":
+        return "same_slot_reviewed_but_blocked"
+    if slot_review_outcome == "weak_candidate_retained":
+        return "weak_candidate"
+    return "unresolved"
+
+
+def apply_decision_useful_consumption_state(
+    claims: List[Dict[str, Any]],
+    evidence_summary: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(evidence_summary, dict):
+        return
+    summaries = evidence_summary.get("claim_summaries") if isinstance(evidence_summary.get("claim_summaries"), dict) else {}
+    if not isinstance(summaries, dict):
+        return
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+        summary = summaries.get(claim_id)
+        if not isinstance(summary, dict):
+            continue
+        point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+        llm_used = normalize_bool(point_conversion.get("llm_evidence_refiner_used"), False)
+        refined_gap = normalize_text(str(point_conversion.get("llm_refined_gap_reason") or ""))
+        current_block = normalize_text(str(point_conversion.get("block_reason") or ""))
+        current_gap = normalize_text(str(point_conversion.get("direct_candidate_gap_reason") or ""))
+        point_conversion["refiner_consumed"] = bool(
+            llm_used and refined_gap and refined_gap in {current_block, current_gap}
+        )
+        slot_review_outcome = infer_slot_review_outcome(summary)
+        point_conversion["slot_review_outcome"] = slot_review_outcome
+        point_conversion["point_consumption_state"] = infer_point_consumption_state(summary, slot_review_outcome)
+        summary["point_conversion"] = point_conversion
 
 
 def claim_budget_priority(claim: Dict[str, Any]) -> Tuple[int, int, int]:
@@ -10054,6 +10451,20 @@ def aggregate_decision_channel_protocol(
     }
 
 
+def infer_label_source_channel(
+    final_label: str,
+    evidence_signal: Optional[Dict[str, Any]],
+    channel_protocol: Optional[Dict[str, Any]],
+) -> str:
+    evidence_signal = evidence_signal if isinstance(evidence_signal, dict) else {}
+    channel_protocol = channel_protocol if isinstance(channel_protocol, dict) else {}
+    if evidence_signal:
+        return str(evidence_signal.get("decision_channel") or DECISION_CHANNEL_UNRESOLVED)
+    if final_label == LABEL_2:
+        return str(channel_protocol.get("decision_channel") or DECISION_CHANNEL_UNRESOLVED)
+    return str(channel_protocol.get("channel_decision_candidate") or channel_protocol.get("decision_channel") or DECISION_CHANNEL_UNRESOLVED)
+
+
 def answer_has_absolute_boundary_terms(text: str) -> bool:
     lowered = normalize_text(text).lower()
     terms = [
@@ -11578,11 +11989,14 @@ def aggregate_by_confidence(
         claim_pipeline_diagnostics,
         result.get("_evidence_non_decidable_state"),
     )
+    evidence_signal = result.get("_evidence_first_signal") if isinstance(result.get("_evidence_first_signal"), dict) else {}
     result["_decision_channel"] = channel_protocol.get("decision_channel") or ""
     result["_channel_decision_candidate"] = channel_protocol.get("channel_decision_candidate") or ""
     result["_channel_decision_confidence"] = float(channel_protocol.get("channel_decision_confidence") or 0.0)
     result["_channel_label_candidate"] = channel_protocol.get("channel_label_candidate") or LABEL_2
     result["_channel_scope"] = channel_protocol.get("channel_scope") or ""
+    result["label_source_channel"] = infer_label_source_channel(final_label, evidence_signal, channel_protocol)
+    result["_label_source_channel"] = result.get("label_source_channel") or ""
     result["analyse"] = normalize_reason_by_decision_basis(
         str(result.get("analyse") or ""),
         final_label,
@@ -11656,9 +12070,11 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     mark_timing("retrieve")
     debug["evidence_bundle"] = evidence_bundle
     evidence_summary = summarize_claim_evidence(claims, evidence_bundle.get("evidence_by_claim", {}) if isinstance(evidence_bundle, dict) else {})
+    apply_decision_useful_candidate_rerank(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     attach_comparability_profiles(extracted, evidence_summary)
     refine_route_claim_points_with_llm(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     apply_llm_evidence_refiners(claims, evidence_summary, debug)
+    apply_decision_useful_consumption_state(claims, evidence_summary)
     evidence_summary["_qa_evidence"] = build_qa_evidence(claims, evidence_summary)
     mark_timing("initial_summary")
     debug["initial_evidence_summary"] = evidence_summary
@@ -11725,9 +12141,11 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
                 evidence_bundle = merge_evidence_bundles(evidence_bundle, retry_bundle)
                 debug["evidence_bundle"] = evidence_bundle
     evidence_summary = summarize_claim_evidence(claims, evidence_bundle.get("evidence_by_claim", {}) if isinstance(evidence_bundle, dict) else {})
+    apply_decision_useful_candidate_rerank(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     attach_comparability_profiles(extracted, evidence_summary)
     refine_route_claim_points_with_llm(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     apply_llm_evidence_refiners(claims, evidence_summary, debug)
+    apply_decision_useful_consumption_state(claims, evidence_summary)
     evidence_summary["_qa_evidence"] = build_qa_evidence(claims, evidence_summary)
     mark_timing("final_summary")
     debug["evidence_summary"] = evidence_summary
@@ -11878,7 +12296,21 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     if not reason:
         reason = "未发现明确事实错误"
     result = {"id": item.get("id"), "label": label, "reason": reason}
-    debug.update({"stage": "done", "final_result": result})
+    debug_final_result = dict(result)
+    debug_final_result.update(
+        {
+            "_decision_channel": verify_obj.get("_decision_channel") or "",
+            "_channel_decision_candidate": verify_obj.get("_channel_decision_candidate") or "",
+            "_channel_decision_confidence": float(verify_obj.get("_channel_decision_confidence") or 0.0),
+            "_channel_label_candidate": verify_obj.get("_channel_label_candidate") or LABEL_2,
+            "_channel_scope": verify_obj.get("_channel_scope") or "",
+            "label_source_channel": verify_obj.get("label_source_channel") or "",
+            "_label_source_channel": verify_obj.get("_label_source_channel") or "",
+            "_decision_basis": verify_obj.get("_decision_basis") or "",
+            "_decision_policy": verify_obj.get("_decision_policy") or "",
+        }
+    )
+    debug.update({"stage": "done", "final_result": debug_final_result})
     return {"result": result, "debug": debug}
 
 
