@@ -4225,17 +4225,31 @@ def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any
     risk_type = normalize_text(str(atomic_claim.get("risk_type") or ""))
     target = atomic_claim.get("refutation_target") if isinstance(atomic_claim.get("refutation_target"), dict) else {}
     target_terms = target.get("target_terms") if isinstance(target.get("target_terms"), list) else []
-    terms = dedupe_keep_order(
-        [
-            normalize_text(str(slots.get("subject") or "")),
-            normalize_text(str(slots.get("time_scope") or "")),
-            normalize_text(str(slots.get("metric_or_relation") or "")),
-            normalize_text(str(slots.get("object") or "")),
-            normalize_text(str(slots.get("status_or_result") or "")),
-        ]
-        + [normalize_text(str(term)) for term in target_terms[:4]]
-        + ATOMIC_CLAIM_QUERY_HINTS.get(risk_type, ["官方", "实际", "结果"])[:4]
-    )
+    if risk_type == "market_calendar_status":
+        terms = dedupe_keep_order(
+            [
+                normalize_text(str(slots.get("subject") or "")),
+                normalize_text(str(slots.get("time_scope") or "")),
+                "交易日历",
+                "是否开市",
+                "正常交易",
+                "交易安排",
+                "官方",
+                "公告",
+            ]
+        )
+    else:
+        terms = dedupe_keep_order(
+            [
+                normalize_text(str(slots.get("subject") or "")),
+                normalize_text(str(slots.get("time_scope") or "")),
+                normalize_text(str(slots.get("metric_or_relation") or "")),
+                normalize_text(str(slots.get("object") or "")),
+                normalize_text(str(slots.get("status_or_result") or "")),
+            ]
+            + [normalize_text(str(term)) for term in target_terms[:4]]
+            + ATOMIC_CLAIM_QUERY_HINTS.get(risk_type, ["官方", "实际", "结果"])[:4]
+        )
     query_text = compact_text_for_query(" ".join(term for term in terms if term), 96)
     priority = int(atomic_claim.get("search_priority") or 0)
     return {

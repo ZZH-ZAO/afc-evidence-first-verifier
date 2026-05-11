@@ -5711,6 +5711,7 @@ def extract_with_fallback(item: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]
     if isinstance(fast_obj, dict):
         fast_obj["_answer_text"] = item.get("answer", "")
         fast_obj["_question_text"] = item.get("question", "")
+        fast_obj["_question_time"] = item.get("time", "")
     fast_elapsed = round(time.perf_counter() - fast_started, 3)
     fast_ok, fast_reason = extract_plan_quality(fast_obj)
     meta: Dict[str, Any] = {
@@ -5737,6 +5738,7 @@ def extract_with_fallback(item: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]
     if isinstance(normal_obj, dict):
         normal_obj["_answer_text"] = item.get("answer", "")
         normal_obj["_question_text"] = item.get("question", "")
+        normal_obj["_question_time"] = item.get("time", "")
     normal_elapsed = round(time.perf_counter() - normal_started, 3)
     meta.update(
         {
@@ -6399,7 +6401,37 @@ def has_event_result_signal(text: str) -> bool:
     return False
 
 
-def atomic_claim_slot_contract(text: str, risk_type: str, source_claim: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+def atomic_context_date_terms(extracted: Dict[str, Any]) -> List[str]:
+    raw_time = normalize_text(str(extracted.get("_question_time") or ""))
+    match = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", raw_time)
+    if not match:
+        return []
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    return [
+        f"{year}年{month}月{day}日",
+        f"{year}-{month:02d}-{day:02d}",
+        f"{month}月{day}日",
+    ]
+
+
+def atomic_normalize_relative_time_scope(time_scope: str, context_dates: Optional[List[str]] = None) -> str:
+    clean = normalize_text(time_scope)
+    context_dates = context_dates or []
+    if not clean or not context_dates:
+        return clean
+    if clean in {"今天", "今日", "当日", "截至今天"} or re.search(r"(今天|今日|当日|截至今天)", clean):
+        return context_dates[0]
+    return clean
+
+
+def atomic_claim_slot_contract(
+    text: str,
+    risk_type: str,
+    source_claim: Optional[Dict[str, Any]] = None,
+    context_dates: Optional[List[str]] = None,
+) -> Dict[str, str]:
     source_claim = source_claim if isinstance(source_claim, dict) else {}
     source_intent = source_claim.get("source_intent") if isinstance(source_claim.get("source_intent"), dict) else {}
     program = source_claim.get("evidence_need_program") if isinstance(source_claim.get("evidence_need_program"), dict) else {}
@@ -6420,6 +6452,7 @@ def atomic_claim_slot_contract(text: str, risk_type: str, source_claim: Optional
         text_time = first_nonempty_text(*claim_time_markers(text)[:2], width=50)
         if text_time:
             time_scope = text_time
+        time_scope = atomic_normalize_relative_time_scope(time_scope, context_dates)
         metric = metric or "交易日历/开休市状态"
         text_status = first_nonempty_text(*(re.findall(r"(休市|开市|开盘|交易日|假期|节假日)", text)[:3]), width=40)
         if text_status:
@@ -6447,6 +6480,7 @@ def atomic_claim_slot_contract(text: str, risk_type: str, source_claim: Optional
     elif risk_type == "numeric_quote_or_metric":
         metric = metric or first_nonempty_text(*(re.findall(r"(汇率|中间价|买入价|卖出价|牌价|战绩|距离|人数|金额|奖金|基点)", text)[:3]), width=50)
         status = first_nonempty_text(*(re.findall(r"\d+(?:\.\d+)?\s*(?:胜|负|公里|千米|美元|元|基点|%|人民币|CNY|USD)?", text, flags=re.I)[:4]), width=50)
+    time_scope = atomic_normalize_relative_time_scope(time_scope, context_dates)
     return {
         "subject": subject,
         "time_scope": time_scope,
@@ -6570,6 +6604,7 @@ def find_parent_claim_for_atomic(text: str, claims: List[Dict[str, Any]]) -> Dic
 def build_atomic_claims_for_extracted(extracted: Dict[str, Any], claims: List[Dict[str, Any]]) -> Dict[str, Any]:
     answer_text = normalize_text(str(extracted.get("_answer_text") or ""))
     need_type = normalize_need_type(extracted.get("need_type"))
+    context_dates = atomic_context_date_terms(extracted)
     atomic_rows: List[Dict[str, Any]] = []
     seen = set()
     for sentence in split_answer_sentences_for_claims(answer_text):
@@ -6586,7 +6621,7 @@ def build_atomic_claims_for_extracted(extracted: Dict[str, Any], claims: List[Di
             parent_id = str(parent.get("claim_id") or parent.get("id") or "")
             parent_centrality = str(parent.get("centrality") or "supporting")
             centrality_hint = "core" if parent_centrality == "core" and risk_type in {"event_result_status", "current_position_distance", "reality_vs_fiction_status"} else "supporting"
-            slots = atomic_claim_slot_contract(clause, risk_type, parent)
+            slots = atomic_claim_slot_contract(clause, risk_type, parent, context_dates)
             refutation_terms = atomic_refutation_terms(clause, risk_type, slots)
             query = compact_claim_text(" ".join(refutation_terms), 120)
             atomic_rows.append(
@@ -11469,11 +11504,44 @@ def claim_has_new_scheme_decidable_evidence(
     )
 
 
+def atomic_refutation_decision_signal(
+    extracted: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ledger = (
+        evidence_summary.get("_evidence_ledger")
+        if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("_evidence_ledger"), dict)
+        else {}
+    )
+    if not ledger:
+        return {}
+    rows = ledger.get("atomic_label_pressure") if isinstance(ledger.get("atomic_label_pressure"), list) else []
+    strong_rows = [
+        row for row in rows
+        if isinstance(row, dict) and str(row.get("state") or "") == "strong_refutation"
+    ]
+    if not strong_rows:
+        return {}
+    core_row = next((row for row in strong_rows if str(row.get("label") or "") == LABEL_0), None)
+    chosen = core_row or strong_rows[0]
+    label = str(chosen.get("label") or LABEL_1)
+    if label not in {LABEL_0, LABEL_1}:
+        label = LABEL_1
+    return {
+        "label": label,
+        "decision_basis": "evidence_refutation",
+        "policy": "atomic_core_direct_refutation" if label == LABEL_0 else "atomic_secondary_direct_refutation",
+        "decision_channel": DECISION_CHANNEL_DIRECT_WEB,
+        "decision_scope": "atomic",
+        "decision_channel_confidence": 0.92 if label == LABEL_0 else 0.88,
+    }
+
+
 def has_new_scheme_decidable_evidence(
     extracted: Dict[str, Any],
     evidence_summary: Optional[Dict[str, Any]],
 ) -> bool:
-    return bool(evidence_first_decision_signal(extracted, evidence_summary))
+    return bool(evidence_first_decision_signal(extracted, evidence_summary) or atomic_refutation_decision_signal(extracted, evidence_summary))
 
 
 def evidence_first_decision_signal(
@@ -11521,6 +11589,9 @@ def evidence_first_decision_signal(
                 "decision_scope": "secondary_detail",
                 "decision_channel_confidence": 0.86 if detail_reason == "stable_logic_refutation" else 0.9,
             }
+    atomic_signal = atomic_refutation_decision_signal(extracted, evidence_summary)
+    if atomic_signal:
+        return atomic_signal
     if has_new_scheme_core_supporting_evidence(extracted, evidence_summary) and not has_unresolved_high_risk_detail_claims(extracted, evidence_summary):
         return {
             "label": LABEL_2,
@@ -12252,6 +12323,7 @@ def insufficient_evidence_reason(
     page_keep_review_state = dominant_row.get("page_keep_review_state") if isinstance(dominant_row.get("page_keep_review_state"), dict) else {}
     page_keep_review_reason = dominant_row.get("page_keep_review_reason") if isinstance(dominant_row.get("page_keep_review_reason"), dict) else {}
     kept_progress_from_raw = int(dominant_row.get("kept_progress_from_raw") or 0)
+    point_consumption_state = str(dominant_row.get("point_consumption_state") or "")
     rescue_success_gate = str(dominant_row.get("rescue_success_gate") or "")
     rescue_target_page_type = str(dominant_row.get("rescue_target_page_type") or "")
     rescue_non_roi_reason = str(dominant_row.get("rescue_non_roi_reason") or "")
@@ -12761,6 +12833,18 @@ def has_direct_supporting_evidence(evidence_summary: Optional[Dict[str, Any]]) -
     return False
 
 
+def has_atomic_refuting_evidence(evidence_summary: Optional[Dict[str, Any]]) -> bool:
+    ledger = (
+        evidence_summary.get("_evidence_ledger")
+        if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("_evidence_ledger"), dict)
+        else {}
+    )
+    if not ledger:
+        return False
+    rows = ledger.get("atomic_refuted_points") if isinstance(ledger.get("atomic_refuted_points"), list) else []
+    return any(isinstance(row, dict) for row in rows)
+
+
 def attached_detail_refuting_reason_allowed(
     extracted: Dict[str, Any],
     evidence_summary: Optional[Dict[str, Any]],
@@ -12824,11 +12908,11 @@ def classify_decision_basis(
 ) -> str:
     if policy in RUBRIC_FALLBACK_POLICIES:
         return "rubric_fallback"
-    if policy in {"evidence_first_core_direct_refutation", "secondary_detail_direct_refutation"}:
+    if policy in {"evidence_first_core_direct_refutation", "secondary_detail_direct_refutation", "atomic_core_direct_refutation", "atomic_secondary_direct_refutation"}:
         return "evidence_refutation"
     if policy == "evidence_first_core_direct_support":
         return "evidence_support"
-    if label in {LABEL_0, LABEL_1} and has_direct_refuting_evidence(evidence_summary):
+    if label in {LABEL_0, LABEL_1} and (has_direct_refuting_evidence(evidence_summary) or has_atomic_refuting_evidence(evidence_summary)):
         return "evidence_refutation"
     if (
         label == LABEL_2
@@ -12987,7 +13071,7 @@ def final_reason_conflict_issues(reason: str, label: str, decision_basis: str, e
         issues.append("错误类标签但reason否定事实错误依据")
     if label == LABEL_2 and any(term in text for term in error_terms):
         issues.append("无错标签但reason说存在事实错误")
-    has_refuting = has_direct_refuting_evidence(evidence_summary)
+    has_refuting = has_direct_refuting_evidence(evidence_summary) or has_atomic_refuting_evidence(evidence_summary)
     has_supporting = has_direct_supporting_evidence(evidence_summary)
     if not has_refuting and any(term in text for term in ["证据显示错误", "证据证明错误", "直接反证", "已经被反驳", "被证据反驳"]):
         issues.append("没有直接反证却写成证据反驳")
@@ -13017,7 +13101,7 @@ def llm_reason_is_safe(reason: str, label: str, decision_basis: str, evidence_su
         return False
     if label == LABEL_2 and any(term in text for term in ["判为主需事实错误", "判为次需事实错误", "构成主需事实错误", "构成次需事实错误", "最终标签为0", "最终标签为1"]):
         return False
-    has_refuting = has_direct_refuting_evidence(evidence_summary)
+    has_refuting = has_direct_refuting_evidence(evidence_summary) or has_atomic_refuting_evidence(evidence_summary)
     evidence_claim_words = ["证据显示", "证据证明", "直接反证", "检索到反证", "被证据反驳"]
     if not has_refuting and any(term in text for term in evidence_claim_words):
         return False
@@ -13128,6 +13212,11 @@ def build_core_assertion_audit(
     evidence_ledger: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     claims = extracted.get("claims") if isinstance(extracted, dict) and isinstance(extracted.get("claims"), list) else []
+    claim_by_id = {
+        str(claim.get("claim_id") or claim.get("id") or ""): claim
+        for claim in claims
+        if isinstance(claim, dict) and str(claim.get("claim_id") or claim.get("id") or "")
+    }
     summaries = (
         evidence_summary.get("claim_summaries")
         if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("claim_summaries"), dict)
@@ -13328,12 +13417,289 @@ def _ledger_point_row(claim_id: str, claim_text: str, point: Dict[str, Any], sta
     }
 
 
+ATOMIC_REFUTATION_CONVERTER_RISK_TYPES = {
+    "market_calendar_status",
+    "exclusive_or_only_path",
+    "event_result_status",
+}
+
+ATOMIC_REFUTATION_LABEL_BY_CENTRALITY = {
+    "core": LABEL_0,
+    "supporting": LABEL_1,
+    "peripheral": LABEL_1,
+}
+
+
+def _atomic_converter_surface_text(point: Dict[str, Any]) -> str:
+    return normalize_text(
+        " ".join(
+            str(value)
+            for value in [
+                point.get("sentence"),
+                point.get("evidence_sentence"),
+                point.get("text"),
+                point.get("title"),
+                point.get("url"),
+            ]
+            if normalize_text(str(value or ""))
+        )
+    ).lower()
+
+
+def _atomic_converter_has_terms(text: str, terms: List[str]) -> bool:
+    lowered = normalize_text(text).lower()
+    return bool(lowered) and any(normalize_text(str(term)).lower() in lowered for term in terms if normalize_text(str(term)))
+
+
+def _atomic_converter_label(row: Dict[str, Any]) -> str:
+    centrality = str(row.get("centrality_hint") or row.get("answer_role_impact") or "").lower()
+    return ATOMIC_REFUTATION_LABEL_BY_CENTRALITY.get(centrality, LABEL_1)
+
+
+def _atomic_converter_extract_score_pair(text: str) -> Optional[Tuple[int, int]]:
+    match = re.search(r"\b(\d{1,3})\s*[-:：]\s*(\d{1,3})\b", normalize_text(str(text or "")))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _atomic_converter_score_scale_compatible(claim_text: str, evidence_value_text: str) -> bool:
+    claim_score = _atomic_converter_extract_score_pair(claim_text)
+    evidence_score = _atomic_converter_extract_score_pair(evidence_value_text)
+    if not claim_score or not evidence_score:
+        return False
+    claim_max = max(claim_score)
+    evidence_max = max(evidence_score)
+    # High-scoring events such as basketball must not be refuted by small
+    # series records or date-like fragments; low-scoring sports remain allowed.
+    if claim_max >= 20:
+        return evidence_max >= max(20, int(claim_max * 0.4))
+    return evidence_max < 20
+
+
+def _atomic_converter_extract_chinese_date(text: str) -> Optional[Tuple[int, int, int]]:
+    clean = normalize_text(text)
+    match = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", clean)
+    if not match:
+        match = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", clean)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _atomic_converter_named_holiday_mismatch(claim_text: str, slot_time_scope: str) -> Optional[str]:
+    date_value = _atomic_converter_extract_chinese_date(slot_time_scope)
+    if not date_value:
+        return None
+    _, month, day = date_value
+    if "清明" in claim_text and not (month == 4 and 4 <= day <= 6):
+        return "不在清明假期窗口"
+    if "元旦" in claim_text and not (month == 1 and 1 <= day <= 3):
+        return "不在元旦假期窗口"
+    return None
+
+
+def _atomic_converter_market_calendar_computed_conflict(
+    atomic_row: Dict[str, Any],
+    candidate: Dict[str, Any],
+    claim_text: str,
+) -> Optional[Dict[str, Any]]:
+    if normalize_text(str(candidate.get("source_type") or "")).lower() != "computed":
+        return None
+    title = normalize_text(str(candidate.get("title") or ""))
+    if title != "样本日期星期计算":
+        return None
+    slots = atomic_row.get("slot_contract") if isinstance(atomic_row.get("slot_contract"), dict) else {}
+    mismatch = _atomic_converter_named_holiday_mismatch(claim_text, normalize_text(str(slots.get("time_scope") or "")))
+    if not mismatch:
+        return None
+    if not _atomic_converter_has_terms(claim_text, ["休市", "假期", "节假日", "不开市", "清明", "元旦"]):
+        return None
+    converted = dict(candidate)
+    converted["conflict_type"] = "status_conflict"
+    converted["conflict_strength"] = "strong"
+    converted["conflict_slot"] = "status_or_result"
+    converted["claim_value"] = "closed_or_holiday"
+    converted["evidence_value"] = mismatch
+    converted["same_slot_conflict_ready"] = True
+    converted["computed_calendar_conflict"] = True
+    converted["direct_answer"] = "direct"
+    return converted
+
+
+def _atomic_converter_market_calendar_synthetic_candidate(
+    atomic_row: Dict[str, Any],
+    claim_text: str,
+) -> Optional[Dict[str, Any]]:
+    slots = atomic_row.get("slot_contract") if isinstance(atomic_row.get("slot_contract"), dict) else {}
+    time_scope = normalize_text(str(slots.get("time_scope") or ""))
+    mismatch = _atomic_converter_named_holiday_mismatch(claim_text, time_scope)
+    if not mismatch:
+        return None
+    if not _atomic_converter_has_terms(claim_text, ["休市", "假期", "节假日", "不开市", "清明", "元旦"]):
+        return None
+    return {
+        "sentence": f"原子日期节假日窗口计算 {time_scope} {mismatch}。",
+        "source_type": "computed",
+        "title": "样本日期星期计算",
+        "url": "",
+        "direct_answer": "direct",
+    }
+
+
+def _atomic_converter_candidate_topic_overlap(
+    atomic_text: str,
+    parent_text: str,
+    candidate_text: str,
+) -> bool:
+    terms = [
+        term
+        for term in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,16}", normalize_text(atomic_text + " " + parent_text))
+        if term
+    ]
+    stop = {"claim", "answer", "question", "result", "score", "official", "general", "today"}
+    return any(term.lower() not in stop and term.lower() in candidate_text for term in terms[:12])
+
+
+def _atomic_converter_match_row(
+    atomic_row: Dict[str, Any],
+    claim: Dict[str, Any],
+    summary: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    risk_type = str(atomic_row.get("risk_type") or "")
+    if risk_type not in ATOMIC_REFUTATION_CONVERTER_RISK_TYPES:
+        return None
+    atomic_id = str(atomic_row.get("atomic_claim_id") or "")
+    claim_text = normalize_text(str(atomic_row.get("text") or ""))
+    parent_text = normalize_text(str(claim.get("claim") or ""))
+    candidates = [
+        row for row in (summary.get("evidence_sentence_candidates") or [])
+        if isinstance(row, dict)
+    ]
+    if risk_type == "market_calendar_status":
+        synthetic_candidate = _atomic_converter_market_calendar_synthetic_candidate(atomic_row, claim_text)
+        if synthetic_candidate:
+            candidates.insert(0, synthetic_candidate)
+    # Prefer atomic-query results when retrieval preserved the id, then fall back to
+    # normal candidates from the same parent claim.
+    candidates.sort(
+        key=lambda row: (
+            str(row.get("atomic_claim_id") or "") == atomic_id,
+            bool(row.get("same_slot_conflict_ready")),
+            str(row.get("conflict_strength") or "") == "strong",
+            bool(row.get("page_role_consumed")),
+        ),
+        reverse=True,
+    )
+    for candidate in candidates:
+        if risk_type == "market_calendar_status":
+            computed_conflict = _atomic_converter_market_calendar_computed_conflict(atomic_row, candidate, claim_text)
+            if computed_conflict:
+                candidate = computed_conflict
+            elif is_pseudo_evidence_candidate(candidate):
+                continue
+            elif not direct_evidence_gate_allows(candidate):
+                continue
+        elif is_pseudo_evidence_candidate(candidate) or not direct_evidence_gate_allows(candidate):
+            continue
+        conflict_profile = candidate.get("candidate_conflict_profile") if isinstance(candidate.get("candidate_conflict_profile"), dict) else {}
+        same_slot_ready = bool(candidate.get("same_slot_conflict_ready") or conflict_profile.get("same_slot_conflict_ready"))
+        conflict_strength = str(candidate.get("conflict_strength") or conflict_profile.get("conflict_strength") or "")
+        conflict_type = str(candidate.get("conflict_type") or conflict_profile.get("conflict_type") or "")
+        conflict_slot = str(candidate.get("conflict_slot") or conflict_profile.get("conflict_slot") or "")
+        candidate_text = _atomic_converter_surface_text(candidate)
+        page_profile = normalize_text(str(candidate.get("page_utility_profile") or candidate.get("sentence_candidate_profile") or "")).lower()
+        page_role = normalize_text(str(candidate.get("page_role") or "")).lower()
+        source_type = normalize_text(str(candidate.get("source_type") or "")).lower()
+        topic_overlap = _atomic_converter_candidate_topic_overlap(claim_text, parent_text, candidate_text)
+        if risk_type == "market_calendar_status":
+            if not (
+                same_slot_ready
+                and conflict_type == "status_conflict"
+                and conflict_strength in {"strong", "medium"}
+                and conflict_slot in {"status_or_result", "time_scope"}
+            ):
+                continue
+        elif risk_type == "exclusive_or_only_path":
+            exclusive_terms = ["唯一", "只能", "必经", "必须经过", "完全绕开", "根本不需要经过", "不需要经过", "无需经过", "only route", "must pass", "without crossing"]
+            alternative_terms = ["替代", "替代路径", "替代通道", "管道", "港口", "绕开", "bypass", "alternative route"]
+            if same_slot_ready and conflict_strength in {"strong", "medium"} and conflict_type in {"relation_conflict", "status_conflict"}:
+                pass
+            elif not (
+                _atomic_converter_has_terms(claim_text, exclusive_terms)
+                and _atomic_converter_has_terms(candidate_text, alternative_terms)
+                and (page_role == "evidence_page" or page_profile == "alternative_route_or_route_analysis" or source_type in {"official", "news"})
+                and topic_overlap
+            ):
+                continue
+        elif risk_type == "event_result_status":
+            result_terms = ["比分", "战胜", "击败", "获胜", "退赛", "弃权", "不战而胜", "walkover", "withdraw", "retired", "result", "score"]
+            withdrawal_terms = ["退赛", "弃权", "不战而胜", "walkover", "withdraw", "withdrew", "retired"]
+            score_pattern = r"\b\d{1,3}\s*[-:：]\s*\d{1,3}\b"
+            claim_has_score = bool(re.search(score_pattern, claim_text))
+            evidence_value_text = normalize_text(str(candidate.get("evidence_value") or conflict_profile.get("evidence_value") or ""))
+            evidence_value_has_score = bool(re.search(score_pattern, evidence_value_text))
+            score_scale_compatible = _atomic_converter_score_scale_compatible(claim_text, evidence_value_text)
+            candidate_has_withdrawal = _atomic_converter_has_terms(candidate_text, withdrawal_terms)
+            if same_slot_ready and conflict_strength in {"strong", "medium"} and conflict_type in {"result_conflict", "status_conflict", "event_mismatch", "status_mismatch"}:
+                if not (
+                    (claim_has_score and evidence_value_has_score and score_scale_compatible and conflict_type == "result_conflict")
+                    or (claim_has_score and candidate_has_withdrawal)
+                    or (candidate_has_withdrawal and _atomic_converter_has_terms(claim_text, result_terms))
+                ):
+                    continue
+            elif not (
+                claim_has_score
+                and candidate_has_withdrawal
+                and (page_role == "evidence_page" or page_profile == "result_or_score_page" or source_type in {"official", "news"})
+                and topic_overlap
+            ):
+                continue
+        converted = dict(candidate)
+        converted["atomic_claim_id"] = atomic_id
+        converted["parent_claim_id"] = str(atomic_row.get("parent_claim_id") or claim.get("claim_id") or claim.get("id") or "")
+        converted["risk_type"] = risk_type
+        converted["centrality_hint"] = str(atomic_row.get("centrality_hint") or "")
+        converted["atomic_label"] = _atomic_converter_label(atomic_row)
+        converted["atomic_query"] = str((atomic_row.get("refutation_target") or {}).get("query") or "") if isinstance(atomic_row.get("refutation_target"), dict) else ""
+        converted["atomic_refutation_reason"] = {
+            "market_calendar_status": "same-slot market calendar conflict",
+            "exclusive_or_only_path": "exclusive-path alternative evidence",
+            "event_result_status": "same-slot event-result conflict",
+        }.get(risk_type, "atomic refutation")
+        converted["direct_answer"] = "direct"
+        converted["conflict_strength"] = str(converted.get("conflict_strength") or conflict_strength or "strong")
+        converted["conflict_type"] = str(converted.get("conflict_type") or conflict_type or risk_type)
+        converted["conflict_slot"] = str(converted.get("conflict_slot") or conflict_slot or "status_or_result")
+        converted["same_slot_conflict_ready"] = True
+        return converted
+    return None
+
+
+def atomic_refutation_points_for_claim(
+    atomic_rows: List[Dict[str, Any]],
+    claim: Dict[str, Any],
+    summary: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    converted: List[Dict[str, Any]] = []
+    for atomic_row in atomic_rows:
+        point = _atomic_converter_match_row(atomic_row, claim, summary)
+        if point:
+            converted.append(point)
+    return converted[:2]
+
+
 def build_evidence_ledger(
     extracted: Dict[str, Any],
     evidence_summary: Optional[Dict[str, Any]],
     claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     claims = extracted.get("claims") if isinstance(extracted, dict) and isinstance(extracted.get("claims"), list) else []
+    claim_by_id = {
+        str(claim.get("claim_id") or claim.get("id") or ""): claim
+        for claim in claims
+        if isinstance(claim, dict) and str(claim.get("claim_id") or claim.get("id") or "")
+    }
     summaries = (
         evidence_summary.get("claim_summaries")
         if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("claim_summaries"), dict)
@@ -13454,6 +13820,54 @@ def build_evidence_ledger(
         plan_row = atomic_plan_by_id.get(atomic_id, {})
         result_row = atomic_result_by_id.get(atomic_id, {})
         parent_diag = atomic_parent_diag.get(atomic_id, {})
+        parent_claim_id = str(row.get("parent_claim_id") or "")
+        parent_claim = claim_by_id.get(parent_claim_id, {})
+        parent_summary = summaries.get(parent_claim_id) if isinstance(summaries.get(parent_claim_id), dict) else {}
+        converted_points = atomic_refutation_points_for_claim([row], parent_claim, parent_summary) if parent_claim and parent_summary else []
+        if converted_points:
+            converted_point = converted_points[0]
+            atomic_label = str(converted_point.get("atomic_label") or LABEL_1)
+            raw_hits_for_atomic = int(result_row.get("raw_hits") or 0) if result_row else 0
+            kept_hits_for_atomic = int(result_row.get("kept_hits") or 0) if result_row else 0
+            ledger["atomic_refuted_points"].append(
+                {
+                    "atomic_claim_id": atomic_id,
+                    "parent_claim_id": parent_claim_id,
+                    "risk_type": str(row.get("risk_type") or ""),
+                    "atomic_label": atomic_label,
+                    "centrality_hint": str(row.get("centrality_hint") or ""),
+                    "state": "refuted",
+                    "atomic_gate_result": str(parent_diag.get("atomic_gate_result") or ""),
+                    "atomic_stop_reason": str(parent_diag.get("atomic_stop_reason") or ""),
+                    "raw_hits": raw_hits_for_atomic,
+                    "kept_hits": kept_hits_for_atomic,
+                    "query": str(result_row.get("query") or plan_row.get("query") or converted_point.get("atomic_query") or ""),
+                    "claim": compact_claim_text(str(row.get("text") or ""), 120),
+                    "point": compact_claim_text(point_text(converted_point), 180),
+                    "title": compact_claim_text(str(converted_point.get("title") or ""), 90),
+                    "url": str(converted_point.get("url") or ""),
+                    "conflict_slot": str(converted_point.get("conflict_slot") or ""),
+                    "conflict_type": str(converted_point.get("conflict_type") or ""),
+                    "conflict_strength": str(converted_point.get("conflict_strength") or ""),
+                    "claim_value": converted_point.get("claim_value"),
+                    "evidence_value": converted_point.get("evidence_value"),
+                    "same_slot_conflict_ready": bool(converted_point.get("same_slot_conflict_ready")),
+                }
+            )
+            ledger["atomic_label_pressure"].append(
+                {
+                    "atomic_claim_id": atomic_id,
+                    "parent_claim_id": parent_claim_id,
+                    "risk_type": str(row.get("risk_type") or ""),
+                    "label": atomic_label,
+                    "pressure": 2 if atomic_label == LABEL_0 else 1,
+                    "state": "strong_refutation",
+                    "reason": str(converted_point.get("atomic_refutation_reason") or ""),
+                    "atomic_gate_result": str(parent_diag.get("atomic_gate_result") or ""),
+                    "atomic_stop_reason": str(parent_diag.get("atomic_stop_reason") or ""),
+                }
+            )
+            continue
         raw_hits = int(result_row.get("raw_hits") or 0) if result_row else 0
         kept_hits = int(result_row.get("kept_hits") or 0) if result_row else 0
         if kept_hits > 0:
@@ -13653,6 +14067,7 @@ def evidence_ledger_reason(label: str, evidence_summary: Optional[Dict[str, Any]
     unresolved = ledger.get("unresolved_points") if isinstance(ledger.get("unresolved_points"), list) else []
     conflict_points = ledger.get("candidate_conflict_points") if isinstance(ledger.get("candidate_conflict_points"), list) else []
     contrastive_unresolved = ledger.get("contrastive_unresolved_points") if isinstance(ledger.get("contrastive_unresolved_points"), list) else []
+    atomic_refuted = ledger.get("atomic_refuted_points") if isinstance(ledger.get("atomic_refuted_points"), list) else []
     atomic_unresolved = ledger.get("atomic_unresolved_points") if isinstance(ledger.get("atomic_unresolved_points"), list) else []
     if refuted:
         first = refuted[0]
@@ -13660,6 +14075,13 @@ def evidence_ledger_reason(label: str, evidence_summary: Optional[Dict[str, Any]
         point = str(first.get("point") or "")
         scope = "主需" if label == LABEL_0 else "次需"
         return f"证据账本显示存在同槽反证：{claim_text}；{point}。因此判为{scope}事实错误。"
+    if atomic_refuted:
+        first = atomic_refuted[0]
+        scope = "主需" if label == LABEL_0 else "次需"
+        risk = str(first.get("risk_type") or "high_risk_atomic_claim")
+        claim_text = str(first.get("claim") or "")
+        point = str(first.get("point") or "")
+        return f"原子证据账本形成同槽反证：{risk}「{claim_text}」；{point}。因此判为{scope}事实错误。"
     parts: List[str] = []
     if confirmed:
         first = confirmed[0]
@@ -13727,7 +14149,7 @@ def choose_final_reason(
     ]
     allow_evidence_reason = (
         label in {LABEL_0, LABEL_1}
-        and has_direct_refuting_evidence(evidence_summary)
+        and (has_direct_refuting_evidence(evidence_summary) or has_atomic_refuting_evidence(evidence_summary))
     ) or (
         label == LABEL_2
         and decision_basis == "evidence_support"
@@ -13746,7 +14168,7 @@ def choose_final_reason(
         )
         candidates.insert(0, ("evidence_reason", evidence_based))
     ledger_based = evidence_ledger_reason(label, evidence_summary)
-    if ledger_based and (label == LABEL_2 or has_direct_refuting_evidence(evidence_summary)):
+    if ledger_based and (label == LABEL_2 or has_direct_refuting_evidence(evidence_summary) or has_atomic_refuting_evidence(evidence_summary)):
         candidates.insert(0, ("evidence_ledger_reason", ledger_based))
     consistency_based = cross_claim_consistency_reason(label, evidence_summary)
     if consistency_based:
@@ -13772,7 +14194,7 @@ def consistent_conflict_fallback_reason(label: str, decision_basis: str, verify_
         if decision_basis == "evidence_support" and has_direct_supporting_evidence(evidence_summary):
             return "最终标签来自直接支持证据：关键 claim 已得到可直接核对的支持，因此当前不判定为事实错误。"
         return "没有形成可直接裁决的支持或反驳证据，因此不判定为事实错误。"
-    if decision_basis == "evidence_refutation" and has_direct_refuting_evidence(evidence_summary):
+    if decision_basis == "evidence_refutation" and (has_direct_refuting_evidence(evidence_summary) or has_atomic_refuting_evidence(evidence_summary)):
         return "最终标签来自直接证据反驳：关键 claim 与可用证据存在冲突，因此判为事实错误风险。"
     if decision_basis == "evidence_support" and has_direct_supporting_evidence(evidence_summary):
         detail = aggregation_reason or audit_reason or "关键 claim 与可核对证据一致"
@@ -13810,6 +14232,8 @@ def policy_reason(label: str, policy: str) -> str:
         "open_route_summary_without_absolute_boundary": "开放式路线说明没有出现强绝对化或排他性表达，证据薄不能单独升级成事实错误。",
         "only_weak_core_refutation_or_secondary_errors": "现有证据只形成弱反证或次要细节错误，未达到主需事实错误门槛。",
         "evidence_first_core_direct_refutation": "核心 claim 已有直接反证，最终标签直接由证据层裁决，不再交给语义兜底或风险校准层改写。",
+        "atomic_core_direct_refutation": "核心高风险原子 claim 已被同槽证据反驳，最终标签直接由原子证据账本裁决。",
+        "atomic_secondary_direct_refutation": "附带高风险原子 claim 已被同槽证据反驳，按次需事实错误处理。",
         "evidence_first_core_direct_support": "核心 claim 已有可直接核对的支持证据，最终标签直接由证据层裁决，不再交给 fallback 补判。",
         "secondary_detail_direct_refutation": "主需结论未被推翻，但附带数字、日期、身份或金额等细节存在直接反证。",
         "unsupported_claims_are_not_fact_errors": "只有证据不足或弱相关材料，没有直接反证；证据不足不能等同于事实错误。",
