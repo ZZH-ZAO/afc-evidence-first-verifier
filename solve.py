@@ -3079,7 +3079,8 @@ def rubric_trigger_gate(
     has_any_incomparable = normalize_bool(fallback_risk_features.get("has_any_incomparable"), False)
     forecast_as_fact = normalize_bool(fallback_risk_features.get("forecast_as_fact_present"), False)
     route_uniqueness_overclaim = normalize_bool(fallback_risk_features.get("route_uniqueness_overclaim"), False)
-    explicit_core_risk = route_uniqueness_overclaim or forecast_as_fact or fictional_risk
+    absolute_claim_present = normalize_bool(fallback_risk_features.get("absolute_claim_present"), False)
+    explicit_core_risk = route_uniqueness_overclaim or forecast_as_fact or fictional_risk or absolute_claim_present
     route_guard_blocked = (
         has_core_route_like_claim(extracted, evidence_summary)
         and not normalize_bool(fallback_risk_features.get("absolute_claim_present"), False)
@@ -3132,6 +3133,14 @@ def rubric_trigger_gate(
     if non_decidable_state == "abstain_no_judge" and (fictional_risk or explicit_core_risk):
         gate["allow"] = True
         gate["reason"] = "abstain_but_explicit_core_risk"
+        return gate
+    if non_decidable_state == "internal_contradiction_detected":
+        gate["allow"] = True
+        gate["reason"] = "internal_contradiction_risk"
+        return gate
+    if non_decidable_state == "access_blocked":
+        gate["allow"] = True
+        gate["reason"] = "access_blocked_not_evidence_absence"
         return gate
     gate["reason"] = f"{non_decidable_state or 'unsupported'}_without_fallback_risk_signal"
     return gate
@@ -10409,6 +10418,7 @@ def build_evidence_non_decidable_state(
     item: Optional[Dict[str, Any]],
     extracted: Dict[str, Any],
     evidence_summary: Optional[Dict[str, Any]],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     item = item if isinstance(item, dict) else {}
     evidence_signal = evidence_first_decision_signal(extracted, evidence_summary)
@@ -10476,12 +10486,36 @@ def build_evidence_non_decidable_state(
         fictional_contamination = any(token in answer_text for token in ["虚构", "剧本", "假设", "AI生成", "非真实新闻"])
         if not fictional_contamination:
             fictional_contamination = bool(re.search(r"(未来场景|未来剧本|模拟推演|虚构设定)", answer_text + " " + question_text))
+    # Extract access_path_state from diagnostics to distinguish "blocked" from "no evidence"
+    diag_items = (
+        claim_pipeline_diagnostics.get("items")
+        if isinstance(claim_pipeline_diagnostics, dict) and isinstance(claim_pipeline_diagnostics.get("items"), list)
+        else []
+    )
+    access_blocked = False
+    for diag_row in diag_items:
+        if not isinstance(diag_row, dict):
+            continue
+        aps = str(diag_row.get("access_path_state") or "")
+        if aps in {"access_blocked_but_rescuable", "access_blocked_and_unresolved", "official_discovery_failed"}:
+            access_blocked = True
+            break
+
+    # Detect internal contradictions in the answer
+    contradiction_signals = detect_answer_internal_contradictions(answer_text, claims)
+
     if fictional_contamination:
         state = "fictional_contamination_suspected"
         reason = "fictional_contamination_signal"
+    elif contradiction_signals and not any_related_material:
+        state = "internal_contradiction_detected"
+        reason = f"answer_contradiction_{contradiction_signals[0]['type']}"
     elif partial_but_incomparable_count > 0:
         state = "partial_but_incomparable"
         reason = "related_material_found_but_not_comparable"
+    elif access_blocked and not any_related_material:
+        state = "access_blocked"
+        reason = "access_blocked_not_evidence_absence"
     elif unsupported_claim_count > 0 or not any_related_material:
         state = "unsupported"
         reason = "no_direct_decidable_evidence"
@@ -10497,6 +10531,8 @@ def build_evidence_non_decidable_state(
         "unsupported_claim_count": unsupported_claim_count,
         "partial_but_incomparable_count": partial_but_incomparable_count,
         "has_fictional_contamination": fictional_contamination,
+        "has_contradiction_signals": bool(contradiction_signals),
+        "contradiction_signals": contradiction_signals,
         "certainty_profile": certainty_profile,
     }
 
@@ -10568,6 +10604,50 @@ def answer_has_absolute_boundary_terms(text: str) -> bool:
 
 def answer_has_resolved_forecast_terms(text: str) -> bool:
     return any(term in normalize_text(text) for term in ["无悬念", "年内最大", "即将迎来", "确定落地"])
+
+
+def detect_answer_internal_contradictions(answer_text: str, claims: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Detect logical contradictions within the answer itself.
+
+    Returns a list of contradiction signals, each with 'type' and 'detail'.
+    """
+    text = normalize_text(answer_text)
+    signals: List[Dict[str, str]] = []
+
+    # Pattern 1: Negation contradiction — "A，但不A" / "A，然而非A"
+    negation_patterns = [
+        (r"(没有|无|不|非|未)(实质性)?影响.{0,20}(但是|但|然而|却|可是).{0,10}(有影响|产生影响|重大影响)", "causal_contradiction"),
+        (r"(唯一|仅有|只能).{0,30}(此外|另外|同时|还可以|也能|也可)", "uniqueness_contradiction"),
+        (r"(完全|彻底|根本).{0,15}(不|没有|无).{0,20}(但是|但|然而|却).{0,10}(部分|有些|一定程度)", "absolute_contradiction"),
+        (r"(不影响|没有影响|无影响).{0,20}(因此|所以|导致|造成).{0,10}(影响|冲击|波及)", "causal_contradiction"),
+    ]
+    for pattern, signal_type in negation_patterns:
+        if re.search(pattern, text):
+            signals.append({"type": signal_type, "detail": f"pattern_matched: {pattern[:40]}"})
+
+    # Pattern 2: Numeric contradiction — same sentence with conflicting numbers
+    sentences = re.split(r"[。！？；\n]", text)
+    for sent in sentences:
+        nums = re.findall(r"(\d+(?:\.\d+)?)\s*(%|个百分点|倍|万|亿|元|美元|港元)", sent)
+        if len(nums) >= 2:
+            vals = [float(n[0]) for n in nums]
+            if max(vals) / max(min(vals), 0.001) > 5:
+                signals.append({"type": "numeric_contradiction", "detail": f"values: {vals}"})
+
+    # Pattern 3: Causal impossibility — effect precedes cause
+    causal_pairs = [
+        (r"因为.{0,20}所以", "causal_forward"),
+        (r"由于.{0,20}(因此|故|所以)", "causal_forward"),
+    ]
+    for pattern, _ in causal_pairs:
+        matches = list(re.finditer(pattern, text))
+        for m in matches:
+            segment = m.group()
+            # Check if the segment contains temporal impossibility
+            if re.search(r"(之后|之后才|随后).{0,10}(之前|先|提前)", segment):
+                signals.append({"type": "temporal_contradiction", "detail": segment[:50]})
+
+    return signals[:3]
 
 
 def regression_label_calibration(
@@ -12030,7 +12110,7 @@ def aggregate_by_confidence(
         result["analyse"] = result["_aggregation_analyse"]
     else:
         result["_evidence_first_locked"] = False
-        evidence_non_decidable_state = build_evidence_non_decidable_state(item or {}, extracted, evidence_summary)
+        evidence_non_decidable_state = build_evidence_non_decidable_state(item or {}, extracted, evidence_summary, claim_pipeline_diagnostics)
         result["_evidence_non_decidable_state"] = evidence_non_decidable_state
         fallback_risk_features = build_fallback_risk_features(item or {}, extracted, evidence_summary)
         result["_fallback_risk_features"] = fallback_risk_features

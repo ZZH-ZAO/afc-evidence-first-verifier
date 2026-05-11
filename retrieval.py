@@ -73,7 +73,7 @@ FETCH_DETAILS_PER_CLAIM = int(os.environ.get("V2_FETCH_DETAILS_PER_CLAIM", "2"))
 MAX_QUERIES_PER_CLAIM = int(os.environ.get("V2_MAX_QUERIES_PER_CLAIM", "3"))
 ENABLE_BING_HTML = os.environ.get("V2_ENABLE_BING_HTML", "0").lower() in {"1", "true", "yes"}
 ENABLE_DUCKDUCKGO = os.environ.get("V2_ENABLE_DUCKDUCKGO", "0").lower() in {"1", "true", "yes"}
-ENABLE_PLAYWRIGHT = os.environ.get("V2_ENABLE_PLAYWRIGHT", "0").lower() in {"1", "true", "yes"}
+ENABLE_PLAYWRIGHT = os.environ.get("V2_ENABLE_PLAYWRIGHT", "1").lower() in {"1", "true", "yes"}
 PLAYWRIGHT_MAX_QUERIES_PER_CLAIM = int(os.environ.get("V2_PLAYWRIGHT_MAX_QUERIES_PER_CLAIM", "1"))
 ENABLE_QA_QUERIES = os.environ.get("V2_ENABLE_QA_QUERIES", "1").lower() in {"1", "true", "yes"}
 QA_QUERY_LIMIT = int(os.environ.get("V2_QA_QUERY_LIMIT", "2"))
@@ -5288,6 +5288,8 @@ def playwright_rescue_mode_allowed(
         return central in {"core", "supporting"}
     if mode == "event_result":
         return central == "core"
+    if mode == "entity_fact":
+        return central in {"core", "supporting"}
     return False
 
 
@@ -12300,6 +12302,7 @@ def retrieve_evidence(
             centrality,
         )
         claim_evidence: List[Dict[str, Any]] = []
+        filtered_evidence_pool: List[Dict[str, Any]] = []
         stats: Dict[str, Any] = {
             "query_count": 0,
             "qa_query_count": sum(1 for item in query_plan if item.get("goal") == "verification_question"),
@@ -12829,6 +12832,9 @@ def retrieve_evidence(
                         stats["filtered_results"] += 1
                         add_filter_reason(stats, filter_reason)
                         add_filtered_sample(stats, filter_reason, item)
+                        rescued_item = dict(item)
+                        rescued_item["_filter_reason"] = filter_reason
+                        filtered_evidence_pool.append(rescued_item)
                         continue
                     record_fact_filter_diagnostic(stats, item, True, filter_reason)
                     if item.get("readiness_promotion_used"):
@@ -12933,6 +12939,24 @@ def retrieve_evidence(
             reverse=True,
         )
         stats["detail_fetches"] = detail_fetches
+        # Rescue: if no web items survived retention but filtered pool is non-empty,
+        # keep the best filtered page as a last resort to avoid empty evidence.
+        web_kept = [ev for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}]
+        if not web_kept and filtered_evidence_pool:
+            filtered_evidence_pool.sort(
+                key=lambda x: (
+                    int(x.get("relevance_score") or 0),
+                    int(x.get("page_retention_score") or 0),
+                    int(x.get("page_utility_score") or 0),
+                    int(x.get("source_quality_score") or 0),
+                ),
+                reverse=True,
+            )
+            rescued = dict(filtered_evidence_pool[0])
+            rescued["_rescued_from_filter"] = True
+            stats["filtered_rescue_used"] = 1
+            stats["filtered_rescue_reason"] = str(rescued.get("_filter_reason", ""))
+            claim_evidence.append(rescued)
         evidence_by_claim[claim_id] = apply_evidence_budget(claim_evidence, max_results_per_query)
         diagnostics_by_claim[claim_id] = diagnose_claim_retrieval(claim_item, evidence_by_claim[claim_id], stats)
         if ENABLE_SOURCE_HEALTH_REORDER:
