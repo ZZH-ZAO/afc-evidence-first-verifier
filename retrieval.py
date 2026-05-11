@@ -5437,7 +5437,7 @@ def playwright_rescue_mode_allowed(
     if mode == "route_fact":
         return central in {"core", "supporting"}
     if mode == "event_result":
-        return central == "core"
+        return central in {"core", "supporting"}
     if mode == "entity_fact":
         return central in {"core", "supporting"}
     return False
@@ -8759,8 +8759,8 @@ def should_use_playwright_fallback(
             return True, "use_playwright_structured_fact"
         return False, "skip_playwright_noncore_structured_fact"
     if mode == "event_result":
-        if central == "core" and not web_items(claim_evidence):
-            return True, "use_playwright_core_event_result"
+        if central in {"core", "supporting"} and not web_items(claim_evidence):
+            return True, "use_playwright_event_result"
         return False, "skip_playwright_noncore_or_has_web"
     if mode == "policy_fact":
         if central == "core" and not web_items(claim_evidence):

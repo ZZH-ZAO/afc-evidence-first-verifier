@@ -5684,6 +5684,72 @@ def extract_with_fallback(item: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]
     return normal_obj, normal_raw, meta
 
 
+# Atomic claim decomposition: split compound claims into independently verifiable facts
+_COMPOUND_SPLITTERS = re.compile(
+    r"(?:并且|而且|同时|此外|另外|不仅.*还|既.*又|一方面.*另一方面"
+    r"|，(?=[^，]*(?:导致|使得|造成|引发|引起|因此|所以))"
+    r"|，(?=[^，]*(?:但|但是|然而|却|不过|虽然))"
+    r"|；)",
+    flags=re.I,
+)
+
+
+def _is_compound_claim(claim_text: str) -> bool:
+    """Detect if a claim contains multiple independently verifiable facts."""
+    if not claim_text or len(claim_text) < 15:
+        return False
+    # Multiple entities with distinct events
+    if re.search(r"[A-Z].*?和.*?[A-Z]", claim_text):
+        return True
+    # Causal compound: A导致B where A and B are both verifiable
+    if re.search(r".{4,}导致.{4,}", claim_text):
+        return True
+    # Contrastive compound: A但B
+    if re.search(r".{4,}但.{4,}", claim_text) and len(claim_text) > 30:
+        return True
+    # Multiple facts joined by connectors
+    if _COMPOUND_SPLITTERS.search(claim_text):
+        return True
+    return False
+
+
+def maybe_decompose_compound_claims(extracted: Dict[str, Any]) -> Dict[str, Any]:
+    """Split compound claims into atomic sub-claims for more precise retrieval."""
+    claims = extracted.get("claims") if isinstance(extracted.get("claims"), list) else []
+    if not claims:
+        return extracted
+    new_claims = []
+    changed = False
+    for claim in claims:
+        if not isinstance(claim, dict):
+            new_claims.append(claim)
+            continue
+        claim_text = str(claim.get("claim") or "")
+        if not _is_compound_claim(claim_text):
+            new_claims.append(claim)
+            continue
+        # Try to split by compound patterns
+        parts = _COMPOUND_SPLITTERS.split(claim_text)
+        parts = [p.strip() for p in parts if p.strip() and len(p.strip()) >= 8]
+        if len(parts) <= 1:
+            new_claims.append(claim)
+            continue
+        changed = True
+        parent_id = str(claim.get("claim_id") or claim.get("id") or "c")
+        for i, part in enumerate(parts):
+            sub_claim = dict(claim)
+            sub_claim["claim"] = part
+            sub_claim["claim_id"] = f"{parent_id}_a{i}"
+            sub_claim["_decomposed_from"] = parent_id
+            sub_claim["_decomposition_index"] = i
+            new_claims.append(sub_claim)
+    if not changed:
+        return extracted
+    result = dict(extracted)
+    result["claims"] = new_claims
+    return result
+
+
 STRUCTURED_DETAIL_MODES = STRUCTURED_EVIDENCE_MODES | {EVIDENCE_MODE_EVENT}
 HIGH_RISK_SUPPORTING_MODES = HIGH_RISK_SUPPORTING_EVIDENCE_MODES
 HIGH_RISK_TYPES = {
@@ -10374,13 +10440,7 @@ def point_is_secondary_detail_refutation(
     if (
         point_type == "date_mismatch"
         and point.get("source_type") != "official"
-        and (
-            bool(direct_supporting)
-            or (
-                centrality in {"supporting", "peripheral"}
-                and mode in {"date_fact", "schedule_fact"}
-            )
-        )
+        and bool(direct_supporting)
     ):
         return False
     if point_type in SECONDARY_DETAIL_REFUTATION_POINT_TYPES:
@@ -12680,6 +12740,12 @@ def aggregate_by_confidence(
                     evidence_non_decidable_state,
                 )
                 result["analyse"] = result["_aggregation_analyse"]
+    # Protect minor_refuted from being overridden by rubric fallback
+    if minor_refuted and final_label == LABEL_2 and not major_refuted:
+        final_label = LABEL_1
+        result["_minor_refuted_preserved"] = True
+        result["_decision_basis"] = "minor_refuted_preserved"
+        result["_decision_policy"] = "aggregate_minor_refutation"
     if not result.get("decision_gate_consumed_diagnostics"):
         result["decision_gate_consumed_diagnostics"] = False
     if not result.get("decision_gate_primary_block"):
@@ -12765,6 +12831,7 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
         }
     extracted = maybe_attach_detail_supplement(item, extracted, extract_meta)
     extracted = normalize_extracted_plan(extracted)
+    extracted = maybe_decompose_compound_claims(extracted)
     mark_timing("extract")
     debug["extract_meta"]["claim_count"] = len(extracted.get("claims") or [])
     debug["extracted"] = extracted
@@ -12859,6 +12926,22 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
             rewrite_frames = normalize_rewrite_frames(rewrite_obj, retry_claims)
             debug["rewrite_route_frames"] = rewrite_frames
             rewritten_claims = build_retry_claims(claims, rewrite_plan, rewrite_frames, retry_claims, verification_gap_alignment)
+            # Loop detection: skip retry claims whose queries are identical to originals
+            if rewritten_claims:
+                original_queries = set()
+                for claim in claims:
+                    for q in (claim.get("queries") or []):
+                        original_queries.add(normalize_text(str(q.get("q") or "")) if isinstance(q, dict) else normalize_text(str(q)))
+                deduped_rewrite = []
+                for rc in rewritten_claims:
+                    rc_queries = set()
+                    for q in (rc.get("queries") or []):
+                        rc_queries.add(normalize_text(str(q.get("q") or "")) if isinstance(q, dict) else normalize_text(str(q)))
+                    if rc_queries and rc_queries.issubset(original_queries):
+                        debug.setdefault("rewrite_loop_skipped", []).append(str(rc.get("claim_id") or rc.get("id") or ""))
+                        continue
+                    deduped_rewrite.append(rc)
+                rewritten_claims = deduped_rewrite
             if rewritten_claims:
                 retry_bundle = retrieve_evidence(
                     question=str(item.get("question", "")),
