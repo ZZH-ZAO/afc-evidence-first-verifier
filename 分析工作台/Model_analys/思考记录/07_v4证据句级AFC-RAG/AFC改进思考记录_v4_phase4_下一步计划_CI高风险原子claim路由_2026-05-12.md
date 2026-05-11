@@ -388,3 +388,100 @@ retrieve 增幅约 `1.0%`，没有超过 10% 阈值。8 样本整体 retrieve �
 3. `event_result_status`：退赛/不战而胜/官方赛果页。
 
 如果 CK 后 retrieve 超过 10%，就只保留 planned query 和 route debug，不让 atomic route 进入实际搜索。
+
+---
+
+## 2026-05-12 追加：CK/CL 怎么把刀磨快
+
+### 分类
+
+证据链路 / 路由 / 聚合裁决
+
+### 这次要做什么
+
+CI 第一阶段已经证明“原子 claim 路线是对的”，下一步分两刀推进：
+
+1. `CK：Atomic Risk Router`
+   只对最高风险的 1-2 个 atomic claim 打开真实检索，把 `planned_only` 变成可控 query。
+
+2. `CL：Atomic Ledger Consumer`
+   只消费 gate 通过、同槽强反证的 atomic 证据，把它写进 ledger 和 reason，必要时再形成标签压力。
+
+### 动机是什么
+
+现在的问题不是“有没有抽到错点”，而是“抽到以后能不能查到、查到以后能不能被安全消费”。如果直接让所有 atomic claim 都进检索，会带来两个风险：
+
+- 时延爆炸。
+- 弱证据或不同口径材料误抬标签。
+
+所以 CK/CL 必须小口径打开，先验证闭环质量。
+
+### 对项目有什么实际作用
+
+CK/CL 的真实价值是把标准 reason 的路径跑通：
+
+`标准错点 -> atomic claim -> 专用 query -> 证据页 -> gate -> atomic_refuted_point -> 标签/原因`
+
+只要这条链能在 2-3 个样本上打通，就说明系统不再只是“解释为什么没证据”，而是开始能主动定位并裁决标准错误。
+
+### 具体场景是什么
+
+优先打三类：
+
+- `market_calendar_status`：解决 `afc_0001` 的 A股是否休市问题。
+- `exclusive_or_only_path`：解决 `afc_0003` 的“唯一海上通道”问题。
+- `event_result_status`：解决 `afc_0004` 的退赛/不战而胜 vs 3-0 问题。
+
+第二批再考虑：
+
+- `current_position_distance`：解决 `afc_0005` 的当前距离口径。
+- `phase_boundary_time`：解决 `afc_0007` 的阶段开始/结束边界。
+
+### 我应该怎么使用
+
+下一轮回归时看这几个字段：
+
+- `atomic_retrieval_attempted`
+- `atomic_query_plan`
+- `atomic_search_results`
+- `atomic_gate_result`
+- `atomic_refuted_points`
+- `atomic_gate_blocked_points`
+- `atomic_label_pressure`
+
+如果 atomic 检索拿到了页面但 gate 没过，reason 只能说“原子错点已定位但证据未闭合”。
+如果 gate 通过并形成 strong refutation，才允许进入标签压力。
+
+### 对用户意味着什么
+
+用户最终会看到更像人工标准的 reason，例如：
+
+- “回答称 A股因清明休市，但交易所日历显示 4月1日为正常交易日。”
+- “回答称霍尔木兹是唯一通道，但材料显示阿联酋存在绕开霍尔木兹的管道和阿曼湾港口。”
+- “回答给出 3-0 比分，但赛果页显示对手退赛/不战而胜。”
+
+这比“核心断言未闭合”更接近真正可用的判错解释。
+
+### 对开发者意味着什么
+
+开发者不能把 CK 做成“多搜几个 query”。它必须有预算阀门：
+
+- 每个样本最多 2 个 atomic claim 进入真实检索。
+- 每个 atomic claim 最多 1-2 条 query。
+- 只允许 `risk_type` 对应的 query 模板。
+- 所有结果继续走原来的 Evidence/Page/Gate。
+- `entry_page / generic_page / pseudo_evidence` 不能直接制造 `atomic_refuted_point`。
+
+### 当前结论
+
+下一步的关键不是扩大召回，而是做“原子 claim 的最小闭环”。先让 1-2 个标准错点稳定从抽取走到 gate，通过后再谈标签提升。
+
+### 下一步建议
+
+实现顺序建议：
+
+1. 在 `retrieval.py` 把 `build_atomic_claim_query_plan` 接进 query planner，但默认只取最高优先级 1 个。
+2. 在 `solve.py` 的 ledger 增加 atomic 检索结果展示字段，不改标签。
+3. 确认 `0001/0003/0004` 至少 1 个能形成 gate 通过的 atomic 反证。
+4. 再打开 CL 的轻量标签压力：主需 atomic strong refutation -> `0`，次需/附带 atomic strong refutation -> `1`。
+5. 如果 retrieve 均值超过 CI 基线 10%，立即关掉真实 atomic route，只保留 query plan debug。
