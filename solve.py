@@ -8098,6 +8098,21 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     if candidate_score >= 34 and slot_count >= 2 and stage in {"direct_to_uncertain_only", "no_direct_candidate"}:
         if directness_rank >= 3 or decision_useful_hit or partial_count > 0:
             return "same_slot_review_not_direct"
+    if (
+        candidate_score >= 32
+        and candidate_sentence_count > 0
+        and slot_count >= 2
+        and block_reason in {
+            "",
+            "candidate_not_direct",
+            "related_but_not_assertive",
+            "not_same_fact_slot",
+            "date_role_mismatch",
+            "result_granularity_mismatch",
+        }
+        and (strong_page_profile or decision_useful_hit or directness_rank >= 3 or partial_count > 0)
+    ):
+        return "kept_page_candidate_progress"
     if candidate_sentence_count > 0 or partial_count > 0:
         return "weak_candidate_retained"
     if int(summary.get("answer_candidate_total") or 0) > 0:
@@ -8108,6 +8123,8 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
 def infer_point_consumption_state(summary: Dict[str, Any], slot_review_outcome: str) -> str:
     if slot_review_outcome == "stable_direct_point":
         return "stable_direct_point"
+    if slot_review_outcome == "kept_page_candidate_progress":
+        return "candidate_progress_from_kept_page"
     if slot_review_outcome.startswith("same_slot_review_blocked") or slot_review_outcome == "same_slot_review_not_direct":
         return "same_slot_reviewed_but_blocked"
     if slot_review_outcome == "weak_candidate_retained":
@@ -8142,6 +8159,9 @@ def apply_decision_useful_consumption_state(
         slot_review_outcome = infer_slot_review_outcome(summary)
         point_conversion["slot_review_outcome"] = slot_review_outcome
         point_conversion["point_consumption_state"] = infer_point_consumption_state(summary, slot_review_outcome)
+        point_conversion["evidence_consumed_from_kept_page"] = bool(
+            point_conversion.get("point_consumption_state") == "candidate_progress_from_kept_page"
+        )
         summary["point_conversion"] = point_conversion
 
 
@@ -11545,6 +11565,13 @@ def insufficient_evidence_reason(
             return "已有一部分结果是靠关键证据页复核才保下来的，说明问题已经从纯召回转到页级保留与消费。"
         return ""
 
+    def kept_candidate_progress_clause() -> str:
+        if point_consumption_state != "candidate_progress_from_kept_page":
+            return ""
+        if candidate_slot_coverage_summary_text:
+            return f"当前已经从保留下来的页面里消费出覆盖 {candidate_slot_coverage_summary_text} 的候选句。"
+        return "当前已经从保留下来的页面里消费出同位点候选句。"
+
     def critical_block_clause() -> str:
         if critical_claim_blocking_state in {"raw_hit_but_page_not_retained", "raw_hit_but_page_not_retained_after_review"}:
             if official_entry_hit:
@@ -11742,35 +11769,35 @@ def insufficient_evidence_reason(
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "关键层级"
                 return f"当前已经保留了一些相关页面，但{layer_hint}仍缺少{','.join(missing_required_slots[:3])}，所以还没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + retained_structured_detail_clause()
             if rescue_success_gate == "detail_content_recovered":
-                return rescue_success_clause() + "，但当前还没有稳定整理出能直接回答该 claim 的候选句，因此暂不判定为事实错误。" + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + retained_structured_detail_clause()
+                return rescue_success_clause() + "，但当前还没有稳定整理出能直接回答该 claim 的候选句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + retained_structured_detail_clause()
             gap_clause = candidate_gap_clause()
             if readiness_promotion_used > 0 and int(dominant_row.get("answer_candidate_total") or 0) > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "句层"
                 basis_clause = f" 当前最强候选句覆盖到 {candidate_slot_coverage_summary_text}。" if candidate_slot_coverage_summary_text else ""
-                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {keep_review_clause()}" if keep_review_clause() else "") + basis_clause + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {keep_review_clause()}" if keep_review_clause() else "") + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + basis_clause + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if readiness_promotion_used > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "页面到句子转换"
-                return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {keep_review_clause()}" if keep_review_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {keep_review_clause()}" if keep_review_clause() else "") + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if recall_probe_used > 0 and recall_probe_raw_hits > 0 and direct_candidate_rescue_used <= 0:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "句层"
-                return f"{recall_probe_clause()}，但当前还卡在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"{recall_probe_clause()}，但当前还卡在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if direct_candidate_rescue_used > 0:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "句层"
-                return f"{rescue_clause()}，但这些句子还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"{rescue_clause()}，但这些句子还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if program_need:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "页面到句子转换"
-                return f"当前已经保留了一些相关页面，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + retained_structured_detail_clause()
-            return "当前已经保留了一些相关页面，但还没整理出可直接比对的证据句，因此暂不判定为事实错误。" + retained_structured_detail_clause()
+                return f"当前已经保留了一些相关页面，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + retained_structured_detail_clause()
+            return "当前已经保留了一些相关页面，但还没整理出可直接比对的证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + retained_structured_detail_clause()
         if stage == "evidence_point_not_convertible":
             if env_prefix:
                 return env_prefix + " 页面里虽拿到部分内容，但还没形成稳定可比的证据点，因此暂不判定为事实错误。"
             if recall_probe_used > 0 and recall_probe_raw_hits > 0 and point_block_reason and program_need:
-                return f"已经用更贴事实位点的问法补回候选材料，但当前仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + opening_slot_clause()
+                return f"已经用更贴事实位点的问法补回候选材料，但当前仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + opening_slot_clause()
             if point_block_reason and program_need:
-                return f"当前页面里已经读到一些相关材料，但仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + opening_slot_clause()
+                return f"当前页面里已经读到一些相关材料，但仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + opening_slot_clause()
             if program_need:
-                return f"当前页面里已经读到一些相关材料，但还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。"
-            return "当前页面里已经读到一些相关材料，但还没转成可直接裁决的证据点，因此暂不判定为事实错误。"
+                return f"当前页面里已经读到一些相关材料，但还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "")
+            return "当前页面里已经读到一些相关材料，但还没转成可直接裁决的证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "")
         if has_core_support and unresolved_details:
             return "核心结论已有部分支持，但高风险结构化细节仍未裁完，现阶段还不能把整题判成错误。" + retained_structured_detail_clause()
         if program_need:

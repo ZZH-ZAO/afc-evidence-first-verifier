@@ -6064,6 +6064,76 @@ def structured_noise_features(query: str, item: Dict[str, Any], evidence_mode: s
     }
 
 
+def structured_title_marker_hit(evidence_mode: str, item: Dict[str, Any]) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    text = normalize_text(f"{item.get('title', '')} {item.get('snippet', '')}").lower()
+    marker_patterns = {
+        "numeric_fact": r"(汇率|中间价|牌价|外汇|fx|forex|rate|price|quote|usd|cny|eur|gbp|jpy)",
+        "date_fact": r"(日期|公布|发布|时间|date|announce|release|notice|calendar)",
+        "schedule_fact": r"(休市|交易日|开市|开盘|收盘|schedule|calendar|holiday|trading|market)",
+        "event_result": r"(赛果|比分|冠军|胜|负|result|winner|beat|score|final)",
+    }
+    pattern = marker_patterns.get(mode)
+    if not pattern:
+        return False
+    return bool(re.search(pattern, text, flags=re.I))
+
+
+def is_recoverable_structured_penalty_item(
+    query: str,
+    item: Dict[str, Any],
+    evidence_mode: str,
+) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    if mode not in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}:
+        return False
+    source_type = str(item.get("source_type") or "")
+    if source_type not in {"official", "news", "finance", "unknown"}:
+        return False
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        return False
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type in {"landing_page", "search_result_page"}:
+        return False
+    page_retention_score = int(item.get("page_retention_score") or 0)
+    page_utility_score = int(item.get("page_utility_score") or 0)
+    answer_quality = int(item.get("answer_candidate_quality_score") or 0)
+    metric_score = int(item.get("metric_table_score") or 0)
+    directness = int(item.get("directness_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    task_card_score = int(item.get("task_card_score") or 0)
+    evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+    evidence_contract_score = int(item.get("evidence_contract_score") or 0)
+    structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    structured_penalty = int(item.get("structured_noise_penalty") or 0)
+    strong_page_type = page_type in STRUCTURED_REVIEW_PAGE_TYPES
+    title_marker_hit = structured_title_marker_hit(mode, item)
+    query_has_numeric = bool(extract_numeric_markers(query or ""))
+    strong_signal = (
+        answer_quality >= 8
+        or metric_score >= 6
+        or directness >= 2
+        or (evidence_contract_status in {"partial", "satisfied"} and evidence_contract_score >= 35)
+        or structured_point_status in {"partial", "satisfied"}
+    )
+    if not strong_signal:
+        return False
+    if page_retention_score < 46 and page_utility_score < 48:
+        return False
+    if relevance < 1 and entity_hits < 1 and task_card_score < 10:
+        return False
+    if not (strong_page_type or title_marker_hit or source_type in {"official", "finance"}):
+        return False
+    if source_type == "unknown" and not (strong_page_type and title_marker_hit and answer_quality >= 10):
+        return False
+    if query_has_numeric and not title_marker_hit and metric_score < 6 and answer_quality < 10:
+        return False
+    if structured_penalty >= 24 and source_type not in {"official", "finance"}:
+        return False
+    return True
+
+
 def extract_temporal_markers(text: str) -> List[str]:
     markers: List[str] = []
     patterns = [
@@ -8720,6 +8790,7 @@ CLAIM_ALIGNED_FACT_LOW_REASONS = {
     "weak_source_low_relevance",
     "low_relevance",
     "source_quality_bad",
+    "structured_noise_review_candidate",
 }
 PREFILTER_RESCUE_ALLOWED_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
 PREFILTER_RESCUE_ALLOWED_SOURCE_TYPES = {"official", "news", "encyclopedia"}
@@ -8756,6 +8827,17 @@ FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS = PREFILTER_RESCUE_HARD_FILTER_REASONS |
     "search_engine_result_page",
     "landing_page",
     "hard_noise_page",
+}
+
+STRUCTURED_REVIEW_PAGE_TYPES = {
+    "quote_page",
+    "historical_table",
+    "official_notice",
+    "calendar_page",
+    "result_page",
+    "event_detail",
+    "current_status_page",
+    "mixed_page",
 }
 
 
@@ -9244,6 +9326,13 @@ def maybe_promote_fact_page_keep_review(
     apply_fact_page_keep_review_annotations(item, "recoverable_near_miss_promoted", filter_reason, signal)
     item["readiness_promotion_used"] = True
     item["readiness_promotion_source"] = "fact_page_keep_review"
+    item["page_keep_review_state"] = "kept_review"
+    item["page_keep_review_reason"] = filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = str(item.get("source_type") or "")
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
     item["program_used_for_retention"] = True
     return True, "fact_page_keep_review"
 
@@ -9371,6 +9460,23 @@ def annotate_soft_kept_claim_aligned_item(
     item["kept_by_soft_claim_alignment"] = True
     item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
     item["soft_keep_original_filter_reason"] = original_filter_reason
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    item["program_used_for_retention"] = True
+
+
+def annotate_soft_kept_structured_metric_item(
+    item: Dict[str, Any],
+    query: str,
+    evidence_mode: str,
+    original_filter_reason: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> None:
+    item["page_keep_review_state"] = "kept_review"
+    item["page_keep_review_reason"] = original_filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = str(item.get("source_type") or "")
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
     item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
     item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
     item["program_used_for_retention"] = True
@@ -9626,9 +9732,16 @@ def web_evidence_filter_reason(query: str, item: Dict[str, Any], evidence_mode: 
             return True, "kept_weak_route_utility_page"
         return False, "route_weak_no_direct_sentence"
     if is_structured_fact_mode(mode):
+        recoverable_structured_penalty = (
+            structured_penalty >= 14
+            and source_type != "official"
+            and is_recoverable_structured_penalty_item(query, item, mode)
+        )
         if structured_penalty >= 14 and source_type != "official":
             if (official_like_structured or strong_news_fact_page) and structured_penalty < 22:
                 return True, "kept_official_like_structured_despite_penalty"
+            if recoverable_structured_penalty:
+                return False, "structured_noise_review_candidate"
             return False, "structured_noise_high_penalty"
         if "structured_no_entity_hit" in structured_reasons and source_type in {"unknown", "forum", "encyclopedia"}:
             return False, "structured_noise_no_entity_weak_source"
@@ -9724,7 +9837,7 @@ def should_soft_keep_structured_metric_item(
 ) -> bool:
     if not is_structured_fact_mode(evidence_mode):
         return False
-    if filter_reason not in {"source_quality_bad", "weak_source_low_relevance", "structured_noise_high_penalty", "low_relevance"}:
+    if filter_reason not in {"source_quality_bad", "weak_source_low_relevance", "structured_noise_high_penalty", "structured_noise_review_candidate", "low_relevance"}:
         return False
     priority_label = str(task_card.get("priority_label") or "")
     if priority_label not in {"critical", "high", "normal"}:
@@ -9741,6 +9854,9 @@ def should_soft_keep_structured_metric_item(
     answer_quality = int(item.get("answer_candidate_quality_score") or 0)
     evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
     evidence_contract_score = int(item.get("evidence_contract_score") or 0)
+    title_marker_hit = structured_title_marker_hit(evidence_mode, item)
+    page_type = str(item.get("page_utility_page_type") or "")
+    strong_page_type = page_type in STRUCTURED_REVIEW_PAGE_TYPES
     if (
         evidence_contract_status in {"partial", "satisfied"}
         and evidence_contract_score >= 45
@@ -9748,6 +9864,18 @@ def should_soft_keep_structured_metric_item(
         and answer_quality >= 8
         and source_type in {"official", "news", "finance", "unknown"}
     ):
+        return True
+    if filter_reason == "structured_noise_review_candidate":
+        if page_retention_score < 46 and page_utility_score < 48:
+            return False
+        if directness < 2 and answer_quality < 8 and metric_score < 6:
+            return False
+        if relevance < 1 and entity_hits < 1 and answer_quality < 10:
+            return False
+        if not (strong_page_type or title_marker_hit or source_type in {"official", "finance"}):
+            return False
+        if source_type == "unknown" and not (strong_page_type and title_marker_hit and answer_quality >= 10):
+            return False
         return True
     if metric_score < 6:
         return False
@@ -10691,8 +10819,10 @@ def expand_official_inner_link_candidates(
             keep_item = True
             filter_reason = "soft_keep_high_priority_structured_candidate"
         if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
+            original_filter_reason = filter_reason
             keep_item = True
             filter_reason = "soft_keep_structured_metric_table_candidate"
+            annotate_soft_kept_structured_metric_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
         if not keep_item and should_soft_keep_claim_aligned_fact_item(source_query, item, filter_reason, evidence_mode, claim_item):
             original_filter_reason = filter_reason
             keep_item = True
@@ -13166,8 +13296,10 @@ def retrieve_evidence(
                 keep_item = True
                 filter_reason = "soft_keep_high_priority_structured_candidate"
             if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
+                original_filter_reason = filter_reason
                 keep_item = True
                 filter_reason = "soft_keep_structured_metric_table_candidate"
+                annotate_soft_kept_structured_metric_item(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
             if not keep_item and should_soft_keep_claim_aligned_fact_item(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
                 original_filter_reason = filter_reason
                 keep_item = True
@@ -13714,8 +13846,10 @@ def retrieve_evidence(
                         keep_item = True
                         filter_reason = "soft_keep_high_priority_structured_candidate"
                     if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
+                        original_filter_reason = filter_reason
                         keep_item = True
                         filter_reason = "soft_keep_structured_metric_table_candidate"
+                        annotate_soft_kept_structured_metric_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
                     if not keep_item and should_soft_keep_claim_aligned_fact_item(source_query, item, filter_reason, evidence_mode, claim_item):
                         original_filter_reason = filter_reason
                         keep_item = True
