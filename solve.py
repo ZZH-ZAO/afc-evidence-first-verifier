@@ -7922,6 +7922,19 @@ def candidate_page_utility_score(
     return score
 
 
+def is_pseudo_evidence_candidate(candidate: Dict[str, Any]) -> bool:
+    source_type = normalize_text(str(candidate.get("source_type") or ""))
+    source = normalize_text(str(candidate.get("source") or ""))
+    title = normalize_text(str(candidate.get("title") or ""))
+    if source_type in {"computed", "input_context"}:
+        return True
+    if source in {"computed", "input_context"}:
+        return True
+    if title in {"样本日期星期计算", "汇率数值换算线索", "用户问题主需"}:
+        return True
+    return False
+
+
 def candidate_decision_useful_score(
     claim: Dict[str, Any],
     summary: Dict[str, Any],
@@ -7973,10 +7986,14 @@ def candidate_decision_useful_score(
         score += 2
     elif gap_reason in {"candidate_not_direct", "related_but_not_assertive"} and slot_count >= 2 and directness_rank >= 2:
         score += 4
+    if is_pseudo_evidence_candidate(candidate):
+        score -= 40
     return score
 
 
 def decision_useful_hit_for_candidate(candidate: Dict[str, Any]) -> bool:
+    if is_pseudo_evidence_candidate(candidate):
+        return False
     utility = int(candidate.get("candidate_utility_score") or 0)
     slot_count = int(((candidate.get("candidate_slot_coverage") or {}) if isinstance(candidate.get("candidate_slot_coverage"), dict) else {}).get("slot_count") or 0)
     profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
@@ -8028,6 +8045,7 @@ def apply_decision_useful_candidate_rerank(
             candidate["page_utility_profile"] = page_profile
             candidate["page_utility_score"] = page_score
             candidate["candidate_utility_score"] = candidate_score
+            candidate["is_pseudo_evidence"] = is_pseudo_evidence_candidate(candidate)
             candidate["decision_useful_hit"] = decision_useful_hit_for_candidate({"candidate_utility_score": candidate_score, **candidate})
         candidates.sort(
             key=lambda item: (
@@ -8039,6 +8057,11 @@ def apply_decision_useful_candidate_rerank(
             reverse=True,
         )
         summary["evidence_sentence_candidates"] = candidates
+        top_evidence_candidate = next(
+            (item for item in candidates if isinstance(item, dict) and not normalize_bool(item.get("is_pseudo_evidence"), False)),
+            {},
+        )
+        summary["top_evidence_candidate"] = top_evidence_candidate
         evidence_mode = str(summary.get("evidence_mode") or "")
         coverage = claim_coverage(claim_id, evidence_mode, evidence_by_claim.get(claim_id, []), summary)
         summary["coverage"] = coverage
@@ -8051,6 +8074,9 @@ def apply_decision_useful_candidate_rerank(
         point_conversion["page_utility_profile"] = str(top_candidate.get("page_utility_profile") or "")
         point_conversion["decision_useful_hit"] = bool(top_candidate.get("decision_useful_hit"))
         point_conversion["candidate_utility_score"] = int(top_candidate.get("candidate_utility_score") or 0)
+        point_conversion["top_candidate_is_pseudo"] = bool(top_candidate.get("is_pseudo_evidence"))
+        point_conversion["top_evidence_candidate_title"] = str(top_evidence_candidate.get("title") or "")
+        point_conversion["top_evidence_candidate_profile"] = str(top_evidence_candidate.get("sentence_candidate_profile") or "")
         summary["point_conversion"] = point_conversion
         rerank_debug[claim_id] = {
             "query_effective_role": query_role,
@@ -8058,6 +8084,8 @@ def apply_decision_useful_candidate_rerank(
             "top_candidate_score": int(top_candidate.get("candidate_utility_score") or 0),
             "top_candidate_profile": str(top_candidate.get("sentence_candidate_profile") or ""),
             "top_page_profile": str(top_candidate.get("page_utility_profile") or ""),
+            "top_candidate_is_pseudo": bool(top_candidate.get("is_pseudo_evidence")),
+            "top_evidence_candidate_title": str(top_evidence_candidate.get("title") or ""),
         }
     if isinstance(debug_bucket, dict):
         debug_bucket["decision_useful_rerank"] = rerank_debug
@@ -8065,6 +8093,7 @@ def apply_decision_useful_candidate_rerank(
 
 def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+    comparability_profile = summary.get("comparability_profile") if isinstance(summary.get("comparability_profile"), dict) else {}
     block_reason = normalize_text(str(point_conversion.get("block_reason") or "")) or normalize_text(str(point_conversion.get("llm_refined_gap_reason") or "")) or normalize_text(str(point_conversion.get("direct_candidate_gap_reason") or ""))
     candidate_score = int(point_conversion.get("candidate_utility_score") or 0)
     slot_coverage = point_conversion.get("candidate_slot_coverage") if isinstance(point_conversion.get("candidate_slot_coverage"), dict) else {}
@@ -8075,13 +8104,18 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     page_profile = normalize_text(str(point_conversion.get("page_utility_profile") or ""))
     directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
     decision_useful_hit = bool(point_conversion.get("decision_useful_hit"))
+    top_candidate_is_pseudo = normalize_bool(point_conversion.get("top_candidate_is_pseudo"), False)
+    top_evidence_candidate = summary.get("top_evidence_candidate") if isinstance(summary.get("top_evidence_candidate"), dict) else {}
+    has_real_evidence_candidate = bool(top_evidence_candidate) and not is_pseudo_evidence_candidate(top_evidence_candidate)
     strong_page_profile = page_profile in {
         "official_calendar_or_notice",
         "alternative_route_or_route_analysis",
         "result_or_score_page",
         "table_or_data_page",
     }
-    if claim_direct_refuting_points(summary) or claim_direct_supporting_points(summary):
+    comparable_direct_support_count = int(comparability_profile.get("comparable_direct_support_count") or 0)
+    comparable_direct_refute_count = int(comparability_profile.get("comparable_direct_refute_count") or 0)
+    if comparable_direct_support_count > 0 or comparable_direct_refute_count > 0:
         return "stable_direct_point"
     if candidate_score >= 36 and slot_count >= 2 and block_reason in {
         "not_same_fact_slot",
@@ -8096,7 +8130,7 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     if candidate_score >= 28 and block_reason in {"candidate_not_direct", "related_but_not_assertive"}:
         return "same_slot_review_not_direct"
     if candidate_score >= 34 and slot_count >= 2 and stage in {"direct_to_uncertain_only", "no_direct_candidate"}:
-        if directness_rank >= 3 or decision_useful_hit or partial_count > 0:
+        if not top_candidate_is_pseudo and (directness_rank >= 3 or decision_useful_hit or partial_count > 0):
             return "same_slot_review_not_direct"
     if (
         candidate_score >= 32
@@ -8110,6 +8144,8 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
             "date_role_mismatch",
             "result_granularity_mismatch",
         }
+        and has_real_evidence_candidate
+        and not top_candidate_is_pseudo
         and (strong_page_profile or decision_useful_hit or directness_rank >= 3 or partial_count > 0)
     ):
         return "kept_page_candidate_progress"
