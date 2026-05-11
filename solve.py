@@ -2183,6 +2183,7 @@ def build_retrieval_effect_review(
     authority_hits = sum(1 for row in rows if normalize_bool(row.get("official_entry_hit"), False))
     raw_positive = sum(1 for row in rows if int(row.get("raw_results") or 0) > 0)
     kept_positive = sum(1 for row in rows if int(row.get("kept_web") or 0) > 0)
+    kept_progress_claims = sum(1 for row in rows if int(row.get("kept_progress_from_raw") or 0) > 0)
     anti_bot_like = sum(
         1
         for row in rows
@@ -2190,18 +2191,47 @@ def build_retrieval_effect_review(
         or str(row.get("official_discovery_block_reason") or "") == "anti_bot_blocked"
     )
     rescue_states: Dict[str, int] = {}
+    rescue_success_gates: Dict[str, int] = {}
+    rescue_latency_ms = 0.0
+    cost_rows = []
+    stop_reasons: Dict[str, int] = {}
     for row in rows:
         state = str(row.get("playwright_rescue_state") or "")
         if not state:
-            continue
-        rescue_states[state] = int(rescue_states.get(state, 0) or 0) + 1
+            pass
+        else:
+            rescue_states[state] = int(rescue_states.get(state, 0) or 0) + 1
+        success_gate = str(row.get("rescue_success_gate") or "")
+        if success_gate:
+            rescue_success_gates[success_gate] = int(rescue_success_gates.get(success_gate, 0) or 0) + 1
+        rescue_latency_ms += float(row.get("rescue_latency_ms") or 0.0)
+        cost_review = row.get("retrieval_cost_review") if isinstance(row.get("retrieval_cost_review"), dict) else {}
+        if cost_review:
+            cost_rows.append(cost_review)
+        stop_reason = str(row.get("claim_retrieve_stop_reason") or "")
+        if stop_reason:
+            stop_reasons[stop_reason] = int(stop_reasons.get(stop_reason, 0) or 0) + 1
+    avg_search_seconds = 0.0
+    avg_detail_fetch_seconds = 0.0
+    avg_official_discovery_seconds = 0.0
+    if cost_rows:
+        avg_search_seconds = round(sum(float(row.get("search_seconds") or 0.0) for row in cost_rows) / len(cost_rows), 3)
+        avg_detail_fetch_seconds = round(sum(float(row.get("detail_fetch_seconds") or 0.0) for row in cost_rows) / len(cost_rows), 3)
+        avg_official_discovery_seconds = round(sum(float(row.get("official_discovery_seconds") or 0.0) for row in cost_rows) / len(cost_rows), 3)
     return {
         "claim_count": len(rows),
         "raw_positive_claims": raw_positive,
         "kept_positive_claims": kept_positive,
+        "kept_progress_claims": kept_progress_claims,
         "authority_hit_claims": authority_hits,
         "anti_bot_or_access_blocked_claims": anti_bot_like,
         "playwright_rescue_states": rescue_states,
+        "rescue_success_gates": rescue_success_gates,
+        "avg_rescue_latency_ms": round(rescue_latency_ms / max(1, len(rows)), 1),
+        "avg_search_seconds": avg_search_seconds,
+        "avg_detail_fetch_seconds": avg_detail_fetch_seconds,
+        "avg_official_discovery_seconds": avg_official_discovery_seconds,
+        "claim_stop_reasons": stop_reasons,
         "retrieve_seconds": round(float((timing or {}).get("retrieve") or 0.0), 3),
         "total_so_far_seconds": round(float((timing or {}).get("total_so_far") or 0.0), 3),
     }
@@ -2444,6 +2474,40 @@ def claim_direct_decidable_diagnostic(
     return {"decidable": False, "claim_id": claim_id}
 
 
+def infer_critical_claim_blocking_state(
+    claim: Dict[str, Any],
+    budget_priority: str,
+    blocked_at: str,
+    access_path_state: str,
+    raw_results: int,
+    kept_web: int,
+    answer_candidate_total: int,
+    page_keep_review_state: Dict[str, int],
+    rescue_success_gate: str,
+) -> str:
+    if str(claim.get("centrality") or "") != "core":
+        return ""
+    if budget_priority != "core_critical":
+        return "core_noncritical"
+    if access_path_state in {"source_access_blocked", "access_blocked_but_rescuable", "access_blocked_and_unresolved", "page_access_or_read_blocked"}:
+        return access_path_state
+    if rescue_success_gate == "search_result_recovered" and raw_results > 0 and kept_web <= 0:
+        return "search_rescued_but_not_kept"
+    if raw_results > 0 and kept_web <= 0:
+        if page_keep_review_state:
+            return "raw_hit_but_page_not_retained_after_review"
+        return "raw_hit_but_page_not_retained"
+    if kept_web > 0 and answer_candidate_total <= 0:
+        return "kept_page_but_no_candidate"
+    if answer_candidate_total > 0 and blocked_at in {"retrieval_readiness", "evidence_point_not_convertible"}:
+        return "candidate_present_but_not_decidable"
+    if blocked_at == "provider_recall":
+        return "core_recall_unresolved"
+    if blocked_at == "retrieval_filter":
+        return "core_filter_unresolved"
+    return "core_path_unresolved"
+
+
 def claim_pipeline_diagnostic(
     claim: Dict[str, Any],
     diagnostic: Optional[Dict[str, Any]],
@@ -2546,9 +2610,37 @@ def claim_pipeline_diagnostic(
     official_entry_hit = normalize_bool(diagnostic.get("official_entry_hit"), False)
     official_entry_source_family = str(diagnostic.get("official_entry_source_family") or "")
     official_discovery_block_reason = str(diagnostic.get("official_discovery_block_reason") or "")
+    source_order_trace = diagnostic.get("source_order_trace") if isinstance(diagnostic.get("source_order_trace"), list) else []
+    priority_source_dropped_stage = str(diagnostic.get("priority_source_dropped_stage") or "")
+    final_source_selection_reason = str(diagnostic.get("final_source_selection_reason") or "")
+    final_executed_source_order = diagnostic.get("final_executed_source_order") if isinstance(diagnostic.get("final_executed_source_order"), list) else []
+    authority_pair_preserved = normalize_bool(diagnostic.get("authority_pair_preserved"), False)
+    rescue_roi_state = str(diagnostic.get("rescue_roi_state") or "")
+    rescue_skip_reason = str(diagnostic.get("rescue_skip_reason") or "")
+    rescue_latency_ms = float(diagnostic.get("rescue_latency_ms") or 0.0)
+    family_rescue_budget_used = diagnostic.get("family_rescue_budget_used") if isinstance(diagnostic.get("family_rescue_budget_used"), dict) else {}
+    source_latency_profile = diagnostic.get("source_latency_profile") if isinstance(diagnostic.get("source_latency_profile"), dict) else {}
+    slow_source_cutoff = diagnostic.get("slow_source_cutoff") if isinstance(diagnostic.get("slow_source_cutoff"), list) else []
+    claim_retrieve_stop_reason = str(diagnostic.get("claim_retrieve_stop_reason") or "")
+    retrieval_cost_review = diagnostic.get("retrieval_cost_review") if isinstance(diagnostic.get("retrieval_cost_review"), dict) else {}
+    page_keep_review_state = diagnostic.get("page_keep_review_state") if isinstance(diagnostic.get("page_keep_review_state"), dict) else {}
+    page_keep_review_reason = diagnostic.get("page_keep_review_reason") if isinstance(diagnostic.get("page_keep_review_reason"), dict) else {}
+    second_pass_keep_review_used = int(diagnostic.get("second_pass_keep_review_used") or 0)
+    second_pass_keep_review_reason = diagnostic.get("second_pass_keep_review_reason") if isinstance(diagnostic.get("second_pass_keep_review_reason"), dict) else {}
+    second_pass_keep_recovered_count = int(diagnostic.get("second_pass_keep_recovered_count") or 0)
+    core_keep_review_block_reason = diagnostic.get("core_keep_review_block_reason") if isinstance(diagnostic.get("core_keep_review_block_reason"), dict) else {}
+    kept_candidate_source_type = diagnostic.get("kept_candidate_source_type") if isinstance(diagnostic.get("kept_candidate_source_type"), dict) else {}
+    kept_progress_from_raw = int(diagnostic.get("kept_progress_from_raw") or 0)
+    rescue_progress_delta = diagnostic.get("rescue_progress_delta") if isinstance(diagnostic.get("rescue_progress_delta"), dict) else {}
+    rescue_success_gate = str(diagnostic.get("rescue_success_gate") or "")
+    rescue_target_page_type = str(diagnostic.get("rescue_target_page_type") or "")
+    rescue_non_roi_reason = str(diagnostic.get("rescue_non_roi_reason") or "")
     raw_results = int(diagnostic.get("raw_results") or 0)
     kept_web = int(diagnostic.get("kept_web") or 0)
     answer_candidate_total = int(diagnostic.get("answer_candidate_total") or 0)
+    claim_budget_priority_label_value = str(claim.get("_claim_budget_priority") or claim_budget_priority_label(claim))
+    core_claim_budget_reserved = normalize_bool(claim.get("_core_claim_budget_reserved"), False)
+    supporting_claim_deprioritized = normalize_bool(claim.get("_supporting_claim_deprioritized"), False)
     news_family_state = str(responsibility.get("news_family_state") or "")
     html_family_state = str(responsibility.get("html_family_state") or "")
     access_path_state = infer_access_path_state(
@@ -2667,6 +2759,17 @@ def claim_pipeline_diagnostic(
         kept_web,
         answer_candidate_total,
     )
+    critical_claim_blocking_state = infer_critical_claim_blocking_state(
+        claim,
+        claim_budget_priority_label_value,
+        blocked_at,
+        access_path_state,
+        raw_results,
+        kept_web,
+        answer_candidate_total,
+        page_keep_review_state,
+        rescue_success_gate,
+    )
     return {
         "claim_id": claim_id,
         "claim": normalize_text(str(claim.get("claim") or ""))[:160],
@@ -2686,6 +2789,10 @@ def claim_pipeline_diagnostic(
         "secondary_detail_scope": secondary_detail_scope,
         "channel_decision_candidate": channel_decision_candidate,
         "channel_decision_confidence": round(channel_decision_confidence, 3),
+        "claim_budget_priority": claim_budget_priority_label_value,
+        "core_claim_budget_reserved": core_claim_budget_reserved,
+        "supporting_claim_deprioritized": supporting_claim_deprioritized,
+        "critical_claim_blocking_state": critical_claim_blocking_state,
         "pipeline_layer": pipeline_layer,
         "pipeline_stage": blocked_at,
         "pipeline_reason": boundary_reason,
@@ -2736,10 +2843,35 @@ def claim_pipeline_diagnostic(
         "playwright_rescue_trigger": playwright_rescue_trigger,
         "playwright_rescue_source": playwright_rescue_source,
         "playwright_rescue_result_count": playwright_rescue_result_count,
+        "rescue_roi_state": rescue_roi_state,
+        "rescue_skip_reason": rescue_skip_reason,
+        "rescue_latency_ms": round(rescue_latency_ms, 1),
+        "family_rescue_budget_used": family_rescue_budget_used,
         "official_entry_attempted": official_entry_attempted,
         "official_entry_hit": official_entry_hit,
         "official_entry_source_family": official_entry_source_family,
         "official_discovery_block_reason": official_discovery_block_reason,
+        "source_order_trace": source_order_trace[:8],
+        "priority_source_dropped_stage": priority_source_dropped_stage,
+        "final_source_selection_reason": final_source_selection_reason,
+        "final_executed_source_order": final_executed_source_order[:10],
+        "authority_pair_preserved": authority_pair_preserved,
+        "source_latency_profile": source_latency_profile,
+        "slow_source_cutoff": slow_source_cutoff[:5],
+        "claim_retrieve_stop_reason": claim_retrieve_stop_reason,
+        "retrieval_cost_review": retrieval_cost_review,
+        "page_keep_review_state": page_keep_review_state,
+        "page_keep_review_reason": page_keep_review_reason,
+        "second_pass_keep_review_used": second_pass_keep_review_used,
+        "second_pass_keep_review_reason": second_pass_keep_review_reason,
+        "second_pass_keep_recovered_count": second_pass_keep_recovered_count,
+        "core_keep_review_block_reason": core_keep_review_block_reason,
+        "kept_candidate_source_type": kept_candidate_source_type,
+        "kept_progress_from_raw": kept_progress_from_raw,
+        "rescue_progress_delta": rescue_progress_delta,
+        "rescue_success_gate": rescue_success_gate,
+        "rescue_target_page_type": rescue_target_page_type,
+        "rescue_non_roi_reason": rescue_non_roi_reason,
         "program_expected_failure_stage": str(evidence_need_program.get("expected_failure_stage") or ""),
         "program_anchor_buckets": list(decision_slots.get("anchor_buckets") or [])[:6] if isinstance(decision_slots, dict) else [],
         "program_direct_evidence_need": compact_claim_text(str(direct_need.get("must_answer") or ""), 120),
@@ -2802,10 +2934,24 @@ def build_claim_pipeline_diagnostics(
         stage = str(row.get("pipeline_stage") or "unknown")
         layer_counts[layer] = layer_counts.get(layer, 0) + 1
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    retrieval_effect_review = {
+        "claim_count": len(items),
+        "raw_positive_claims": sum(1 for row in items if int(row.get("raw_results") or 0) > 0),
+        "kept_positive_claims": sum(1 for row in items if int(row.get("kept_web") or 0) > 0),
+        "kept_progress_claims": sum(1 for row in items if int(row.get("kept_progress_from_raw") or 0) > 0),
+        "authority_hit_claims": sum(1 for row in items if normalize_bool(row.get("official_entry_hit"), False)),
+        "anti_bot_or_access_blocked_claims": sum(
+            1
+            for row in items
+            if str(row.get("access_path_state") or "") in {"access_blocked_but_rescuable", "access_blocked_and_unresolved"}
+            or str(row.get("official_discovery_block_reason") or "") == "anti_bot_blocked"
+        ),
+    }
     return {
         "items": items,
         "layer_counts": layer_counts,
         "stage_counts": stage_counts,
+        "retrieval_effect_review": retrieval_effect_review,
     }
 
 
@@ -3062,9 +3208,11 @@ def rubric_trigger_gate(
     evidence_summary: Optional[Dict[str, Any]],
     fallback_risk_features: Optional[Dict[str, Any]],
     evidence_non_decidable_state: Optional[Dict[str, Any]] = None,
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     fallback_risk_features = fallback_risk_features if isinstance(fallback_risk_features, dict) else {}
     evidence_non_decidable_state = evidence_non_decidable_state if isinstance(evidence_non_decidable_state, dict) else {}
+    claim_pipeline_diagnostics = claim_pipeline_diagnostics if isinstance(claim_pipeline_diagnostics, dict) else {}
     unsupported_signals = fallback_risk_features.get("unsupported_signals") if isinstance(fallback_risk_features.get("unsupported_signals"), dict) else {}
     incomparable_signals = fallback_risk_features.get("incomparable_signals") if isinstance(fallback_risk_features.get("incomparable_signals"), dict) else {}
     fictional_signals = fallback_risk_features.get("fictional_contamination_signals") if isinstance(fallback_risk_features.get("fictional_contamination_signals"), dict) else {}
@@ -3088,6 +3236,24 @@ def rubric_trigger_gate(
         and not fictional_risk
     )
     non_decidable_state = str(evidence_non_decidable_state.get("state") or "")
+    dominant_row = dominant_pipeline_row(claim_pipeline_diagnostics, evidence_non_decidable_state)
+    retrieval_effect_review = (
+        claim_pipeline_diagnostics.get("retrieval_effect_review")
+        if isinstance(claim_pipeline_diagnostics.get("retrieval_effect_review"), dict)
+        else {}
+    )
+    access_path_state = str(dominant_row.get("access_path_state") or "")
+    critical_claim_blocking_state = str(dominant_row.get("critical_claim_blocking_state") or "")
+    official_entry_hit = normalize_bool(dominant_row.get("official_entry_hit"), False)
+    kept_web = int(dominant_row.get("kept_web") or 0)
+    raw_results = int(dominant_row.get("raw_results") or 0)
+    answer_candidate_total = int(dominant_row.get("answer_candidate_total") or 0)
+    decision_gate_primary_block = (
+        critical_claim_blocking_state
+        or access_path_state
+        or str(dominant_row.get("pipeline_stage") or "")
+        or non_decidable_state
+    )
     gate = {
         "allow": False,
         "reason": "",
@@ -3103,6 +3269,9 @@ def rubric_trigger_gate(
         "fictional_reality_contamination_risk": fictional_risk,
         "route_guard_blocked": route_guard_blocked,
         "certainty_profile_hint": certainty_profile,
+        "decision_gate_consumed_diagnostics": bool(dominant_row or retrieval_effect_review),
+        "decision_gate_primary_block": decision_gate_primary_block,
+        "reason_source_layer": "diagnostic_gate" if (dominant_row or retrieval_effect_review) else "fallback_risk_only",
     }
     if has_direct_refuting_evidence(evidence_summary):
         gate["reason"] = "direct_refuting_evidence_exists"
@@ -3114,6 +3283,39 @@ def rubric_trigger_gate(
         return gate
     if non_decidable_state == "direct_decidable":
         gate["reason"] = "direct_decision_available"
+        return gate
+    if critical_claim_blocking_state in {
+        "access_blocked_but_rescuable",
+        "access_blocked_and_unresolved",
+        "official_discovery_failed",
+    }:
+        gate["reason"] = "access_blocked_not_evidence_absence"
+        return gate
+    if critical_claim_blocking_state in {
+        "raw_hit_but_page_not_retained",
+        "raw_hit_but_page_not_retained_after_review",
+    }:
+        gate["reason"] = "raw_hit_but_page_not_retained"
+        return gate
+    if official_entry_hit and raw_results > 0 and kept_web <= 0:
+        gate["reason"] = "authority_hit_but_not_retained"
+        return gate
+    if critical_claim_blocking_state == "candidate_present_but_not_decidable" or (kept_web > 0 and answer_candidate_total > 0):
+        gate["reason"] = "candidate_present_but_not_decidable"
+        return gate
+    if (
+        non_decidable_state == "unsupported"
+        and int(retrieval_effect_review.get("authority_hit_claims") or 0) > 0
+        and int(retrieval_effect_review.get("kept_positive_claims") or 0) <= 0
+    ):
+        gate["reason"] = "authority_hit_but_not_retained"
+        return gate
+    if (
+        non_decidable_state == "unsupported"
+        and int(retrieval_effect_review.get("kept_progress_claims") or 0) > 0
+        and int(retrieval_effect_review.get("kept_positive_claims") or 0) > 0
+    ):
+        gate["reason"] = "retained_progress_but_not_decidable"
         return gate
     if route_guard_blocked and non_decidable_state == "unsupported" and not high_risk_feature and unsupported_core_claim_count > 0:
         gate["reason"] = "open_route_summary_guard_blocked"
@@ -3176,8 +3378,16 @@ def rubric_fallback_decide(
     fallback_risk_features: Optional[Dict[str, Any]],
     evidence_non_decidable_state: Optional[Dict[str, Any]],
     legacy_preview: Dict[str, Any],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    gate = rubric_trigger_gate(item, extracted, evidence_summary, fallback_risk_features, evidence_non_decidable_state)
+    gate = rubric_trigger_gate(
+        item,
+        extracted,
+        evidence_summary,
+        fallback_risk_features,
+        evidence_non_decidable_state,
+        claim_pipeline_diagnostics,
+    )
     if not gate.get("allow"):
         return {
             "attempted": False,
@@ -7721,6 +7931,19 @@ def candidate_page_utility_score(
     return score
 
 
+def is_pseudo_evidence_candidate(candidate: Dict[str, Any]) -> bool:
+    source_type = normalize_text(str(candidate.get("source_type") or ""))
+    source = normalize_text(str(candidate.get("source") or ""))
+    title = normalize_text(str(candidate.get("title") or ""))
+    if source_type in {"computed", "input_context"}:
+        return True
+    if source in {"computed", "input_context"}:
+        return True
+    if title in {"样本日期星期计算", "汇率数值换算线索", "用户问题主需"}:
+        return True
+    return False
+
+
 def candidate_decision_useful_score(
     claim: Dict[str, Any],
     summary: Dict[str, Any],
@@ -7735,10 +7958,23 @@ def candidate_decision_useful_score(
     sentence_profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
     gap_reason = normalize_text(str(candidate.get("direct_candidate_gap_reason") or ""))
     directness = normalize_text(str(candidate.get("sentence_directness") or ""))
+    page_profile = candidate_page_utility_profile(claim_family, query_role, candidate)
+    subject_slot_hit = bool(coverage.get("subject"))
+    time_slot_hit = bool(coverage.get("time_scope") or coverage.get("time"))
+    fact_slot_hit = bool(coverage.get("metric_or_relation") or coverage.get("status_or_result"))
     score = sentence_utility_score
     score += min(20, directness_rank * 4)
     score += min(16, slot_count * 4)
     score += candidate_page_utility_score(claim_family, query_role, candidate)
+    if subject_slot_hit and (time_slot_hit or fact_slot_hit):
+        score += 6
+    if page_profile in {
+        "official_calendar_or_notice",
+        "alternative_route_or_route_analysis",
+        "result_or_score_page",
+        "table_or_data_page",
+    } and slot_count >= 2:
+        score += 6
     if sentence_profile == "direct_candidate":
         score += 20
     elif sentence_profile == "slot_hit_but_indirect":
@@ -7757,14 +7993,33 @@ def candidate_decision_useful_score(
         score -= 4
     elif gap_reason in {"date_role_mismatch", "result_granularity_mismatch", "opening_slot_mismatch"}:
         score += 2
+    elif gap_reason in {"candidate_not_direct", "related_but_not_assertive"} and slot_count >= 2 and directness_rank >= 2:
+        score += 4
+    if is_pseudo_evidence_candidate(candidate):
+        score -= 40
     return score
 
 
 def decision_useful_hit_for_candidate(candidate: Dict[str, Any]) -> bool:
+    if is_pseudo_evidence_candidate(candidate):
+        return False
     utility = int(candidate.get("candidate_utility_score") or 0)
     slot_count = int(((candidate.get("candidate_slot_coverage") or {}) if isinstance(candidate.get("candidate_slot_coverage"), dict) else {}).get("slot_count") or 0)
     profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
-    return utility >= 36 and slot_count >= 2 and profile != "background_commentary"
+    page_profile = normalize_text(str(candidate.get("page_utility_profile") or ""))
+    if utility >= 36 and slot_count >= 2 and profile != "background_commentary":
+        return True
+    return (
+        utility >= 34
+        and slot_count >= 2
+        and profile not in {"background_commentary", ""}
+        and page_profile in {
+            "official_calendar_or_notice",
+            "alternative_route_or_route_analysis",
+            "result_or_score_page",
+            "table_or_data_page",
+        }
+    )
 
 
 def apply_decision_useful_candidate_rerank(
@@ -7799,6 +8054,7 @@ def apply_decision_useful_candidate_rerank(
             candidate["page_utility_profile"] = page_profile
             candidate["page_utility_score"] = page_score
             candidate["candidate_utility_score"] = candidate_score
+            candidate["is_pseudo_evidence"] = is_pseudo_evidence_candidate(candidate)
             candidate["decision_useful_hit"] = decision_useful_hit_for_candidate({"candidate_utility_score": candidate_score, **candidate})
         candidates.sort(
             key=lambda item: (
@@ -7810,6 +8066,11 @@ def apply_decision_useful_candidate_rerank(
             reverse=True,
         )
         summary["evidence_sentence_candidates"] = candidates
+        top_evidence_candidate = next(
+            (item for item in candidates if isinstance(item, dict) and not normalize_bool(item.get("is_pseudo_evidence"), False)),
+            {},
+        )
+        summary["top_evidence_candidate"] = top_evidence_candidate
         evidence_mode = str(summary.get("evidence_mode") or "")
         coverage = claim_coverage(claim_id, evidence_mode, evidence_by_claim.get(claim_id, []), summary)
         summary["coverage"] = coverage
@@ -7822,6 +8083,9 @@ def apply_decision_useful_candidate_rerank(
         point_conversion["page_utility_profile"] = str(top_candidate.get("page_utility_profile") or "")
         point_conversion["decision_useful_hit"] = bool(top_candidate.get("decision_useful_hit"))
         point_conversion["candidate_utility_score"] = int(top_candidate.get("candidate_utility_score") or 0)
+        point_conversion["top_candidate_is_pseudo"] = bool(top_candidate.get("is_pseudo_evidence"))
+        point_conversion["top_evidence_candidate_title"] = str(top_evidence_candidate.get("title") or "")
+        point_conversion["top_evidence_candidate_profile"] = str(top_evidence_candidate.get("sentence_candidate_profile") or "")
         summary["point_conversion"] = point_conversion
         rerank_debug[claim_id] = {
             "query_effective_role": query_role,
@@ -7829,6 +8093,8 @@ def apply_decision_useful_candidate_rerank(
             "top_candidate_score": int(top_candidate.get("candidate_utility_score") or 0),
             "top_candidate_profile": str(top_candidate.get("sentence_candidate_profile") or ""),
             "top_page_profile": str(top_candidate.get("page_utility_profile") or ""),
+            "top_candidate_is_pseudo": bool(top_candidate.get("is_pseudo_evidence")),
+            "top_evidence_candidate_title": str(top_evidence_candidate.get("title") or ""),
         }
     if isinstance(debug_bucket, dict):
         debug_bucket["decision_useful_rerank"] = rerank_debug
@@ -7836,11 +8102,29 @@ def apply_decision_useful_candidate_rerank(
 
 def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
-    block_reason = normalize_text(str(point_conversion.get("block_reason") or ""))
+    comparability_profile = summary.get("comparability_profile") if isinstance(summary.get("comparability_profile"), dict) else {}
+    block_reason = normalize_text(str(point_conversion.get("block_reason") or "")) or normalize_text(str(point_conversion.get("llm_refined_gap_reason") or "")) or normalize_text(str(point_conversion.get("direct_candidate_gap_reason") or ""))
     candidate_score = int(point_conversion.get("candidate_utility_score") or 0)
     slot_coverage = point_conversion.get("candidate_slot_coverage") if isinstance(point_conversion.get("candidate_slot_coverage"), dict) else {}
     slot_count = int(slot_coverage.get("slot_count") or 0)
-    if claim_direct_refuting_points(summary) or claim_direct_supporting_points(summary):
+    candidate_sentence_count = int(point_conversion.get("candidate_sentence_count") or 0)
+    partial_count = int(point_conversion.get("partial_count") or 0)
+    stage = normalize_text(str(point_conversion.get("stage") or ""))
+    page_profile = normalize_text(str(point_conversion.get("page_utility_profile") or ""))
+    directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
+    decision_useful_hit = bool(point_conversion.get("decision_useful_hit"))
+    top_candidate_is_pseudo = normalize_bool(point_conversion.get("top_candidate_is_pseudo"), False)
+    top_evidence_candidate = summary.get("top_evidence_candidate") if isinstance(summary.get("top_evidence_candidate"), dict) else {}
+    has_real_evidence_candidate = bool(top_evidence_candidate) and not is_pseudo_evidence_candidate(top_evidence_candidate)
+    strong_page_profile = page_profile in {
+        "official_calendar_or_notice",
+        "alternative_route_or_route_analysis",
+        "result_or_score_page",
+        "table_or_data_page",
+    }
+    comparable_direct_support_count = int(comparability_profile.get("comparable_direct_support_count") or 0)
+    comparable_direct_refute_count = int(comparability_profile.get("comparable_direct_refute_count") or 0)
+    if comparable_direct_support_count > 0 or comparable_direct_refute_count > 0:
         return "stable_direct_point"
     if candidate_score >= 36 and slot_count >= 2 and block_reason in {
         "not_same_fact_slot",
@@ -7849,8 +8133,33 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
         "numeric_not_normalizable",
     }:
         return f"same_slot_review_blocked:{block_reason}"
+    if candidate_score >= 30 and slot_count >= 2 and block_reason in {"candidate_not_direct", "related_but_not_assertive"}:
+        if strong_page_profile or directness_rank >= 3 or decision_useful_hit:
+            return f"same_slot_review_blocked:{block_reason}"
     if candidate_score >= 28 and block_reason in {"candidate_not_direct", "related_but_not_assertive"}:
         return "same_slot_review_not_direct"
+    if candidate_score >= 34 and slot_count >= 2 and stage in {"direct_to_uncertain_only", "no_direct_candidate"}:
+        if not top_candidate_is_pseudo and (directness_rank >= 3 or decision_useful_hit or partial_count > 0):
+            return "same_slot_review_not_direct"
+    if (
+        candidate_score >= 32
+        and candidate_sentence_count > 0
+        and slot_count >= 2
+        and block_reason in {
+            "",
+            "candidate_not_direct",
+            "related_but_not_assertive",
+            "not_same_fact_slot",
+            "date_role_mismatch",
+            "result_granularity_mismatch",
+        }
+        and has_real_evidence_candidate
+        and not top_candidate_is_pseudo
+        and (strong_page_profile or decision_useful_hit or directness_rank >= 3 or partial_count > 0)
+    ):
+        return "kept_page_candidate_progress"
+    if candidate_sentence_count > 0 or partial_count > 0:
+        return "weak_candidate_retained"
     if int(summary.get("answer_candidate_total") or 0) > 0:
         return "weak_candidate_retained"
     return "unresolved"
@@ -7859,6 +8168,8 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
 def infer_point_consumption_state(summary: Dict[str, Any], slot_review_outcome: str) -> str:
     if slot_review_outcome == "stable_direct_point":
         return "stable_direct_point"
+    if slot_review_outcome == "kept_page_candidate_progress":
+        return "candidate_progress_from_kept_page"
     if slot_review_outcome.startswith("same_slot_review_blocked") or slot_review_outcome == "same_slot_review_not_direct":
         return "same_slot_reviewed_but_blocked"
     if slot_review_outcome == "weak_candidate_retained":
@@ -7893,6 +8204,9 @@ def apply_decision_useful_consumption_state(
         slot_review_outcome = infer_slot_review_outcome(summary)
         point_conversion["slot_review_outcome"] = slot_review_outcome
         point_conversion["point_consumption_state"] = infer_point_consumption_state(summary, slot_review_outcome)
+        point_conversion["evidence_consumed_from_kept_page"] = bool(
+            point_conversion.get("point_consumption_state") == "candidate_progress_from_kept_page"
+        )
         summary["point_conversion"] = point_conversion
 
 
@@ -7916,6 +8230,60 @@ def claim_budget_priority(claim: Dict[str, Any]) -> Tuple[int, int, int]:
         "background_context": 0,
     }.get(bucket, 0)
     return (priority_score + bucket_bonus, high_risk + structured + strong, structured + has_queries + len(text))
+
+
+KEY_EVIDENCE_BUDGET_MODES = {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+
+
+def claim_budget_priority_label(claim: Dict[str, Any]) -> str:
+    if not isinstance(claim, dict):
+        return "unknown"
+    centrality = str(claim.get("centrality") or "supporting")
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    task_card = claim.get("evidence_task_card") if isinstance(claim.get("evidence_task_card"), dict) else {}
+    mode = str(source_intent.get("evidence_mode") or "")
+    target = str(source_intent.get("evidence_target") or "")
+    mechanism_type = str(source_intent.get("mechanism_type") or "")
+    priority_label = str(task_card.get("priority_label") or "normal")
+    risk_type = str(source_intent.get("risk_type") or "")
+    bucket = str(claim.get("claim_budget_bucket") or "")
+    critical_fact_like = (
+        mode in KEY_EVIDENCE_BUDGET_MODES
+        or target in {"market_calendar", "route_relation", "match_result", "current_status", "withdrawal_status", "prize_amount"}
+        or mechanism_type in {"structured_numeric_authority", "date_authority", "event_result_page", "current_status_update"}
+    )
+    if centrality == "core":
+        if critical_fact_like or priority_label in {"critical", "high"}:
+            return "core_critical"
+        return "core_normal"
+    if priority_label in {"critical", "high"} or risk_type in HIGH_RISK_TYPES or bucket == "structured_detail":
+        return "supporting_high_risk"
+    if centrality == "peripheral":
+        return "peripheral_low"
+    return "supporting_normal"
+
+
+def annotate_claim_budget_metadata(claims: List[Dict[str, Any]], retrieval_budget: Dict[str, Any]) -> None:
+    if not isinstance(retrieval_budget, dict):
+        return
+    priority_map = retrieval_budget.get("claim_budget_priority") if isinstance(retrieval_budget.get("claim_budget_priority"), dict) else {}
+    reserved_ids = {
+        str(claim_id)
+        for claim_id in (retrieval_budget.get("core_claim_budget_reserved") or [])
+        if str(claim_id)
+    } if isinstance(retrieval_budget.get("core_claim_budget_reserved"), list) else set()
+    deprioritized_ids = {
+        str(claim_id)
+        for claim_id in (retrieval_budget.get("supporting_claim_deprioritized") or [])
+        if str(claim_id)
+    } if isinstance(retrieval_budget.get("supporting_claim_deprioritized"), list) else set()
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+        claim["_claim_budget_priority"] = str(priority_map.get(claim_id) or claim_budget_priority_label(claim))
+        claim["_core_claim_budget_reserved"] = claim_id in reserved_ids
+        claim["_supporting_claim_deprioritized"] = claim_id in deprioritized_ids
 
 
 def select_claims_for_budget(claims: List[Dict[str, Any]], max_claims: int, user_need: str = "") -> List[Dict[str, Any]]:
@@ -9400,6 +9768,9 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
     skipped: List[Dict[str, str]] = []
     query_limits: Dict[str, int] = {}
     source_limits: Dict[str, int] = {}
+    budget_priority: Dict[str, str] = {}
+    core_claim_budget_reserved: List[str] = []
+    supporting_claim_deprioritized: List[str] = []
     reason = scope_reason or "default_structured_budget"
     for claim in claims:
         if not isinstance(claim, dict):
@@ -9414,6 +9785,7 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
         priority_label = str(task_card.get("priority_label") or "normal")
         preferred_domains = source_intent.get("preferred_domains") if isinstance(source_intent.get("preferred_domains"), list) else []
         evidence_shape = str(source_intent.get("evidence_shape") or "")
+        budget_priority[claim_id] = claim_budget_priority_label(claim)
         binding_strength = sum(
             1
             for key in ("subject_entity", "relation_or_metric", "time_scope", "expected_evidence_shape")
@@ -9578,12 +9950,58 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
             elif centrality != "core":
                 query_limits[claim_id] = 0
                 skipped.append({"claim_id": claim_id, "reason": "prediction_boundary_supporting_skip"})
+    has_core_critical = any(label == "core_critical" for label in budget_priority.values())
+    if has_core_critical:
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+            if not claim_id:
+                continue
+            label = str(budget_priority.get(claim_id) or "")
+            source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+            task_card = claim.get("evidence_task_card") if isinstance(claim.get("evidence_task_card"), dict) else {}
+            mode = str(source_intent.get("evidence_mode") or "")
+            target = str(source_intent.get("evidence_target") or "")
+            preferred_domains = source_intent.get("preferred_domains") if isinstance(source_intent.get("preferred_domains"), list) else []
+            evidence_shape = str(source_intent.get("evidence_shape") or "")
+            priority_label = str(task_card.get("priority_label") or "normal")
+            authority_ready = bool(preferred_domains) or evidence_shape in {"authoritative_notice", "structured_historical_data"}
+            if label == "core_critical":
+                query_limits[claim_id] = max(query_limits.get(claim_id, 0), 3 if mode in {"date_fact", "schedule_fact", "route_fact", "event_result", "numeric_fact"} else 2)
+                source_limits[claim_id] = max(
+                    source_limits.get(claim_id, 0),
+                    3 if authority_ready or mode in {"route_fact", "event_result"} or target in {"market_calendar", "route_relation"} else 2,
+                )
+                core_claim_budget_reserved.append(claim_id)
+                continue
+            if label == "supporting_high_risk":
+                query_limits[claim_id] = min(max(query_limits.get(claim_id, 0), 1), 2)
+                source_limits[claim_id] = min(max(source_limits.get(claim_id, 0), 1), 2 if priority_label in {"critical", "high"} or mode in KEY_EVIDENCE_BUDGET_MODES else 1)
+                continue
+            if label == "supporting_normal":
+                if query_limits.get(claim_id, 0) > 1:
+                    query_limits[claim_id] = 1
+                if source_limits.get(claim_id, 0) > 1:
+                    source_limits[claim_id] = 1
+                if query_limits.get(claim_id, 0) > 0 or source_limits.get(claim_id, 0) > 0:
+                    supporting_claim_deprioritized.append(claim_id)
+                continue
+            if label == "peripheral_low":
+                if query_limits.get(claim_id, 0) > 0 or source_limits.get(claim_id, 0) > 0:
+                    skipped.append({"claim_id": claim_id, "reason": "core_critical_budget_preempts_peripheral"})
+                query_limits[claim_id] = 0
+                source_limits[claim_id] = 0
+                supporting_claim_deprioritized.append(claim_id)
     return {
         "reason": reason,
         "triggers": triggers,
         "claim_ids": claim_ids,
         "query_limits": query_limits,
         "source_limits": source_limits,
+        "claim_budget_priority": budget_priority,
+        "core_claim_budget_reserved": list(dict.fromkeys(core_claim_budget_reserved)),
+        "supporting_claim_deprioritized": list(dict.fromkeys(supporting_claim_deprioritized)),
         "skipped_claims": dedupe_dicts(skipped),
         "expected_risk": "may_reduce_direct_evidence_recall_for_skipped_claims" if skipped else "low",
     }
@@ -11157,10 +11575,17 @@ def insufficient_evidence_reason(
     claim_pipeline_diagnostics: Optional[Dict[str, Any]],
     evidence_non_decidable_state: Optional[Dict[str, Any]],
 ) -> str:
+    claim_pipeline_diagnostics = claim_pipeline_diagnostics if isinstance(claim_pipeline_diagnostics, dict) else {}
     non_decidable_state = evidence_non_decidable_state if isinstance(evidence_non_decidable_state, dict) else {}
     state = str(non_decidable_state.get("state") or "")
     dominant_row = dominant_pipeline_row(claim_pipeline_diagnostics, non_decidable_state)
+    retrieval_effect_review = (
+        claim_pipeline_diagnostics.get("retrieval_effect_review")
+        if isinstance(claim_pipeline_diagnostics.get("retrieval_effect_review"), dict)
+        else {}
+    )
     stage = str(dominant_row.get("pipeline_stage") or "")
+    critical_claim_blocking_state = str(dominant_row.get("critical_claim_blocking_state") or "")
     program_need = compact_claim_text(str(dominant_row.get("program_direct_evidence_need") or ""), 120)
     false_friend = compact_claim_text(
         str(((dominant_row.get("program_false_friend_evidence") or [""])[0] if isinstance(dominant_row.get("program_false_friend_evidence"), list) else "")),
@@ -11193,6 +11618,13 @@ def insufficient_evidence_reason(
     source_budget_cutoff = dominant_row.get("source_budget_cutoff") if isinstance(dominant_row.get("source_budget_cutoff"), dict) else {}
     playwright_rescue_state = str(dominant_row.get("playwright_rescue_state") or "")
     playwright_rescue_trigger = str(dominant_row.get("playwright_rescue_trigger") or "")
+    rescue_skip_reason = str(dominant_row.get("rescue_skip_reason") or "")
+    page_keep_review_state = dominant_row.get("page_keep_review_state") if isinstance(dominant_row.get("page_keep_review_state"), dict) else {}
+    page_keep_review_reason = dominant_row.get("page_keep_review_reason") if isinstance(dominant_row.get("page_keep_review_reason"), dict) else {}
+    kept_progress_from_raw = int(dominant_row.get("kept_progress_from_raw") or 0)
+    rescue_success_gate = str(dominant_row.get("rescue_success_gate") or "")
+    rescue_target_page_type = str(dominant_row.get("rescue_target_page_type") or "")
+    rescue_non_roi_reason = str(dominant_row.get("rescue_non_roi_reason") or "")
     official_entry_attempted = normalize_bool(dominant_row.get("official_entry_attempted"), False)
     official_entry_hit = normalize_bool(dominant_row.get("official_entry_hit"), False)
     official_discovery_block_reason = str(dominant_row.get("official_discovery_block_reason") or "")
@@ -11239,6 +11671,54 @@ def insufficient_evidence_reason(
             return "已经改用更贴事实位点的检索问法拿回了结果"
         return "已经额外尝试了更贴事实位点的检索问法，但仍没有稳定拿回原始结果"
 
+    def keep_review_clause() -> str:
+        if kept_progress_from_raw <= 0:
+            return ""
+        reason = next(iter(page_keep_review_reason.keys()), "") if page_keep_review_reason else ""
+        if reason == "page_type_not_decision_useful":
+            return "已有一部分结果是靠关键证据页复核才保下来的，说明入口并非全空，而是原先的页级保留偏严。"
+        if page_keep_review_state:
+            return "已有一部分结果是靠关键证据页复核才保下来的，说明问题已经从纯召回转到页级保留与消费。"
+        return ""
+
+    def kept_candidate_progress_clause() -> str:
+        if point_consumption_state != "candidate_progress_from_kept_page":
+            return ""
+        if candidate_slot_coverage_summary_text:
+            return f"当前已经从保留下来的页面里消费出覆盖 {candidate_slot_coverage_summary_text} 的候选句。"
+        return "当前已经从保留下来的页面里消费出同位点候选句。"
+
+    def critical_block_clause() -> str:
+        if critical_claim_blocking_state in {"raw_hit_but_page_not_retained", "raw_hit_but_page_not_retained_after_review"}:
+            if official_entry_hit:
+                return "当前已经命中过 authority/official 入口，也拿回过原始结果，但关键页还没有稳定保住。"
+            return "当前已经拿回过原始结果，但关键页还没有稳定保住。"
+        if critical_claim_blocking_state == "candidate_present_but_not_decidable":
+            return "当前关键页和候选句都已经出现，但还没闭合成可直接裁决的证据点。"
+        return ""
+
+    def retrieval_review_clause() -> str:
+        authority_hit_claims = int(retrieval_effect_review.get("authority_hit_claims") or 0)
+        kept_positive_claims = int(retrieval_effect_review.get("kept_positive_claims") or 0)
+        kept_progress_claims = int(retrieval_effect_review.get("kept_progress_claims") or 0)
+        anti_bot_claims = int(retrieval_effect_review.get("anti_bot_or_access_blocked_claims") or 0)
+        if authority_hit_claims > 0 and kept_positive_claims <= 0:
+            return "本轮其实已经碰到过权威入口，但命中的页还没有稳定保留下来。"
+        if kept_progress_claims > 0 and kept_positive_claims > 0:
+            return "本轮已经有页级保留进展，主阻塞不再是纯 recall，而是 kept page 到 candidate/point 的消费没有闭合。"
+        if anti_bot_claims > 0:
+            return "本轮主阻塞里已经包含明显的访问受阻或反爬因素，不是单纯没有相关网页。"
+        return ""
+
+    def rescue_success_clause() -> str:
+        if rescue_success_gate == "search_result_recovered":
+            target_text = f"{rescue_target_page_type} 类结果" if rescue_target_page_type else "结果页"
+            return f"Playwright 救援已经把 {target_text} 拿回来了"
+        if rescue_success_gate == "detail_content_recovered":
+            target_text = f"{rescue_target_page_type} 的正文" if rescue_target_page_type else "详情页正文"
+            return f"Playwright 救援已经把 {target_text} 读回来了"
+        return ""
+
     def access_clause() -> str:
         if access_path_state == "source_budget_cutoff":
             omitted = source_budget_cutoff.get("omitted_sources") if isinstance(source_budget_cutoff.get("omitted_sources"), list) else []
@@ -11262,6 +11742,10 @@ def insufficient_evidence_reason(
                     return f"当前主要卡在页面访问或正文读取受阻：已经触发过 Playwright 救援（{playwright_rescue_trigger}），但还是没把关键正文稳定读下来。"
                 return "当前主要卡在页面访问或正文读取受阻：已经尝试过 Playwright 救援，但还是没把关键正文稳定读下来。"
             if rescue_attempt_state == "playwright_rescue_skipped_by_policy":
+                if rescue_skip_reason:
+                    return f"当前页面访问有阻塞迹象，但本轮补救策略没有真正接手（{rescue_skip_reason}），关键正文仍没稳定拿下来。"
+                if rescue_non_roi_reason:
+                    return f"当前页面访问有阻塞迹象，但本轮补救策略没有真正接手（{rescue_non_roi_reason}），关键正文仍没稳定拿下来。"
                 return "当前页面访问有阻塞迹象，但本轮补救策略没有真正接手，关键正文仍没稳定拿下来。"
             return "当前主要卡在页面访问或正文读取受阻：相关页出现过，但关键正文没有稳定读下来。"
         if access_path_state == "provider_recall_insufficient_after_probe":
@@ -11369,10 +11853,18 @@ def insufficient_evidence_reason(
                 return f"当前主要卡在检索召回：关键 claim 还没有拿到足够可用的原始材料，尤其缺少能直接回答“{program_need}”的证据，因此暂不判定为事实错误。"
             return "当前主要卡在检索召回，关键 claim 还没有拿到足够可用的原始材料，因此暂不判定为事实错误。"
         if stage == "retrieval_filter":
+            if critical_block_clause():
+                return critical_block_clause() + " 因此当前先把主阻塞记在页保留层，不把它混成黑盒“没证据”。"
+            if retrieval_review_clause():
+                return retrieval_review_clause() + " 因此当前主要还停在页面保留阶段，暂不判定为事实错误。"
             if access_prefix and access_path_state in {"page_access_or_read_blocked", "access_blocked_and_unresolved"}:
                 return access_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"
             if env_prefix:
                 return env_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"
+            if rescue_success_gate == "search_result_recovered" and kept_progress_from_raw <= 0:
+                return rescue_success_clause() + "，但这些结果还没有稳定保成可用页面，因此暂不判定为事实错误。"
+            if kept_progress_from_raw > 0:
+                return keep_review_clause() + " 但当前保留下来的页面还没有稳定转成可直接使用的网页材料，因此暂不判定为事实错误。"
             if recoverable_filter_reason:
                 top_reason = next(iter(recoverable_filter_reason.keys()), "")
                 if top_reason == "opening_slot_mismatch":
@@ -11383,39 +11875,45 @@ def insufficient_evidence_reason(
                 return f"当前主要卡在页面保留阶段：搜到过相关结果，但没有稳定留下能直接回答“{program_need}”的页面材料，因此暂不判定为事实错误。"
             return "当前主要卡在页面保留阶段：搜到过相关结果，但可用材料没有稳定留下，因此暂不判定为事实错误。"
         if stage == "retrieval_readiness":
+            if critical_block_clause() and int(dominant_row.get("answer_candidate_total") or 0) > 0:
+                return critical_block_clause() + " 当前已经不是搜不到，而是 candidate/point 还没有闭合，因此暂不判定为事实错误。"
+            if retrieval_review_clause() and not env_prefix:
+                return retrieval_review_clause() + " 当前已经不是纯召回问题，但还没整理出稳定可直裁的证据句，因此暂不判定为事实错误。"
             if env_prefix:
                 return env_prefix + " 因此当前还没整理出可直接比对的候选句，先不判定为事实错误。"
             if missing_required_slots:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "关键层级"
                 return f"当前已经保留了一些相关页面，但{layer_hint}仍缺少{','.join(missing_required_slots[:3])}，所以还没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + retained_structured_detail_clause()
+            if rescue_success_gate == "detail_content_recovered":
+                return rescue_success_clause() + "，但当前还没有稳定整理出能直接回答该 claim 的候选句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + retained_structured_detail_clause()
             gap_clause = candidate_gap_clause()
             if readiness_promotion_used > 0 and int(dominant_row.get("answer_candidate_total") or 0) > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "句层"
                 basis_clause = f" 当前最强候选句覆盖到 {candidate_slot_coverage_summary_text}。" if candidate_slot_coverage_summary_text else ""
-                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + basis_clause + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"当前已经把差一点被丢掉的相关页保了下来，但这些候选句还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {keep_review_clause()}" if keep_review_clause() else "") + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + basis_clause + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if readiness_promotion_used > 0:
                 layer_hint = "句层" if readiness_block_layer == "sentence" else "页层" if readiness_block_layer == "page" else "页面到句子转换"
-                return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"当前已经把差一点被丢掉的相关页保了下来，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {keep_review_clause()}" if keep_review_clause() else "") + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if recall_probe_used > 0 and recall_probe_raw_hits > 0 and direct_candidate_rescue_used <= 0:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "句层"
-                return f"{recall_probe_clause()}，但当前还卡在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"{recall_probe_clause()}，但当前还卡在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if direct_candidate_rescue_used > 0:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "句层"
-                return f"{rescue_clause()}，但这些句子还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
+                return f"{rescue_clause()}，但这些句子还停在{layer_hint}，没有形成能直接回答“{program_need}”的稳定证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + opening_slot_clause(relaxed=True) + retained_structured_detail_clause()
             if program_need:
                 layer_hint = "页层" if readiness_block_layer == "page" else "句层" if readiness_block_layer == "sentence" else "页面到句子转换"
-                return f"当前已经保留了一些相关页面，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {gap_clause}" if gap_clause else "") + retained_structured_detail_clause()
-            return "当前已经保留了一些相关页面，但还没整理出可直接比对的证据句，因此暂不判定为事实错误。" + retained_structured_detail_clause()
+                return f"当前已经保留了一些相关页面，但还卡在{layer_hint}，没整理出能直接回答“{program_need}”的证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {gap_clause}" if gap_clause else "") + retained_structured_detail_clause()
+            return "当前已经保留了一些相关页面，但还没整理出可直接比对的证据句，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + retained_structured_detail_clause()
         if stage == "evidence_point_not_convertible":
             if env_prefix:
                 return env_prefix + " 页面里虽拿到部分内容，但还没形成稳定可比的证据点，因此暂不判定为事实错误。"
             if recall_probe_used > 0 and recall_probe_raw_hits > 0 and point_block_reason and program_need:
-                return f"已经用更贴事实位点的问法补回候选材料，但当前仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + opening_slot_clause()
+                return f"已经用更贴事实位点的问法补回候选材料，但当前仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + opening_slot_clause()
             if point_block_reason and program_need:
-                return f"当前页面里已经读到一些相关材料，但仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + opening_slot_clause()
+                return f"当前页面里已经读到一些相关材料，但仍卡在{point_block_reason}，还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "") + (f" {candidate_gap_clause()}" if candidate_gap_clause() else "") + opening_slot_clause()
             if program_need:
-                return f"当前页面里已经读到一些相关材料，但还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。"
-            return "当前页面里已经读到一些相关材料，但还没转成可直接裁决的证据点，因此暂不判定为事实错误。"
+                return f"当前页面里已经读到一些相关材料，但还没转成能直接回答“{program_need}”的可裁决证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "")
+            return "当前页面里已经读到一些相关材料，但还没转成可直接裁决的证据点，因此暂不判定为事实错误。" + (f" {kept_candidate_progress_clause()}" if kept_candidate_progress_clause() else "")
         if has_core_support and unresolved_details:
             return "核心结论已有部分支持，但高风险结构化细节仍未裁完，现阶段还不能把整题判成错误。" + retained_structured_detail_clause()
         if program_need:
@@ -12116,7 +12614,15 @@ def aggregate_by_confidence(
         result["_fallback_risk_features"] = fallback_risk_features
         legacy_preview = legacy_fallback_preview(final_label, extracted, evidence_summary, item)
         result["_legacy_fallback_preview"] = legacy_preview
-        rubric_decision = rubric_fallback_decide(item or {}, extracted, evidence_summary, fallback_risk_features, evidence_non_decidable_state, legacy_preview) if item else {
+        rubric_decision = rubric_fallback_decide(
+            item or {},
+            extracted,
+            evidence_summary,
+            fallback_risk_features,
+            evidence_non_decidable_state,
+            legacy_preview,
+            claim_pipeline_diagnostics,
+        ) if item else {
             "attempted": False,
             "valid": False,
             "skip_reason": "missing_item_context",
@@ -12126,6 +12632,10 @@ def aggregate_by_confidence(
         if isinstance(rubric_decision, dict):
             result["_rubric_skip_reason"] = str(rubric_decision.get("skip_reason") or "")
             result["_rubric_trigger_gate"] = rubric_decision.get("trigger_gate") or {}
+            trigger_gate = result["_rubric_trigger_gate"] if isinstance(result.get("_rubric_trigger_gate"), dict) else {}
+            result["decision_gate_consumed_diagnostics"] = normalize_bool(trigger_gate.get("decision_gate_consumed_diagnostics"), False)
+            result["decision_gate_primary_block"] = str(trigger_gate.get("decision_gate_primary_block") or "")
+            result["reason_source_layer"] = str(trigger_gate.get("reason_source_layer") or "")
             if rubric_decision.get("elapsed_ms") is not None:
                 result["_rubric_elapsed_ms"] = float(rubric_decision.get("elapsed_ms") or 0.0)
             result["_rubric_prior_raw"] = rubric_decision.get("raw") or ""
@@ -12155,6 +12665,17 @@ def aggregate_by_confidence(
                     evidence_non_decidable_state,
                 )
                 result["analyse"] = result["_aggregation_analyse"]
+    if not result.get("decision_gate_consumed_diagnostics"):
+        result["decision_gate_consumed_diagnostics"] = False
+    if not result.get("decision_gate_primary_block"):
+        result["decision_gate_primary_block"] = ""
+    if not result.get("reason_source_layer"):
+        if result.get("_evidence_first_locked"):
+            result["reason_source_layer"] = "evidence_first"
+        elif result.get("_rubric_fallback_policy"):
+            result["reason_source_layer"] = "rubric_fallback"
+        else:
+            result["reason_source_layer"] = "insufficient_reason"
     result["final_label"] = final_label
     if (
         final_label == LABEL_2
@@ -12244,6 +12765,7 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     claims = extracted.get("claims") if isinstance(extracted.get("claims"), list) else []
     retrieval_claims, retrieval_scope_reason, retrieval_scope_trace = claims_for_initial_retrieval(item, extracted)
     retrieval_budget = retrieval_budget_for_initial(item, extracted, retrieval_claims, retrieval_scope_reason)
+    annotate_claim_budget_metadata(claims, retrieval_budget)
     debug["retrieval_scope_reason"] = retrieval_scope_reason
     debug["initial_retrieval_scope_trace"] = retrieval_scope_trace
     debug["retrieval_claim_ids"] = [str(claim.get("claim_id") or claim.get("id") or "") for claim in retrieval_claims]
@@ -12505,6 +13027,9 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
             "_label_source_channel": verify_obj.get("_label_source_channel") or "",
             "_decision_basis": verify_obj.get("_decision_basis") or "",
             "_decision_policy": verify_obj.get("_decision_policy") or "",
+            "decision_gate_consumed_diagnostics": bool(verify_obj.get("decision_gate_consumed_diagnostics")),
+            "decision_gate_primary_block": verify_obj.get("decision_gate_primary_block") or "",
+            "reason_source_layer": verify_obj.get("reason_source_layer") or "",
         }
     )
     debug.update({"stage": "done", "final_result": debug_final_result})

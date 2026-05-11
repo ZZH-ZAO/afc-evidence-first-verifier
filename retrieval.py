@@ -326,6 +326,10 @@ def apply_detail_fetch_trace(
         if trigger:
             stats.setdefault("playwright_reasons", []).append(trigger)
             item["playwright_rescue_trigger"] = trigger
+    if trace.get("playwright_rescue_skipped_by_policy"):
+        stats.setdefault("playwright_skipped_reasons", []).append(str(trace.get("rescue_skip_reason") or "detail_rescue_budget_exhausted"))
+        item["playwright_rescue_skipped_by_policy"] = True
+        item["rescue_skip_reason"] = str(trace.get("rescue_skip_reason") or "detail_rescue_budget_exhausted")
     if trace.get("environment_block_reason"):
         item["environment_block_reason"] = str(trace.get("environment_block_reason") or "")
         increment_named_counter(stats, "environment_block_reasons", str(trace.get("environment_block_reason") or ""))
@@ -450,6 +454,61 @@ def source_family_name(source_name: str) -> str:
     if "sitemap" in text:
         return "sitemap"
     return "other"
+
+
+def source_is_authority_or_news(source_name: str) -> bool:
+    text = normalize_text(str(source_name)).lower()
+    return text in {"domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss"} or source_family_name(text) in {"news_rss", "rss", "sitemap"}
+
+
+def source_is_non_sogou_html(source_name: str) -> bool:
+    text = normalize_text(str(source_name)).lower()
+    return text in {"bing_html", "duckduckgo_html"}
+
+
+def query_needs_authority_pair(
+    query_goal: str,
+    query_family_role: str,
+    source_intent: Optional[Dict[str, Any]] = None,
+) -> bool:
+    evidence_mode = effective_evidence_mode(source_intent or {}, str((source_intent or {}).get("evidence_mode") or ""))
+    return query_family_role in {"closure", "distinguish", "refute"} or (
+        query_goal == "verification_question"
+        and evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+    )
+
+
+def source_order_trace_entry(stage: str, sources: List[str], previous_sources: Optional[List[str]] = None, reason: str = "") -> Dict[str, Any]:
+    prev = [str(item) for item in (previous_sources or []) if str(item)]
+    curr = [str(item) for item in (sources or []) if str(item)]
+    return {
+        "stage": stage,
+        "sources": curr[:10],
+        "changed": curr != prev if prev else False,
+        "reason": reason,
+    }
+
+
+def note_source_order_stage(
+    query_item: Optional[Dict[str, Any]],
+    stage: str,
+    sources: List[str],
+    previous_sources: Optional[List[str]] = None,
+    reason: str = "",
+) -> None:
+    if not isinstance(query_item, dict):
+        return
+    trace = query_item.setdefault("_source_order_trace", [])
+    if not isinstance(trace, list):
+        trace = []
+        query_item["_source_order_trace"] = trace
+    trace.append(source_order_trace_entry(stage, sources, previous_sources, reason))
+
+
+def preserved_authority_pair(selected_sources: List[str]) -> bool:
+    has_authority_or_news = any(source_is_authority_or_news(source_name) for source_name in selected_sources)
+    has_non_sogou_html = any(source_is_non_sogou_html(source_name) for source_name in selected_sources)
+    return has_authority_or_news and has_non_sogou_html
 
 
 def summarize_source_recall_diagnosis(
@@ -629,42 +688,70 @@ def budgeted_source_jobs(
     source_intent: Dict[str, Any],
     query_item: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[tuple[str, str]], Dict[str, Any]]:
-    if limit <= 0 or len(source_jobs) <= limit:
-        return source_jobs, {
-            "applied": False,
-            "limit": limit,
-            "original_count": len(source_jobs),
-            "selected_count": len(source_jobs),
-            "selected_sources": [str(source) for source, _ in source_jobs],
-            "omitted_sources": [],
-            "omitted_families": [],
-            "different_family_omitted": False,
-            "higher_priority_omitted": False,
-            "preserved_family_diversity": False,
-            "high_value_query": False,
-        }
     query_item = query_item if isinstance(query_item, dict) else {}
+    planned_source_order = [str(item) for item in (query_item.get("_planned_source_order") or []) if str(item)]
+    post_role_priority_order = [str(item) for item in (query_item.get("_post_role_priority_order") or []) if str(item)]
     query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
     high_value_query = (
         query_goal in {"verification_question", "find_page_intent_page", "find_route_page", "find_metric_source_page"}
         or query_family_role in {"closure", "distinguish", "refute"}
     )
+    authority_pair_needed = query_needs_authority_pair(query_goal, query_family_role, source_intent)
+
+    def build_result(
+        selected_jobs: List[tuple[str, str]],
+        omitted_jobs: List[tuple[str, str]],
+        *,
+        applied: bool,
+        preserved_family_diversity: bool,
+        priority_drop_stage: str = "",
+        selection_reason: str = "",
+    ) -> Dict[str, Any]:
+        selected_sources = [str(source) for source, _ in selected_jobs]
+        omitted_sources = [str(source) for source, _ in omitted_jobs]
+        top_priority_omitted = [
+            name for name in post_role_priority_order[:limit + 2]
+            if name not in selected_sources
+        ]
+        return {
+            "applied": applied,
+            "limit": limit,
+            "original_count": len(source_jobs),
+            "selected_count": len(selected_jobs),
+            "selected_sources": selected_sources,
+            "omitted_sources": omitted_sources[:6],
+            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted_jobs)[:4],
+            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted_jobs} - {source_family_name(str(source)) for source, _ in selected_jobs}),
+            "higher_priority_omitted": bool(top_priority_omitted),
+            "preserved_family_diversity": preserved_family_diversity,
+            "high_value_query": high_value_query,
+            "planned_source_order": planned_source_order[:10],
+            "post_role_priority_order": post_role_priority_order[:10],
+            "post_budget_selected_order": selected_sources[:10],
+            "priority_source_dropped_stage": priority_drop_stage or ("budget" if top_priority_omitted else ""),
+            "final_source_selection_reason": selection_reason,
+            "authority_pair_preserved": preserved_authority_pair(selected_sources) if authority_pair_needed else False,
+        }
+
+    if limit <= 0 or len(source_jobs) <= limit:
+        return source_jobs, build_result(
+            source_jobs,
+            [],
+            applied=False,
+            preserved_family_diversity=False,
+            selection_reason="within_budget",
+        )
     if limit == 1:
         selected = source_jobs[:1]
         omitted = source_jobs[1:]
-        return selected, {
-            "applied": True,
-            "limit": limit,
-            "original_count": len(source_jobs),
-            "selected_count": len(selected),
-            "selected_sources": [str(source) for source, _ in selected],
-            "omitted_sources": [str(source) for source, _ in omitted][:6],
-            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
-            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(selected[0][0]))}),
-            "higher_priority_omitted": False,
-            "preserved_family_diversity": False,
-            "high_value_query": high_value_query,
-        }
+        return selected, build_result(
+            selected,
+            omitted,
+            applied=True,
+            preserved_family_diversity=False,
+            priority_drop_stage="budget" if omitted else "",
+            selection_reason="single_slot_budget",
+        )
     page_intent = normalize_page_intent(source_intent)
     needed_page_type = str(page_intent.get("needed_page_type") or "")
     preserve_family_diversity = query_goal in {"find_route_page", "find_page_intent_page"} or (
@@ -674,19 +761,14 @@ def budgeted_source_jobs(
     if not preserve_family_diversity:
         selected = source_jobs[:limit]
         omitted = source_jobs[limit:]
-        return selected, {
-            "applied": True,
-            "limit": limit,
-            "original_count": len(source_jobs),
-            "selected_count": len(selected),
-            "selected_sources": [str(source) for source, _ in selected],
-            "omitted_sources": [str(source) for source, _ in omitted][:6],
-            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
-            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(source)) for source, _ in selected}),
-            "higher_priority_omitted": False,
-            "preserved_family_diversity": False,
-            "high_value_query": high_value_query,
-        }
+        return selected, build_result(
+            selected,
+            omitted,
+            applied=True,
+            preserved_family_diversity=False,
+            priority_drop_stage="budget" if omitted else "",
+            selection_reason="head_preserved_without_diversity",
+        )
 
     selected: List[tuple[str, str]] = []
     used_names = set()
@@ -713,7 +795,15 @@ def budgeted_source_jobs(
             used_names.add(source_name)
             return
 
-    if high_value_query and limit >= 2:
+    if authority_pair_needed and limit >= 2:
+        pick_family("authority_or_news", ["domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss"])
+        if len(selected) < limit:
+            pick_family("html", ["bing_html", "duckduckgo_html"])
+        if len(selected) < limit and not any(source_is_authority_or_news(str(source_name)) for source_name, _ in selected):
+            pick_family("news_rss", ["bing_news_zh_rss", "bing_news_rss"])
+        if len(selected) < limit and not any(source_is_non_sogou_html(str(source_name)) for source_name, _ in selected):
+            pick_family("html", ["bing_html", "duckduckgo_html"])
+    elif high_value_query and limit >= 2:
         if query_family_role in {"closure", "distinguish"}:
             pick_family("authority_or_news", ["domain_sitemap", "bing_rss"])
             if len(selected) < limit:
@@ -749,21 +839,19 @@ def budgeted_source_jobs(
     selected = selected[:limit]
     selected_names = {str(source) for source, _ in selected}
     omitted = [job for job in source_jobs if str(job[0]) not in selected_names]
-    selected_indexes = [index for index, job in enumerate(source_jobs) if str(job[0]) in selected_names]
-    omitted_indexes = [index for index, job in enumerate(source_jobs) if str(job[0]) not in selected_names]
-    return selected, {
-        "applied": True,
-        "limit": limit,
-        "original_count": len(source_jobs),
-        "selected_count": len(selected),
-        "selected_sources": [str(source) for source, _ in selected],
-        "omitted_sources": [str(source) for source, _ in omitted][:6],
-        "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
-        "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(source)) for source, _ in selected}),
-        "higher_priority_omitted": bool(selected_indexes and omitted_indexes and min(omitted_indexes) < max(selected_indexes)),
-        "preserved_family_diversity": preserve_family_diversity,
-        "high_value_query": high_value_query,
-    }
+    selection_reason = "family_diversity_budget"
+    if authority_pair_needed:
+        selection_reason = "authority_pair_guarded"
+    elif query_family_role in {"closure", "distinguish", "refute"}:
+        selection_reason = f"{query_family_role}_priority_budget"
+    return selected, build_result(
+        selected,
+        omitted,
+        applied=True,
+        preserved_family_diversity=preserve_family_diversity,
+        priority_drop_stage="budget" if omitted else "",
+        selection_reason=selection_reason,
+    )
 
 
 def clamp_int(value: Any, lower: int, upper: int) -> int:
@@ -4770,6 +4858,7 @@ def dynamic_source_type(
 def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace: Optional[Dict[str, Any]] = None) -> str:
     if not url:
         return ""
+    allow_playwright_rescue = True if not isinstance(trace, dict) else bool(trace.get("allow_playwright_detail_rescue", True))
     cached = cache_get("page", url, max_chars)
     if isinstance(cached, str):
         repaired_cached = repair_mojibake_text(cached)
@@ -4783,13 +4872,21 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_blocked_before_playwright",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_text = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=False)
             except Exception as fallback_exc:
@@ -4847,13 +4944,21 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_blocked_after_fetch",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_text = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=False)
             except Exception as fallback_exc:
@@ -4893,6 +4998,7 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
 def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, Any]] = None) -> str:
     if not url:
         return ""
+    allow_playwright_rescue = True if not isinstance(trace, dict) else bool(trace.get("allow_playwright_detail_rescue", True))
     cached = cache_get("page_html", url, 0)
     if isinstance(cached, str):
         repaired_cached = repair_mojibake_text(cached)
@@ -4906,13 +5012,21 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_html_blocked_before_playwright",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_html = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=True)
             except Exception as fallback_exc:
@@ -4954,13 +5068,21 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_html_blocked_after_fetch",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_html = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=True)
             except Exception as fallback_exc:
@@ -5150,6 +5272,10 @@ def source_plan_for_query_goal(
     query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
     source_preference = query_item.get("source_preference") if isinstance(query_item.get("source_preference"), list) else []
     sources = source_plan_for_query(source_plan, query)
+    initial_sources = list(sources)
+    query_item["_source_order_trace"] = []
+    query_item["_planned_source_order"] = initial_sources[:10]
+    note_source_order_stage(query_item, "planned_source_order", initial_sources, reason="source_plan_for_query")
     evidence_mode = effective_evidence_mode(source_intent, str(source_intent.get("evidence_mode") or ""))
     if query_goal == "find_metric_source_page":
         priority_sources = ["bing_html", "sogou_html", "bing_rss"]
@@ -5158,17 +5284,26 @@ def source_plan_for_query_goal(
         priority_sources.extend(["bing_news_zh_rss", "bing_news_rss"])
         sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
         sources = reorder_sources_by_query_preference(sources, query_goal, query, [str(item) for item in source_preference])
-        return finalize_route_source_plan(sources, source_intent, query_goal)
+        note_source_order_stage(query_item, "post_role_priority_order", sources, initial_sources, "metric_source_priority")
+        sources = finalize_route_source_plan(sources, source_intent, query_goal)
+        note_source_order_stage(query_item, "post_route_finalize_order", sources, query_item.get("_post_role_priority_order") or initial_sources, "route_finalize")
+        query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
+        return sources
     if query_goal == "find_page_intent_page":
         priority_sources = ["bing_html", "sogou_html"]
         if ENABLE_DUCKDUCKGO:
             priority_sources.append("duckduckgo_html")
         priority_sources.extend(["bing_news_rss", "bing_news_zh_rss", "bing_rss"])
-        return reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+        sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+        note_source_order_stage(query_item, "post_role_priority_order", sources, initial_sources, "page_intent_priority")
+        query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
+        return sources
     profile = retrieval_profile(source_intent)
     priority_sources = profile_sources_for_goal(profile, query_goal, query, source_intent)
     if priority_sources:
+        before_priority = list(sources)
         sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+        note_source_order_stage(query_item, "profile_priority_order", sources, before_priority, "profile_sources_for_goal")
     role_priority: List[str] = []
     if query_family_role == "closure":
         role_priority = ["domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss", "bing_html"]
@@ -5182,16 +5317,26 @@ def source_plan_for_query_goal(
         insert_after = role_priority.index("bing_html") + 1 if "bing_html" in role_priority else len(role_priority)
         role_priority = role_priority[:insert_after] + ["duckduckgo_html"] + role_priority[insert_after:]
     if role_priority:
+        before_role = list(sources)
         sources = reorder_sources_by_priority_order(dedupe_keep_order(role_priority + sources), role_priority)
+        note_source_order_stage(query_item, "role_priority_order", sources, before_role, "query_family_role")
+    before_shape = list(sources)
     sources = reorder_sources_by_evidence_shape(sources, source_intent)
+    note_source_order_stage(query_item, "evidence_shape_order", sources, before_shape, "reorder_sources_by_evidence_shape")
+    before_preference = list(sources)
     sources = reorder_sources_by_query_preference(sources, query_goal, query, [str(item) for item in source_preference])
-    authority_first = query_family_role in {"closure", "distinguish", "refute"} or (
-        query_goal == "verification_question"
-        and evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
-    )
+    note_source_order_stage(query_item, "query_preference_order", sources, before_preference, "reorder_sources_by_query_preference")
+    authority_first = query_needs_authority_pair(query_goal, query_family_role, source_intent)
     if authority_first and "sogou_html" in sources:
+        before_sogou = list(sources)
         sources = [item for item in sources if item != "sogou_html"] + ["sogou_html"]
+        note_source_order_stage(query_item, "authority_first_sogou_demoted", sources, before_sogou, "non_sogou_html_preferred")
+    query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
+    note_source_order_stage(query_item, "post_role_priority_order", sources, initial_sources, "pre_budget_contract")
+    before_finalize = list(sources)
     sources = finalize_route_source_plan(sources, source_intent, query_goal)
+    note_source_order_stage(query_item, "post_route_finalize_order", sources, before_finalize, "finalize_route_source_plan")
+    query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
     if query_goal != "verification_question" or not ENABLE_QA_ENHANCED_SOURCES:
         return sources
     return sources
@@ -5262,13 +5407,18 @@ def infer_playwright_rescue_state(stats: Dict[str, Any]) -> str:
     playwright_rescued = int(stats.get("playwright_rescued", 0) or 0)
     playwright_queries = stats.get("playwright_queries") if isinstance(stats.get("playwright_queries"), list) else []
     skipped_reasons = stats.get("playwright_skipped_reasons") if isinstance(stats.get("playwright_skipped_reasons"), list) else []
+    family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
+    serp_count = int(family_rescue_budget_used.get("serp_count", 0) or 0)
+    detail_count = int(family_rescue_budget_used.get("detail_count", 0) or 0)
     pollution = stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}
     playwright_bucket = pollution.get("playwright_duckduckgo") if isinstance(pollution.get("playwright_duckduckgo"), dict) else {}
     playwright_calls = int(playwright_bucket.get("calls", 0) or 0)
     playwright_raw = int(playwright_bucket.get("raw", 0) or 0)
-    if playwright_rescued > 0 or playwright_raw > 0:
+    rescue_success_gate = str(stats.get("rescue_success_gate") or "")
+    rescue_roi_state = str(stats.get("rescue_roi_state") or "")
+    if playwright_rescued > 0 or playwright_raw > 0 or rescue_success_gate or rescue_roi_state in {"search_result_recovered", "detail_content_recovered", "detail_candidates_recovered"}:
         return "playwright_rescue_succeeded"
-    if playwright_calls > 0 or playwright_queries:
+    if playwright_calls > 0 or playwright_queries or serp_count > 0 or detail_count > 0:
         return "playwright_rescue_failed"
     if skipped_reasons:
         return "playwright_rescue_skipped_by_policy"
@@ -5352,6 +5502,7 @@ def summarize_search_execution_trace(stats: Dict[str, Any]) -> Dict[str, Any]:
     effective_source_plan = [str(item) for item in (stats.get("effective_source_plan") or []) if str(item)][:10]
     source_budget_cutoff = stats.get("source_budget_cutoff") if isinstance(stats.get("source_budget_cutoff"), dict) else {}
     provider_health_snapshot = stats.get("provider_health_snapshot") if isinstance(stats.get("provider_health_snapshot"), list) else []
+    first_row = executed_plan[0] if executed_plan and isinstance(executed_plan[0], dict) else {}
     return {
         "query_count": int(stats.get("query_count", 0) or 0),
         "planned_query_count": int(stats.get("planned_query_count", 0) or 0),
@@ -5363,6 +5514,8 @@ def summarize_search_execution_trace(stats: Dict[str, Any]) -> Dict[str, Any]:
         "playwright_rescue_roles": dedupe_keep_order([str(item) for item in (stats.get("playwright_roles") or []) if str(item)])[:4],
         "playwright_rescue_triggers": dedupe_keep_order([str(item) for item in (stats.get("playwright_reasons") or []) if str(item)])[:4],
         "detail_fetch_paths": stats.get("detail_fetch_paths", {}) if isinstance(stats.get("detail_fetch_paths"), dict) else {},
+        "source_order_trace": first_row.get("source_order_trace", []) if isinstance(first_row, dict) else [],
+        "final_executed_source_order": first_row.get("final_executed_source_order", []) if isinstance(first_row, dict) else [],
     }
 
 
@@ -5911,6 +6064,76 @@ def structured_noise_features(query: str, item: Dict[str, Any], evidence_mode: s
             "evidence_dates": evidence_dates[:6],
         },
     }
+
+
+def structured_title_marker_hit(evidence_mode: str, item: Dict[str, Any]) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    text = normalize_text(f"{item.get('title', '')} {item.get('snippet', '')}").lower()
+    marker_patterns = {
+        "numeric_fact": r"(汇率|中间价|牌价|外汇|fx|forex|rate|price|quote|usd|cny|eur|gbp|jpy)",
+        "date_fact": r"(日期|公布|发布|时间|date|announce|release|notice|calendar)",
+        "schedule_fact": r"(休市|交易日|开市|开盘|收盘|schedule|calendar|holiday|trading|market)",
+        "event_result": r"(赛果|比分|冠军|胜|负|result|winner|beat|score|final)",
+    }
+    pattern = marker_patterns.get(mode)
+    if not pattern:
+        return False
+    return bool(re.search(pattern, text, flags=re.I))
+
+
+def is_recoverable_structured_penalty_item(
+    query: str,
+    item: Dict[str, Any],
+    evidence_mode: str,
+) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    if mode not in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}:
+        return False
+    source_type = str(item.get("source_type") or "")
+    if source_type not in {"official", "news", "finance", "unknown"}:
+        return False
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        return False
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type in {"landing_page", "search_result_page"}:
+        return False
+    page_retention_score = int(item.get("page_retention_score") or 0)
+    page_utility_score = int(item.get("page_utility_score") or 0)
+    answer_quality = int(item.get("answer_candidate_quality_score") or 0)
+    metric_score = int(item.get("metric_table_score") or 0)
+    directness = int(item.get("directness_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    task_card_score = int(item.get("task_card_score") or 0)
+    evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+    evidence_contract_score = int(item.get("evidence_contract_score") or 0)
+    structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    structured_penalty = int(item.get("structured_noise_penalty") or 0)
+    strong_page_type = page_type in STRUCTURED_REVIEW_PAGE_TYPES
+    title_marker_hit = structured_title_marker_hit(mode, item)
+    query_has_numeric = bool(extract_numeric_markers(query or ""))
+    strong_signal = (
+        answer_quality >= 8
+        or metric_score >= 6
+        or directness >= 2
+        or (evidence_contract_status in {"partial", "satisfied"} and evidence_contract_score >= 35)
+        or structured_point_status in {"partial", "satisfied"}
+    )
+    if not strong_signal:
+        return False
+    if page_retention_score < 46 and page_utility_score < 48:
+        return False
+    if relevance < 1 and entity_hits < 1 and task_card_score < 10:
+        return False
+    if not (strong_page_type or title_marker_hit or source_type in {"official", "finance"}):
+        return False
+    if source_type == "unknown" and not (strong_page_type and title_marker_hit and answer_quality >= 10):
+        return False
+    if query_has_numeric and not title_marker_hit and metric_score < 6 and answer_quality < 10:
+        return False
+    if structured_penalty >= 24 and source_type not in {"official", "finance"}:
+        return False
+    return True
 
 
 def extract_temporal_markers(text: str) -> List[str]:
@@ -8569,6 +8792,7 @@ CLAIM_ALIGNED_FACT_LOW_REASONS = {
     "weak_source_low_relevance",
     "low_relevance",
     "source_quality_bad",
+    "structured_noise_review_candidate",
 }
 PREFILTER_RESCUE_ALLOWED_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
 PREFILTER_RESCUE_ALLOWED_SOURCE_TYPES = {"official", "news", "encyclopedia"}
@@ -8605,6 +8829,17 @@ FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS = PREFILTER_RESCUE_HARD_FILTER_REASONS |
     "search_engine_result_page",
     "landing_page",
     "hard_noise_page",
+}
+
+STRUCTURED_REVIEW_PAGE_TYPES = {
+    "quote_page",
+    "historical_table",
+    "official_notice",
+    "calendar_page",
+    "result_page",
+    "event_detail",
+    "current_status_page",
+    "mixed_page",
 }
 
 
@@ -8691,6 +8926,268 @@ def fact_like_keep_review_allowed(claim_item: Optional[Dict[str, Any]], evidence
     if centrality == "core":
         return True
     return centrality == "supporting" and str(evidence_mode or "") in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
+
+
+CORE_SECOND_PASS_ALLOWED_MODES = {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+CORE_SECOND_PASS_ALLOWED_PAGE_TYPES = {
+    "result_page",
+    "event_detail",
+    "calendar_page",
+    "quote_page",
+    "historical_table",
+    "official_notice",
+    "current_status_page",
+    "mixed_page",
+    "route_analysis_page",
+    "route_passage_page",
+}
+CORE_SECOND_PASS_STRONG_PAGE_TYPES = {
+    "result_page",
+    "event_detail",
+    "calendar_page",
+    "quote_page",
+    "historical_table",
+    "official_notice",
+}
+CORE_SECOND_PASS_ROUTE_PAGE_TYPES = {
+    "route_analysis_page",
+    "route_passage_page",
+    "mixed_page",
+}
+CORE_SECOND_PASS_ALLOWED_SOURCE_TYPES = {"official", "news", "encyclopedia", "unknown"}
+CORE_SECOND_PASS_STRUCTURED_SOURCE_TYPES = CORE_SECOND_PASS_ALLOWED_SOURCE_TYPES | {"finance"}
+DETAIL_RESCUE_ALLOWED_PAGE_TYPES = {
+    "official_notice",
+    "calendar_page",
+    "historical_table",
+    "result_page",
+    "event_detail",
+    "current_status_page",
+}
+
+
+def core_second_pass_keep_review_allowed(
+    claim_item: Optional[Dict[str, Any]],
+    evidence_mode: str,
+    raw_results_so_far: int,
+    kept_web_so_far: int,
+) -> bool:
+    if str(evidence_mode or "") not in CORE_SECOND_PASS_ALLOWED_MODES:
+        return False
+    if not isinstance(claim_item, dict):
+        return False
+    centrality = str(claim_item.get("centrality") or "")
+    priority = str(claim_item.get("_claim_budget_priority") or "")
+    mode = policy_mode_label(evidence_mode)
+    allowed = centrality == "core" and priority == "core_critical"
+    if not allowed and mode == "route_fact":
+        allowed = centrality == "supporting" and priority == "supporting_high_risk"
+    if not allowed:
+        return False
+    return raw_results_so_far > 0 and kept_web_so_far <= 0
+
+
+def core_second_pass_source_type_allowed(source_type: str, evidence_mode: str) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    if mode in {"numeric_fact", "date_fact", "schedule_fact"}:
+        return source_type in CORE_SECOND_PASS_STRUCTURED_SOURCE_TYPES
+    return source_type in CORE_SECOND_PASS_ALLOWED_SOURCE_TYPES
+
+
+def core_second_pass_signal_summary(
+    query: str,
+    item: Dict[str, Any],
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    signal = fact_slot_signal_summary(query, item, evidence_mode, claim_item)
+    page_type = str(item.get("page_utility_page_type") or "")
+    route_sentence = item.get("route_sentence") if isinstance(item.get("route_sentence"), dict) else {}
+    page_components = item.get("page_utility_components") if isinstance(item.get("page_utility_components"), dict) else {}
+    relation_evidence = int(page_components.get("relation_evidence") or 0)
+    answerability = int(page_components.get("answerability") or 0)
+    entity_grounding = int(page_components.get("entity_grounding") or 0)
+    structural_extractability = int(page_components.get("structural_extractability") or 0)
+    has_answer_candidates = bool(item.get("answer_candidates")) and isinstance(item.get("answer_candidates"), list)
+    route_signal = (
+        page_type in CORE_SECOND_PASS_ROUTE_PAGE_TYPES
+        and (
+            relation_evidence >= 1
+            or answerability >= 1
+            or bool(route_sentence.get("direct_sentence"))
+            or bool(route_sentence.get("has_relation_marker"))
+            or bool(route_sentence.get("has_route_object_marker"))
+        )
+        and entity_grounding >= 1
+        and structural_extractability >= 1
+    )
+    signal.update(
+        {
+            "page_type": page_type,
+            "strong_page_type": page_type in CORE_SECOND_PASS_STRONG_PAGE_TYPES,
+            "route_signal": route_signal,
+            "route_relation_evidence": relation_evidence,
+            "route_answerability": answerability,
+            "route_entity_grounding": entity_grounding,
+            "route_structural_extractability": structural_extractability,
+            "has_answer_candidates": has_answer_candidates,
+        }
+    )
+    return signal
+
+
+def maybe_promote_core_second_pass_keep_review(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]],
+    raw_results_so_far: int,
+    kept_web_so_far: int,
+) -> tuple[bool, str]:
+    if not core_second_pass_keep_review_allowed(claim_item, evidence_mode, raw_results_so_far, kept_web_so_far):
+        return False, filter_reason
+    item["second_pass_keep_review_used"] = True
+    item["second_pass_keep_review_reason"] = filter_reason
+    mode = policy_mode_label(evidence_mode)
+    source_type = str(item.get("source_type") or "")
+    signal = core_second_pass_signal_summary(query, item, mode, claim_item)
+    if not core_second_pass_source_type_allowed(source_type, mode):
+        item["core_keep_review_block_reason"] = "source_type_not_allowed"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    allow_structured_noise_exception = (
+        filter_reason == "structured_noise_high_penalty"
+        and mode in {"numeric_fact", "date_fact", "schedule_fact"}
+        and bool(signal.get("strong_page_type"))
+        and bool(signal.get("subject_time_hit"))
+        and bool(signal.get("metric_or_status_hit"))
+        and (
+            bool(signal.get("has_answer_candidates"))
+            or int(signal.get("answer_quality") or 0) >= 4
+            or int(signal.get("directness") or 0) >= 2
+        )
+    )
+    if ((filter_reason in FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS) and not allow_structured_noise_exception) or not claim_aligned_page_shape_ok(item):
+        item["core_keep_review_block_reason"] = "page_shape_hard_drop"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        item["core_keep_review_block_reason"] = "utility_drop_decision"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type not in CORE_SECOND_PASS_ALLOWED_PAGE_TYPES:
+        item["core_keep_review_block_reason"] = "page_type_not_decision_useful"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    anchor_hits = signal.get("anchor_hits") if isinstance(signal.get("anchor_hits"), list) else claim_anchor_bucket_hits(query, item, mode, claim_item)
+    anchor_hit_set = {str(hit) for hit in anchor_hits if str(hit)}
+    subject_like = bool(anchor_hit_set & {"subject", "entity", "actor"})
+    time_like = bool(anchor_hit_set & {"time", "time_scope"})
+    fact_like = bool(anchor_hit_set & {"event", "status", "metric", "metric_or_relation", "status_or_result"})
+    route_mode = is_route_like_mode(mode)
+    if route_mode:
+        if not subject_like or not bool(signal.get("route_signal")):
+            item["core_keep_review_block_reason"] = "anchor_slots_not_closed"
+            item["page_keep_review_state"] = "core_near_miss_still_rejected"
+            return False, filter_reason
+    elif len(anchor_hits) < 2 or not ((subject_like and time_like) or (subject_like and fact_like) or (time_like and fact_like)):
+        item["core_keep_review_block_reason"] = "anchor_slots_not_closed"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    page_retention_score = int(signal.get("page_retention_score") or item.get("page_retention_score") or 0)
+    page_utility_score = int(signal.get("page_utility_score") or item.get("page_utility_score") or 0)
+    directness = int(signal.get("directness") or item.get("directness_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    answer_quality = int(signal.get("answer_quality") or item.get("answer_candidate_quality_score") or 0)
+    evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+    structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    strong_page_type = bool(signal.get("strong_page_type"))
+    has_answer_candidates = bool(signal.get("has_answer_candidates"))
+    promotable_signal = (
+        directness >= (1 if strong_page_type else 2)
+        or answer_quality >= (4 if strong_page_type else 5)
+        or evidence_contract_status in {"partial", "satisfied"}
+        or structured_point_status in {"partial", "satisfied"}
+        or (has_answer_candidates and strong_page_type and answer_quality >= 3)
+        or (route_mode and bool(signal.get("route_signal")))
+    )
+    min_retention_score = 34
+    min_utility_score = 34
+    if strong_page_type:
+        min_retention_score = 30
+        min_utility_score = 30
+    if route_mode and bool(signal.get("route_signal")):
+        min_retention_score = 32
+        min_utility_score = 30
+    if page_retention_score < min_retention_score or page_utility_score < min_utility_score or (relevance < 1 and entity_hits < 1):
+        item["core_keep_review_block_reason"] = "page_signal_too_weak"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    if not promotable_signal:
+        item["core_keep_review_block_reason"] = "candidate_signal_too_weak"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    item["page_keep_review_state"] = "core_near_miss_kept"
+    item["page_keep_review_reason"] = filter_reason
+    item["core_keep_review_profile"] = (
+        "route_relation_near_miss"
+        if route_mode
+        else ("strong_fact_page_near_miss" if strong_page_type else "general_fact_page_near_miss")
+    )
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = source_type
+    item["second_pass_keep_recovered_count"] = 1
+    item["program_used_for_retention"] = True
+    item["soft_keep_anchor_buckets"] = anchor_hits
+    item["program_anchor_buckets"] = list(anchor_hits or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    return True, "core_second_pass_keep_review"
+
+
+def should_allow_playwright_detail_rescue(
+    item: Dict[str, Any],
+    claim_item: Optional[Dict[str, Any]],
+    evidence_mode: str,
+    used_playwright_detail_rescues: int,
+) -> tuple[bool, str]:
+    if used_playwright_detail_rescues >= 1:
+        return False, "detail_rescue_budget_exhausted"
+    centrality = str((claim_item or {}).get("centrality") or "supporting")
+    source_intent = (claim_item or {}).get("source_intent") if isinstance((claim_item or {}).get("source_intent"), dict) else {}
+    if not playwright_rescue_mode_allowed(evidence_mode, centrality, source_intent):
+        return False, "detail_rescue_policy_not_allowed"
+    if not claim_aligned_page_shape_ok(item):
+        return False, "detail_rescue_page_shape_not_allowed"
+    if str(item.get("source_quality_label") or "") == "bad":
+        return False, "detail_rescue_bad_source_quality"
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type not in DETAIL_RESCUE_ALLOWED_PAGE_TYPES:
+        return False, "detail_rescue_page_type_not_allowed"
+    return True, ""
+
+
+def finalize_detail_rescue_effect(stats: Dict[str, Any], item: Dict[str, Any], keep_item: bool) -> None:
+    if not item.get("_detail_rescue_playwright_used"):
+        return
+    candidate_gain = len(item.get("answer_candidates") or []) if isinstance(item.get("answer_candidates"), list) else 0
+    page_type = str(item.get("page_utility_page_type") or "") or "detail_page"
+    stats["detail_rescue_target_page_type"] = page_type
+    if candidate_gain > 0:
+        stats["detail_rescue_roi_state"] = "detail_candidates_recovered"
+        stats["detail_rescue_effect_delta"] = {"candidate_gain": candidate_gain, "kept_gain": 1 if keep_item else 0}
+        stats["rescue_success_gate"] = "detail_candidates_recovered"
+        stats["rescue_progress_delta"] = {"raw_delta": 0, "kept_delta": 1 if keep_item else 0, "stage": "detail_candidates_recovered"}
+        stats["rescue_roi_state"] = "detail_candidates_recovered"
+        return
+    if keep_item:
+        stats["detail_rescue_roi_state"] = "detail_page_kept_after_rescue"
+        stats["detail_rescue_effect_delta"] = {"candidate_gain": 0, "kept_gain": 1}
+        stats["rescue_roi_state"] = "detail_page_kept_after_rescue"
+        return
+    stats["detail_rescue_failure_reason"] = "detail_rescue_content_loaded_but_not_extractable"
 
 
 def claim_needs_opening_slot(claim_item: Optional[Dict[str, Any]], evidence_mode: str, query: str = "") -> bool:
@@ -8831,6 +9328,13 @@ def maybe_promote_fact_page_keep_review(
     apply_fact_page_keep_review_annotations(item, "recoverable_near_miss_promoted", filter_reason, signal)
     item["readiness_promotion_used"] = True
     item["readiness_promotion_source"] = "fact_page_keep_review"
+    item["page_keep_review_state"] = "kept_review"
+    item["page_keep_review_reason"] = filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = str(item.get("source_type") or "")
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
     item["program_used_for_retention"] = True
     return True, "fact_page_keep_review"
 
@@ -8958,6 +9462,112 @@ def annotate_soft_kept_claim_aligned_item(
     item["kept_by_soft_claim_alignment"] = True
     item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
     item["soft_keep_original_filter_reason"] = original_filter_reason
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    item["program_used_for_retention"] = True
+
+
+def annotate_soft_kept_structured_metric_item(
+    item: Dict[str, Any],
+    query: str,
+    evidence_mode: str,
+    original_filter_reason: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> None:
+    item["page_keep_review_state"] = "kept_review"
+    item["page_keep_review_reason"] = original_filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = str(item.get("source_type") or "")
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    item["program_used_for_retention"] = True
+
+
+KEY_EVIDENCE_KEEP_PAGE_TYPES = {
+    "result_page",
+    "event_detail",
+    "calendar_page",
+    "quote_page",
+    "historical_table",
+    "official_notice",
+    "mixed_page",
+    "current_status_page",
+}
+
+
+def should_soft_keep_key_evidence_page(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    if mode not in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}:
+        return False
+    if filter_reason in {
+        "site_domain_mismatch",
+        "search_engine_result_page",
+        "sitemap_generic_landing_page",
+        "official_structured_discovery_stub",
+    }:
+        return False
+    source_type = str(item.get("source_type") or "")
+    if source_type not in {"official", "news", "encyclopedia"}:
+        return False
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        return False
+    claim_item = claim_item if isinstance(claim_item, dict) else {}
+    task_card = claim_item.get("evidence_task_card") if isinstance(claim_item.get("evidence_task_card"), dict) else {}
+    centrality = str(claim_item.get("centrality") or "supporting")
+    priority_label = str(task_card.get("priority_label") or "normal")
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type not in KEY_EVIDENCE_KEEP_PAGE_TYPES:
+        return False
+    page_retention_score = int(item.get("page_retention_score") or 0)
+    page_utility_score = int(item.get("page_utility_score") or 0)
+    directness = int(item.get("directness_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    answer_quality = int(item.get("answer_candidate_quality_score") or 0)
+    anchor_hits = claim_anchor_bucket_hits(query, item, mode, claim_item)
+    anchor_hit_set = {str(hit) for hit in anchor_hits if str(hit)}
+    subject_like = bool(anchor_hit_set & {"subject", "entity", "actor"})
+    time_like = bool(anchor_hit_set & {"time", "time_scope"})
+    fact_like = bool(anchor_hit_set & {"event", "status", "metric", "metric_or_relation", "status_or_result"})
+    if len(anchor_hits) < 2:
+        return False
+    if not ((subject_like and time_like) or (subject_like and fact_like) or (time_like and fact_like)):
+        return False
+    if centrality == "core" or priority_label in {"critical", "high"}:
+        return (
+            page_retention_score >= 44
+            and page_utility_score >= 42
+            and relevance >= 1
+            and (entity_hits >= 1 or directness >= 2 or answer_quality >= 6)
+        )
+    return (
+        page_retention_score >= 52
+        and page_utility_score >= 48
+        and relevance >= 2
+        and entity_hits >= 1
+        and (directness >= 1 or answer_quality >= 6)
+    )
+
+
+def annotate_key_evidence_page_keep(
+    item: Dict[str, Any],
+    query: str,
+    evidence_mode: str,
+    original_filter_reason: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> None:
+    item["page_keep_review_state"] = "kept_review"
+    item["page_keep_review_reason"] = original_filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = str(item.get("source_type") or "")
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
     item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
     item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
     item["program_used_for_retention"] = True
@@ -9124,9 +9734,16 @@ def web_evidence_filter_reason(query: str, item: Dict[str, Any], evidence_mode: 
             return True, "kept_weak_route_utility_page"
         return False, "route_weak_no_direct_sentence"
     if is_structured_fact_mode(mode):
+        recoverable_structured_penalty = (
+            structured_penalty >= 14
+            and source_type != "official"
+            and is_recoverable_structured_penalty_item(query, item, mode)
+        )
         if structured_penalty >= 14 and source_type != "official":
             if (official_like_structured or strong_news_fact_page) and structured_penalty < 22:
                 return True, "kept_official_like_structured_despite_penalty"
+            if recoverable_structured_penalty:
+                return False, "structured_noise_review_candidate"
             return False, "structured_noise_high_penalty"
         if "structured_no_entity_hit" in structured_reasons and source_type in {"unknown", "forum", "encyclopedia"}:
             return False, "structured_noise_no_entity_weak_source"
@@ -9222,7 +9839,7 @@ def should_soft_keep_structured_metric_item(
 ) -> bool:
     if not is_structured_fact_mode(evidence_mode):
         return False
-    if filter_reason not in {"source_quality_bad", "weak_source_low_relevance", "structured_noise_high_penalty", "low_relevance"}:
+    if filter_reason not in {"source_quality_bad", "weak_source_low_relevance", "structured_noise_high_penalty", "structured_noise_review_candidate", "low_relevance"}:
         return False
     priority_label = str(task_card.get("priority_label") or "")
     if priority_label not in {"critical", "high", "normal"}:
@@ -9239,6 +9856,9 @@ def should_soft_keep_structured_metric_item(
     answer_quality = int(item.get("answer_candidate_quality_score") or 0)
     evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
     evidence_contract_score = int(item.get("evidence_contract_score") or 0)
+    title_marker_hit = structured_title_marker_hit(evidence_mode, item)
+    page_type = str(item.get("page_utility_page_type") or "")
+    strong_page_type = page_type in STRUCTURED_REVIEW_PAGE_TYPES
     if (
         evidence_contract_status in {"partial", "satisfied"}
         and evidence_contract_score >= 45
@@ -9246,6 +9866,18 @@ def should_soft_keep_structured_metric_item(
         and answer_quality >= 8
         and source_type in {"official", "news", "finance", "unknown"}
     ):
+        return True
+    if filter_reason == "structured_noise_review_candidate":
+        if page_retention_score < 46 and page_utility_score < 48:
+            return False
+        if directness < 2 and answer_quality < 8 and metric_score < 6:
+            return False
+        if relevance < 1 and entity_hits < 1 and answer_quality < 10:
+            return False
+        if not (strong_page_type or title_marker_hit or source_type in {"official", "finance"}):
+            return False
+        if source_type == "unknown" and not (strong_page_type and title_marker_hit and answer_quality >= 10):
+            return False
         return True
     if metric_score < 6:
         return False
@@ -9770,6 +10402,96 @@ def add_timing(stats: Dict[str, Any], name: str, elapsed: float) -> None:
     item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + elapsed, 3)
 
 
+def timing_seconds(stats: Dict[str, Any], name: str) -> float:
+    timings = stats.get("source_timings") if isinstance(stats.get("source_timings"), dict) else {}
+    bucket = timings.get(name) if isinstance(timings.get(name), dict) else {}
+    return float(bucket.get("seconds", 0.0) or 0.0)
+
+
+def record_rescue_budget_event(
+    stats: Dict[str, Any],
+    rescue_type: str,
+    family: str,
+    state: str,
+    latency_ms: float = 0.0,
+    skip_reason: str = "",
+) -> None:
+    family_key = normalize_text(str(family or "")) or "unknown"
+    rescue_key = f"{normalize_text(str(rescue_type or 'unknown'))}_count"
+    budget = stats.setdefault(
+        "family_rescue_budget_used",
+        {
+            "serp_count": 0,
+            "detail_count": 0,
+            "families": {},
+        },
+    )
+    budget[rescue_key] = int(budget.get(rescue_key, 0) or 0) + (1 if state in {"succeeded", "failed"} else 0)
+    families = budget.setdefault("families", {})
+    family_bucket = families.setdefault(
+        family_key,
+        {"serp": {"succeeded": 0, "failed": 0}, "detail": {"succeeded": 0, "failed": 0}},
+    )
+    if state in {"succeeded", "failed"}:
+        family_bucket.setdefault(rescue_type, {"succeeded": 0, "failed": 0})
+        family_bucket[rescue_type][state] = int(family_bucket[rescue_type].get(state, 0) or 0) + 1
+    if latency_ms > 0:
+        stats["rescue_latency_ms"] = round(float(stats.get("rescue_latency_ms", 0.0) or 0.0) + latency_ms, 1)
+    if skip_reason:
+        skips = stats.setdefault("rescue_skip_reasons", {})
+        skips[skip_reason] = int(skips.get(skip_reason, 0) or 0) + 1
+
+
+def source_timing_stage_profile(stats: Dict[str, Any]) -> Dict[str, Any]:
+    timings = stats.get("source_timings") if isinstance(stats.get("source_timings"), dict) else {}
+    search_seconds = 0.0
+    detail_seconds = 0.0
+    official_discovery_seconds = timing_seconds(stats, "official_discovery")
+    slow_sources: List[Dict[str, Any]] = []
+    for name, bucket in timings.items():
+        if not isinstance(bucket, dict):
+            continue
+        seconds = float(bucket.get("seconds", 0.0) or 0.0)
+        calls = int(bucket.get("calls", 0) or 0)
+        if name == "fetch_detail":
+            detail_seconds += seconds
+            continue
+        if name.endswith("_precheck") or name == "official_discovery":
+            continue
+        search_seconds += seconds
+        if calls > 0 and seconds >= 4.0:
+            slow_sources.append(
+                {
+                    "source": str(name),
+                    "seconds": round(seconds, 3),
+                    "calls": calls,
+                }
+            )
+    slow_sources.sort(key=lambda item: (item.get("seconds", 0.0), item.get("calls", 0)), reverse=True)
+    return {
+        "official_discovery_seconds": round(official_discovery_seconds, 3),
+        "search_seconds": round(search_seconds, 3),
+        "detail_fetch_seconds": round(detail_seconds, 3),
+        "slow_sources": slow_sources[:5],
+    }
+
+
+def source_family_stop_loss_triggered(
+    stats: Dict[str, Any],
+    source_name: str,
+    slow_threshold_sec: float = 6.0,
+) -> str:
+    bucket = source_pollution_bucket(stats, source_name)
+    seconds = timing_seconds(stats, source_name)
+    if int(bucket.get("anti_bot_blocks", 0) or 0) >= 1 and int(bucket.get("requests_blocked_playwright_failed", 0) or 0) >= 1:
+        return "anti_bot_and_rescue_failed"
+    if int(bucket.get("raw", 0) or 0) <= 0 and int(bucket.get("calls", 0) or 0) >= 1 and seconds >= slow_threshold_sec:
+        return "empty_and_slow"
+    if int(bucket.get("playwright_failed", 0) or 0) >= 1:
+        return "repeated_rescue_failed"
+    return ""
+
+
 def add_filtered_sample(stats: Dict[str, Any], reason: str, item: Dict[str, Any]) -> None:
     samples = stats.setdefault("filtered_samples", [])
     if len(samples) >= 8:
@@ -10099,8 +10821,10 @@ def expand_official_inner_link_candidates(
             keep_item = True
             filter_reason = "soft_keep_high_priority_structured_candidate"
         if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
+            original_filter_reason = filter_reason
             keep_item = True
             filter_reason = "soft_keep_structured_metric_table_candidate"
+            annotate_soft_kept_structured_metric_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
         if not keep_item and should_soft_keep_claim_aligned_fact_item(source_query, item, filter_reason, evidence_mode, claim_item):
             original_filter_reason = filter_reason
             keep_item = True
@@ -11622,6 +12346,10 @@ def diagnose_claim_retrieval(
     direct_candidate_rescue_used = sum(1 for item in web_items if isinstance(item, dict) and item.get("direct_candidate_rescue_used"))
     direct_candidate_rescue_sources = count_item_field_values(web_items, "direct_candidate_rescue_source")
     direct_candidate_rescue_stages = count_item_field_values(web_items, "direct_candidate_rescue_stage")
+    page_keep_review_state = count_item_field_values(web_items, "page_keep_review_state")
+    page_keep_review_reason = count_item_field_values(web_items, "page_keep_review_reason")
+    kept_candidate_source_type = count_item_field_values(web_items, "kept_candidate_source_type")
+    kept_progress_from_raw = sum(1 for item in web_items if isinstance(item, dict) and item.get("kept_progress_from_raw"))
     rescue_promoted_from_filter = sum(1 for item in web_items if isinstance(item, dict) and item.get("rescue_promoted_from_filter"))
     readiness_promotion_used = sum(1 for item in web_items if isinstance(item, dict) and item.get("readiness_promotion_used"))
     readiness_promotion_source = count_item_field_values(web_items, "readiness_promotion_source")
@@ -11695,6 +12423,47 @@ def diagnose_claim_retrieval(
     search_request = stats.get("search_request") if isinstance(stats.get("search_request"), dict) else {}
     search_policy = stats.get("search_policy") if isinstance(stats.get("search_policy"), dict) else {}
     search_execution_trace = summarize_search_execution_trace(stats)
+    executed_query_rows = stats.get("executed_query_source_plan") if isinstance(stats.get("executed_query_source_plan"), list) else []
+    source_order_trace = []
+    final_executed_source_order: List[str] = []
+    priority_source_dropped_stage = ""
+    final_source_selection_reason = ""
+    authority_pair_preserved = False
+    for row in executed_query_rows:
+        if not isinstance(row, dict):
+            continue
+        if not source_order_trace and isinstance(row.get("source_order_trace"), list):
+            source_order_trace = row.get("source_order_trace", [])[:8]
+        final_executed_source_order.extend([str(item) for item in (row.get("final_executed_source_order") or []) if str(item)])
+        if not priority_source_dropped_stage:
+            priority_source_dropped_stage = str(row.get("priority_source_dropped_stage") or "")
+        if not final_source_selection_reason:
+            final_source_selection_reason = str(row.get("final_source_selection_reason") or "")
+        authority_pair_preserved = authority_pair_preserved or bool(row.get("authority_pair_preserved"))
+    source_latency_profile = source_timing_stage_profile(stats)
+    rescue_skip_reasons = stats.get("rescue_skip_reasons") if isinstance(stats.get("rescue_skip_reasons"), dict) else {}
+    rescue_skip_reason = next(iter(rescue_skip_reasons.keys()), "")
+    rescue_latency_ms = round(float(stats.get("rescue_latency_ms", 0.0) or 0.0), 1)
+    rescue_progress_delta = stats.get("rescue_progress_delta") if isinstance(stats.get("rescue_progress_delta"), dict) else {}
+    rescue_success_gate = str(stats.get("rescue_success_gate") or "")
+    rescue_target_page_type = str(stats.get("rescue_target_page_type") or "")
+    rescue_non_roi_reason = str(stats.get("rescue_non_roi_reason") or "")
+    detail_rescue_roi_state = str(stats.get("detail_rescue_roi_state") or "")
+    detail_rescue_target_page_type = str(stats.get("detail_rescue_target_page_type") or "")
+    detail_rescue_effect_delta = stats.get("detail_rescue_effect_delta") if isinstance(stats.get("detail_rescue_effect_delta"), dict) else {}
+    detail_rescue_failure_reason = str(stats.get("detail_rescue_failure_reason") or "")
+    family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
+    claim_retrieve_stop_reason = str(stats.get("claim_retrieve_stop_reason") or "")
+    retrieval_cost_review = {
+        "query_count": int(stats.get("query_count", 0) or 0),
+        "executed_source_count": len(dedupe_keep_order(final_executed_source_order)),
+        "detail_attempts": int(stats.get("detail_attempts", 0) or 0),
+        "detail_successes": int(stats.get("detail_successes", 0) or 0),
+        "rescue_latency_ms": rescue_latency_ms,
+        "search_seconds": source_latency_profile.get("search_seconds", 0.0),
+        "detail_fetch_seconds": source_latency_profile.get("detail_fetch_seconds", 0.0),
+        "official_discovery_seconds": source_latency_profile.get("official_discovery_seconds", 0.0),
+    }
     search_outcome = summarize_search_outcome(
         raw_results,
         len(web_items),
@@ -11882,6 +12651,11 @@ def diagnose_claim_retrieval(
         "planned_query_count": stats.get("planned_query_count"),
         "executed_query_plan": stats.get("executed_query_plan", []),
         "executed_query_source_plan": stats.get("executed_query_source_plan", [])[:6],
+        "source_order_trace": source_order_trace,
+        "priority_source_dropped_stage": priority_source_dropped_stage,
+        "final_source_selection_reason": final_source_selection_reason,
+        "final_executed_source_order": dedupe_keep_order(final_executed_source_order)[:10],
+        "authority_pair_preserved": authority_pair_preserved,
         "query_variant_origin": stats.get("query_variant_origin", [])[:8],
         "recall_probe_used": int(stats.get("recall_probe_used", 0) or 0),
         "recall_probe_query": stats.get("recall_probe_query", ""),
@@ -11918,6 +12692,18 @@ def diagnose_claim_retrieval(
         "playwright_rescue_trigger": playwright_rescue_trigger,
         "playwright_rescue_source": playwright_rescue_source,
         "playwright_rescue_result_count": playwright_rescue_result_count,
+        "rescue_roi_state": str(stats.get("rescue_roi_state") or ""),
+        "rescue_skip_reason": rescue_skip_reason,
+        "rescue_latency_ms": rescue_latency_ms,
+        "rescue_progress_delta": rescue_progress_delta,
+        "rescue_success_gate": rescue_success_gate,
+        "rescue_target_page_type": rescue_target_page_type,
+        "rescue_non_roi_reason": rescue_non_roi_reason,
+        "detail_rescue_roi_state": detail_rescue_roi_state,
+        "detail_rescue_target_page_type": detail_rescue_target_page_type,
+        "detail_rescue_effect_delta": detail_rescue_effect_delta,
+        "detail_rescue_failure_reason": detail_rescue_failure_reason,
+        "family_rescue_budget_used": family_rescue_budget_used,
         "official_entry_attempted": official_entry_attempted,
         "official_entry_hit": official_entry_hit,
         "official_entry_source_family": official_entry_source_family,
@@ -11926,6 +12712,14 @@ def diagnose_claim_retrieval(
         "search_execution_trace": search_execution_trace,
         "search_outcome": search_outcome,
         "detail_fetch_paths": detail_fetch_paths,
+        "page_keep_review_state": page_keep_review_state,
+        "page_keep_review_reason": page_keep_review_reason,
+        "second_pass_keep_review_used": sum(1 for item in web_items if isinstance(item, dict) and item.get("second_pass_keep_review_used")),
+        "second_pass_keep_review_reason": count_item_field_values(web_items, "second_pass_keep_review_reason"),
+        "second_pass_keep_recovered_count": sum(1 for item in web_items if isinstance(item, dict) and int(item.get("second_pass_keep_recovered_count") or 0) > 0),
+        "core_keep_review_block_reason": stats.get("core_keep_review_block_reason", {}),
+        "kept_candidate_source_type": kept_candidate_source_type,
+        "kept_progress_from_raw": kept_progress_from_raw,
         "direct_candidate_rescue_used": direct_candidate_rescue_used,
         "direct_candidate_rescue_sources": direct_candidate_rescue_sources,
         "direct_candidate_rescue_stages": direct_candidate_rescue_stages,
@@ -11994,6 +12788,10 @@ def diagnose_claim_retrieval(
         "source_precheck_skipped_sources": int(stats.get("source_precheck_skipped_sources", 0) or 0),
         "source_health_before": stats.get("source_health_before", {}),
         "source_health_reorder_actions": stats.get("source_health_reorder_actions", [])[:10],
+        "source_latency_profile": source_latency_profile,
+        "slow_source_cutoff": source_latency_profile.get("slow_sources", []),
+        "claim_retrieve_stop_reason": claim_retrieve_stop_reason,
+        "retrieval_cost_review": retrieval_cost_review,
         "trusted_deepen_used": int(stats.get("trusted_deepen_used", 0) or 0),
         "trusted_deepen_domains": stats.get("trusted_deepen_domains", []),
         "trusted_deepen_jobs": stats.get("trusted_deepen_jobs", [])[:6],
@@ -12248,7 +13046,28 @@ def retrieve_evidence(
             source_intent = dict(source_intent)
             existing_domains = preferred_domains_from_intent(source_intent)
             source_intent["preferred_domains"] = dedupe_keep_order(existing_domains + inline_query_domains)
-        discovery_result = discover_official_domains(question, claim_text, source_intent, timeout_sec=min(timeout_sec, 8))
+        should_attempt_official_discovery = (
+            bool(preferred_domains_from_intent(source_intent))
+            or evidence_mode in {"date_fact", "schedule_fact", "route_fact", "numeric_fact"}
+            or (evidence_mode == "event_result" and centrality == "core")
+        )
+        if should_attempt_official_discovery:
+            discovery_started = time.perf_counter()
+            discovery_timeout = min(timeout_sec, 6 if evidence_mode in {"date_fact", "schedule_fact", "route_fact", "numeric_fact"} else 4)
+            discovery_result = discover_official_domains(question, claim_text, source_intent, timeout_sec=discovery_timeout)
+            discovery_elapsed = time.perf_counter() - discovery_started
+        else:
+            discovery_result = {
+                "official_discovery_attempted": False,
+                "official_domain_candidates": [],
+                "discovered_domains": [],
+                "official_discovery_score": 0,
+                "official_discovery_used": False,
+                "official_discovery_queries": [],
+                "official_discovery_logs": [],
+                "official_discovery_block_reason": "skipped_low_roi",
+            }
+            discovery_elapsed = 0.0
         if discovery_result.get("discovered_domains"):
             source_intent = dict(source_intent)
             existing_domains = preferred_domains_from_intent(source_intent)
@@ -12338,8 +13157,12 @@ def retrieve_evidence(
             "search_request": search_request,
             "search_policy": search_policy,
             "playwright_roles": [],
+            "claim_retrieve_stop_reason": "",
+            "rescue_latency_ms": 0.0,
+            "family_rescue_budget_used": {"serp_count": 0, "detail_count": 0, "families": {}},
             **source_strategy_eval,
         }
+        add_timing(stats, "official_discovery", discovery_elapsed)
         if source_strategy_eval.get("source_strategy_label") in {"weak", "bad"}:
             stats["source_strategy_fallback"] = "default_source_plan"
         retry_policy = retry_source_plan_policy(source_intent)
@@ -12347,7 +13170,9 @@ def retrieve_evidence(
             stats["route_retry_source_strategy"] = retry_policy
         detail_fetches = 0
         used_playwright_queries = 0
+        used_playwright_detail_rescues = 0
         adaptive_fallback_used_for_claim = 0
+        failed_rescue_families: set[str] = set()
         claim_evidence.extend(context_evidence(question, answer, history, claim_id))
         claim_evidence.extend(computational_evidence(question, answer, claim_text, claim_id, time_value))
         for candidate in discovery_result.get("official_domain_candidates", []) or []:
@@ -12366,22 +13191,70 @@ def retrieve_evidence(
                 "official_discovery_score": candidate.get("score", 0),
                 "official_discovery_reasons": candidate.get("reasons", []),
             }
+            item.update(page_intent_features(item, source_intent, f"{question} {claim_text}", stats))
             if fetch_details > 0 and item.get("url") and detail_fetches < FETCH_DETAILS_PER_CLAIM:
                 stats["detail_attempts"] = int(stats.get("detail_attempts", 0) or 0) + 1
+                allow_detail_rescue, detail_rescue_skip_reason = should_allow_playwright_detail_rescue(
+                    item,
+                    claim_item,
+                    evidence_mode,
+                    used_playwright_detail_rescues,
+                )
+                detail_trace: Dict[str, Any] = {
+                    "allow_playwright_detail_rescue": allow_detail_rescue,
+                    "rescue_skip_reason": detail_rescue_skip_reason,
+                }
                 try:
                     detail_started = time.perf_counter()
-                    page_text = fetch_page_text(str(item["url"]), max_chars=5000, timeout_sec=timeout_sec)
+                    page_text = fetch_page_text(str(item["url"]), max_chars=5000, timeout_sec=timeout_sec, trace=detail_trace)
                     item["detail"] = extract_relevant_passage(
                         page_text,
                         passage_focus_terms(f"{question} {claim_text}", str(item.get("title") or "")),
                         max_chars=1800,
                     )
-                    enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec)
+                    enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec, fetch_trace=detail_trace)
+                    apply_detail_fetch_trace(stats, item, detail_trace, "official_discovery")
+                    if detail_trace.get("playwright_rescued"):
+                        used_playwright_detail_rescues += 1
+                        item["_detail_rescue_playwright_used"] = True
+                        stats["rescue_progress_delta"] = {
+                            "raw_delta": 0,
+                            "kept_delta": 0,
+                            "stage": "detail_content_recovered",
+                        }
+                        stats["rescue_success_gate"] = "detail_content_recovered"
+                        stats["rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
+                        stats["detail_rescue_roi_state"] = "detail_content_recovered"
+                        stats["detail_rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
+                        record_rescue_budget_event(
+                            stats,
+                            "detail",
+                            "official_discovery",
+                            "succeeded",
+                            latency_ms=(time.perf_counter() - detail_started) * 1000.0,
+                        )
                     detail_fetches += 1
                     stats["detail_successes"] = int(stats.get("detail_successes", 0) or 0) + 1
                     add_timing(stats, "fetch_detail", time.perf_counter() - detail_started)
                 except Exception as exc:
                     add_timing(stats, "fetch_detail", time.perf_counter() - detail_started if "detail_started" in locals() else 0.0)
+                    apply_detail_fetch_trace(stats, item, detail_trace, "official_discovery")
+                    if detail_trace.get("playwright_used") or detail_trace.get("playwright_rescue_skipped_by_policy"):
+                        used_playwright_detail_rescues += 1 if detail_trace.get("playwright_used") else 0
+                        record_rescue_budget_event(
+                            stats,
+                            "detail",
+                            "official_discovery",
+                            "failed" if detail_trace.get("playwright_used") else "skipped",
+                            latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
+                            skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
+                        )
+                        if detail_trace.get("playwright_used"):
+                            stats["detail_rescue_failure_reason"] = "detail_rescue_page_open_failed"
+                        else:
+                            stats["detail_rescue_failure_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
+                        if not detail_trace.get("playwright_used"):
+                            stats["rescue_non_roi_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                     record_detail_fetch_failure(stats, item, exc)
             item["relevance_score"] = evidence_relevance_score(f"{question} {claim_text}", item)
             item["entity_match_count"] = entity_match_count(f"{question} {claim_text}", item)
@@ -12426,13 +13299,20 @@ def retrieve_evidence(
                 keep_item = True
                 filter_reason = "soft_keep_high_priority_structured_candidate"
             if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
+                original_filter_reason = filter_reason
                 keep_item = True
                 filter_reason = "soft_keep_structured_metric_table_candidate"
+                annotate_soft_kept_structured_metric_item(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
             if not keep_item and should_soft_keep_claim_aligned_fact_item(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
                 original_filter_reason = filter_reason
                 keep_item = True
                 filter_reason = "soft_keep_claim_aligned_fact_page"
                 annotate_soft_kept_claim_aligned_item(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
+            if not keep_item and should_soft_keep_key_evidence_page(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
+                original_filter_reason = filter_reason
+                keep_item = True
+                filter_reason = "key_evidence_page_keep_review"
+                annotate_key_evidence_page_keep(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
             if not keep_item and should_soft_keep_route_review_item(item, filter_reason, evidence_mode):
                 keep_item = True
                 filter_reason = "soft_keep_route_review_candidate"
@@ -12445,6 +13325,20 @@ def retrieve_evidence(
                     claim_item,
                 )
             if not keep_item:
+                keep_item, filter_reason = maybe_promote_core_second_pass_keep_review(
+                    f"{question} {claim_text}",
+                    item,
+                    filter_reason,
+                    evidence_mode,
+                    claim_item,
+                    int(stats.get("raw_results") or 0) + 1,
+                    sum(
+                        1
+                        for kept_item in claim_evidence
+                        if isinstance(kept_item, dict) and kept_item.get("source_type") not in {"input_context", "computed"}
+                    ),
+                )
+            if not keep_item:
                 keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
                     f"{question} {claim_text}",
                     item,
@@ -12455,10 +13349,14 @@ def retrieve_evidence(
             stats["raw_results"] += 1
             if keep_item:
                 record_fact_filter_diagnostic(stats, item, True, filter_reason)
+                if item.get("second_pass_keep_review_used"):
+                    stats["second_pass_keep_recovered_count"] = int(stats.get("second_pass_keep_recovered_count", 0) or 0) + int(item.get("second_pass_keep_recovered_count") or 1)
+                    increment_named_counter(stats, "second_pass_keep_review_reason", str(item.get("second_pass_keep_review_reason") or filter_reason))
                 if item.get("readiness_promotion_used"):
                     stats["readiness_promotion_used"] = int(stats.get("readiness_promotion_used", 0) or 0) + 1
                     increment_named_counter(stats, "readiness_promotion_source", normalize_text(str(item.get("readiness_promotion_source") or "fact_page_keep_review")) or "fact_page_keep_review")
                     stats.setdefault("candidate_strength_before_keep_scores", []).append(int(item.get("candidate_strength_before_keep") or 0))
+                finalize_detail_rescue_effect(stats, item, keep_item)
                 finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
                 claim_evidence.append(item)
                 if not item.get("_bridge_expanded"):
@@ -12478,6 +13376,9 @@ def retrieve_evidence(
                         max_results_per_query,
                     )
             else:
+                if item.get("core_keep_review_block_reason"):
+                    increment_named_counter(stats, "core_keep_review_block_reason", str(item.get("core_keep_review_block_reason") or "blocked"))
+                finalize_detail_rescue_effect(stats, item, keep_item)
                 record_fact_filter_diagnostic(stats, item, False, filter_reason)
                 stats["filtered_results"] += 1
                 add_filter_reason(stats, filter_reason)
@@ -12492,6 +13393,7 @@ def retrieve_evidence(
             if is_recall_probe and int(stats.get("raw_results", 0) or 0) > 0:
                 continue
             query_goal = normalize_text(query_item.get("goal") or "general_verify") or "general_verify"
+            query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
             query = normalize_text(query_item.get("q") or "")
             if not query:
                 continue
@@ -12506,11 +13408,14 @@ def retrieve_evidence(
                     and str(page_intent.get("needed_page_type") or "") not in {"", "general_page"}
                 )
             )
-            allow_adaptive_fallback = (ENABLE_ADAPTIVE_SOURCE_FALLBACK or page_probe_adaptive_fallback) and not is_recall_probe
+            authority_first_query = query_needs_authority_pair(query_goal, query_family_role, source_intent)
+            allow_adaptive_fallback = (ENABLE_ADAPTIVE_SOURCE_FALLBACK or page_probe_adaptive_fallback or authority_first_query) and not is_recall_probe
             source_jobs = [
                 (source_name, query)
                 for source_name in source_plan_for_query_goal(source_plan, query_item, query_goal, source_intent)
             ]
+            planned_source_order = [str(item) for item in (query_item.get("_planned_source_order") or []) if str(item)]
+            post_role_priority_order = [str(item) for item in (query_item.get("_post_role_priority_order") or []) if str(item)]
             if is_recall_probe:
                 source_jobs = restrict_recall_probe_source_jobs(source_jobs, evidence_mode)
                 stats["recall_probe_used"] = 1
@@ -12521,16 +13426,26 @@ def retrieve_evidence(
                     key: dict(value)
                     for key, value in list(source_health.items())[:20]
                 }
+                before_health_reorder = [source_name for source_name, _ in source_jobs]
                 source_jobs, health_actions = reorder_sources_by_health(source_jobs, source_health, evidence_mode, query_goal)
                 if health_actions:
                     stats.setdefault("source_health_reorder_actions", []).extend(health_actions[:5])
                     stats["provider_health_snapshot"] = health_actions[:5]
+                note_source_order_stage(query_item, "health_reorder_order", [source_name for source_name, _ in source_jobs], before_health_reorder, "reorder_sources_by_health")
             original_source_job_count = len(source_jobs)
             if claim_source_limit > 0:
                 source_jobs, source_budget_cutoff = budgeted_source_jobs(source_jobs, claim_source_limit, query_goal, source_intent, query_item)
                 stats["skipped_sources_by_budget"] = int(stats.get("skipped_sources_by_budget", 0) or 0) + max(0, original_source_job_count - len(source_jobs))
                 if source_budget_cutoff.get("applied"):
                     stats["source_budget_cutoff"] = source_budget_cutoff
+            post_budget_selected_order = [source_name for source_name, _ in source_jobs]
+            note_source_order_stage(
+                query_item,
+                "post_budget_selected_order",
+                post_budget_selected_order,
+                post_role_priority_order or planned_source_order,
+                str((stats.get("source_budget_cutoff") or {}).get("final_source_selection_reason") or "budgeted_source_jobs"),
+            )
             stats["effective_source_plan"] = dedupe_keep_order(
                 list(stats.get("effective_source_plan", [])) + [source_name for source_name, _ in source_jobs]
             )[:10]
@@ -12550,17 +13465,24 @@ def retrieve_evidence(
             )
             if not query_playwright_allowed and not is_recall_probe and ENABLE_PLAYWRIGHT:
                 stats.setdefault("playwright_skipped_reasons", []).append(playwright_policy_reason)
-            stats.setdefault("executed_query_source_plan", []).append(
-                {
-                    "q": query,
-                    "goal": query_goal,
-                    "origin": normalize_text(str(query_item.get("origin") or "")) or "planner",
-                    "query_variant_origin": query_variant_origin_value(query_item),
-                    "probe_only_if_raw_zero": is_recall_probe,
-                    "sources": [source_name for source_name, _ in source_jobs],
-                    "source_count": len(source_jobs),
-                }
-            )
+            executed_query_row = {
+                "q": query,
+                "goal": query_goal,
+                "origin": normalize_text(str(query_item.get("origin") or "")) or "planner",
+                "query_variant_origin": query_variant_origin_value(query_item),
+                "probe_only_if_raw_zero": is_recall_probe,
+                "sources": post_budget_selected_order[:10],
+                "source_count": len(source_jobs),
+                "planned_source_order": planned_source_order[:10],
+                "post_role_priority_order": post_role_priority_order[:10],
+                "post_budget_selected_order": post_budget_selected_order[:10],
+                "final_executed_source_order": [],
+                "source_order_trace": list(query_item.get("_source_order_trace") or [])[:8],
+                "priority_source_dropped_stage": str((stats.get("source_budget_cutoff") or {}).get("priority_source_dropped_stage") or ""),
+                "final_source_selection_reason": str((stats.get("source_budget_cutoff") or {}).get("final_source_selection_reason") or ""),
+                "authority_pair_preserved": bool((stats.get("source_budget_cutoff") or {}).get("authority_pair_preserved")),
+            }
+            stats.setdefault("executed_query_source_plan", []).append(executed_query_row)
             fallback_jobs = adaptive_fallback_candidates(source_plan, source_jobs, query)
             fallback_used_for_query = 0
             source_index = 0
@@ -12573,12 +13495,24 @@ def retrieve_evidence(
             query_high_priority_attempted = False
             query_anti_bot_blocked = False
             query_playwright_scheduled = any(source_name == "playwright_duckduckgo" for source_name, _ in source_jobs)
+            executed_source_order: List[str] = []
+            query_rescue_family = ""
 
             def maybe_schedule_query_playwright_rescue() -> None:
                 nonlocal query_playwright_scheduled, used_playwright_queries
                 if not query_playwright_allowed or query_playwright_scheduled:
                     return
                 if used_playwright_queries >= PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
+                    record_rescue_budget_event(stats, "serp", query_rescue_family or "playwright_duckduckgo", "skipped", skip_reason="serp_rescue_budget_exhausted")
+                    stats["rescue_roi_state"] = "budget_exhausted_before_rescue"
+                    return
+                if int(stats.get("kept_web", 0) or 0) > 0 or sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) > query_kept_before:
+                    record_rescue_budget_event(stats, "serp", query_rescue_family or "playwright_duckduckgo", "skipped", skip_reason="kept_web_already_positive")
+                    stats["rescue_roi_state"] = "skipped_after_kept_progress"
+                    return
+                if query_rescue_family and query_rescue_family in failed_rescue_families:
+                    record_rescue_budget_event(stats, "serp", query_rescue_family, "skipped", skip_reason="same_family_rescue_failed")
+                    stats["rescue_roi_state"] = "skipped_same_family_failed"
                     return
                 query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
                 rescue_trigger = ""
@@ -12591,10 +13525,12 @@ def retrieve_evidence(
                 source_jobs.append(("playwright_duckduckgo", query))
                 query_playwright_scheduled = True
                 used_playwright_queries += 1
+                stats["playwright_rescue_trigger"] = rescue_trigger
                 stats.setdefault("playwright_queries", []).append(query)
                 stats.setdefault("playwright_reasons", []).append(rescue_trigger)
                 role = "authority_entry_opener" if query_item.get("query_family_role") in {"closure", "distinguish", "refute"} else "serp_rescue"
                 stats.setdefault("playwright_roles", []).append(role)
+                stats["rescue_roi_state"] = f"scheduled_{rescue_trigger}"
 
             while source_index < len(source_jobs):
                 source_name, source_query = source_jobs[source_index]
@@ -12602,6 +13538,12 @@ def retrieve_evidence(
                 if budget_exhausted():
                     stats["budget_exhausted"] = True
                     break
+                if source_name != "playwright_duckduckgo":
+                    stop_reason = source_family_stop_loss_triggered(stats, source_name)
+                    if stop_reason:
+                        stats["claim_retrieve_stop_reason"] = normalize_text(f"{source_name}:{stop_reason}") or stop_reason
+                        continue
+                executed_source_order.append(source_name)
                 if source_name != "playwright_duckduckgo" and high_priority_search_source(source_name):
                     query_high_priority_attempted = True
                 if should_precheck_source(source_name, source_query, max_results_per_query) and not source_precheck_passes(
@@ -12624,19 +13566,71 @@ def retrieve_evidence(
                     error_reason = "anti_bot_blocked" if exception_looks_like_anti_bot(exc) else "source_error"
                     if error_reason == "anti_bot_blocked":
                         query_anti_bot_blocked = True
+                        query_rescue_family = source_name
                     record_source_call(stats, source_name, 0, error=True, error_reason=error_reason)
+                    if source_name == "playwright_duckduckgo":
+                        family_name = source_family_name(query_rescue_family or "playwright_duckduckgo")
+                        failed_rescue_families.add(family_name)
+                        record_rescue_budget_event(
+                            stats,
+                            "serp",
+                            family_name,
+                            "failed",
+                            latency_ms=timing_seconds(stats, source_name) * 1000.0,
+                        )
+                        stats["rescue_roi_state"] = "playwright_rescue_failed"
                     all_logs.append({"claim_id": claim_id, "query": source_query, "source": source_name, "error": str(exc), "error_reason": error_reason})
                     maybe_schedule_query_playwright_rescue()
                     continue
                 record_source_call(stats, source_name, len(items))
+                if source_name == "playwright_duckduckgo":
+                    family_name = source_family_name(query_rescue_family or "playwright_duckduckgo")
+                    if items:
+                        stats["playwright_rescued"] = int(stats.get("playwright_rescued", 0) or 0) + 1
+                        stats["rescue_progress_delta"] = {
+                            "raw_delta": len(items),
+                            "kept_delta": 0,
+                            "stage": "search_result_recovered",
+                        }
+                        stats["rescue_success_gate"] = "search_result_recovered"
+                        stats["rescue_target_page_type"] = normalize_text(str(page_intent.get("needed_page_type") or "")) or "serp_result"
+                        record_rescue_budget_event(
+                            stats,
+                            "serp",
+                            family_name,
+                            "succeeded",
+                            latency_ms=timing_seconds(stats, source_name) * 1000.0,
+                        )
+                        stats["rescue_roi_state"] = "playwright_rescue_succeeded"
+                    else:
+                        failed_rescue_families.add(family_name)
+                        record_rescue_budget_event(
+                            stats,
+                            "serp",
+                            family_name,
+                            "failed",
+                            latency_ms=timing_seconds(stats, source_name) * 1000.0,
+                        )
+                        stats["rescue_roi_state"] = "playwright_rescue_no_raw"
                 search_fallback_from_anti_bot = any(bool(item.get("search_fallback_from_anti_bot")) for item in items if isinstance(item, dict))
                 if search_fallback_from_anti_bot:
                     query_anti_bot_blocked = True
+                    query_rescue_family = source_name
                     stats.setdefault("playwright_queries", []).append(source_query)
                     stats.setdefault("playwright_reasons", []).append("anti_bot_blocked")
                     stats.setdefault("playwright_roles", []).append("serp_rescue")
                     if used_playwright_queries < PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
                         used_playwright_queries += 1
+                    stats["playwright_rescued"] = int(stats.get("playwright_rescued", 0) or 0) + 1
+                    stats["rescue_progress_delta"] = {
+                        "raw_delta": len(items),
+                        "kept_delta": 0,
+                        "stage": "search_result_recovered",
+                    }
+                    stats["rescue_success_gate"] = "search_result_recovered"
+                    stats["rescue_target_page_type"] = normalize_text(str(page_intent.get("needed_page_type") or "")) or "serp_result"
+                    record_rescue_budget_event(stats, "serp", source_name, "succeeded", latency_ms=timing_seconds(stats, source_name) * 1000.0)
+                    stats["rescue_roi_state"] = "search_source_internal_rescue_succeeded"
                 stats["raw_results"] += len(items)
                 for item in items:
                     if budget_exhausted():
@@ -12709,7 +13703,16 @@ def retrieve_evidence(
                         stats["source_quality_detail_skipped"] = int(stats.get("source_quality_detail_skipped", 0) or 0) + 1
                     if should_fetch_detail:
                         stats["detail_attempts"] = int(stats.get("detail_attempts", 0) or 0) + 1
-                        detail_trace: Dict[str, Any] = {}
+                        allow_detail_rescue, detail_rescue_skip_reason = should_allow_playwright_detail_rescue(
+                            item,
+                            claim_item,
+                            evidence_mode,
+                            used_playwright_detail_rescues,
+                        )
+                        detail_trace: Dict[str, Any] = {
+                            "allow_playwright_detail_rescue": allow_detail_rescue,
+                            "rescue_skip_reason": detail_rescue_skip_reason,
+                        }
                         try:
                             detail_started = time.perf_counter()
                             raw_chars = 5000 if evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact"} else 1600
@@ -12718,12 +13721,59 @@ def retrieve_evidence(
                             item["detail"] = extract_relevant_passage(page_text, passage_focus_terms(source_query, str(item.get("title") or "")), max_chars=passage_chars)
                             enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec, fetch_trace=detail_trace)
                             apply_detail_fetch_trace(stats, item, detail_trace, source_name)
+                            if detail_trace.get("playwright_rescued"):
+                                used_playwright_detail_rescues += 1
+                                item["_detail_rescue_playwright_used"] = True
+                                stats["rescue_progress_delta"] = {
+                                    "raw_delta": 0,
+                                    "kept_delta": 0,
+                                    "stage": "detail_content_recovered",
+                                }
+                                stats["rescue_success_gate"] = "detail_content_recovered"
+                                stats["rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
+                                stats["detail_rescue_roi_state"] = "detail_content_recovered"
+                                stats["detail_rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
+                                record_rescue_budget_event(
+                                    stats,
+                                    "detail",
+                                    source_family_name(source_name),
+                                    "succeeded",
+                                    latency_ms=(time.perf_counter() - detail_started) * 1000.0,
+                                )
+                                stats["rescue_roi_state"] = "detail_rescue_succeeded"
+                            elif detail_trace.get("playwright_rescue_skipped_by_policy"):
+                                record_rescue_budget_event(
+                                    stats,
+                                    "detail",
+                                    source_family_name(source_name),
+                                    "skipped",
+                                    skip_reason=str(detail_trace.get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
+                                )
                             detail_fetches += 1
                             stats["detail_successes"] = int(stats.get("detail_successes", 0) or 0) + 1
                             add_timing(stats, "fetch_detail", time.perf_counter() - detail_started)
                         except Exception as exc:
                             add_timing(stats, "fetch_detail", time.perf_counter() - detail_started if "detail_started" in locals() else 0.0)
                             apply_detail_fetch_trace(stats, item, detail_trace, source_name)
+                            if detail_trace.get("playwright_used") or detail_trace.get("playwright_rescue_skipped_by_policy"):
+                                used_playwright_detail_rescues += 1 if detail_trace.get("playwright_used") else 0
+                                record_rescue_budget_event(
+                                    stats,
+                                    "detail",
+                                    source_family_name(source_name),
+                                    "failed" if detail_trace.get("playwright_used") else "skipped",
+                                    latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
+                                    skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
+                                )
+                                if detail_trace.get("playwright_used"):
+                                    stats["detail_rescue_failure_reason"] = "detail_rescue_page_open_failed"
+                                else:
+                                    stats["detail_rescue_failure_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
+                                if detail_trace.get("playwright_used"):
+                                    failed_rescue_families.add(source_family_name(source_name))
+                                    stats["rescue_roi_state"] = "detail_rescue_failed"
+                                else:
+                                    stats["rescue_non_roi_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                             record_detail_fetch_failure(stats, item, exc, source_name)
                     item["relevance_score"] = evidence_relevance_score(source_query, item)
                     item["entity_match_count"] = entity_match_count(source_query, item)
@@ -12799,13 +13849,20 @@ def retrieve_evidence(
                         keep_item = True
                         filter_reason = "soft_keep_high_priority_structured_candidate"
                     if not keep_item and should_soft_keep_structured_metric_item(item, filter_reason, evidence_mode, task_card):
+                        original_filter_reason = filter_reason
                         keep_item = True
                         filter_reason = "soft_keep_structured_metric_table_candidate"
+                        annotate_soft_kept_structured_metric_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
                     if not keep_item and should_soft_keep_claim_aligned_fact_item(source_query, item, filter_reason, evidence_mode, claim_item):
                         original_filter_reason = filter_reason
                         keep_item = True
                         filter_reason = "soft_keep_claim_aligned_fact_page"
                         annotate_soft_kept_claim_aligned_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
+                    if not keep_item and should_soft_keep_key_evidence_page(source_query, item, filter_reason, evidence_mode, claim_item):
+                        original_filter_reason = filter_reason
+                        keep_item = True
+                        filter_reason = "key_evidence_page_keep_review"
+                        annotate_key_evidence_page_keep(item, source_query, evidence_mode, original_filter_reason, claim_item)
                     if not keep_item and should_soft_keep_route_review_item(item, filter_reason, evidence_mode):
                         keep_item = True
                         filter_reason = "soft_keep_route_review_candidate"
@@ -12818,6 +13875,20 @@ def retrieve_evidence(
                             claim_item,
                         )
                     if not keep_item:
+                        keep_item, filter_reason = maybe_promote_core_second_pass_keep_review(
+                            source_query,
+                            item,
+                            filter_reason,
+                            evidence_mode,
+                            claim_item,
+                            int(stats.get("raw_results") or 0) + 1,
+                            sum(
+                                1
+                                for kept_item in claim_evidence
+                                if isinstance(kept_item, dict) and kept_item.get("source_type") not in {"input_context", "computed"}
+                            ),
+                        )
+                    if not keep_item:
                         keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
                             source_query,
                             item,
@@ -12826,6 +13897,9 @@ def retrieve_evidence(
                             claim_item,
                         )
                     if not keep_item:
+                        if item.get("core_keep_review_block_reason"):
+                            increment_named_counter(stats, "core_keep_review_block_reason", str(item.get("core_keep_review_block_reason") or "blocked"))
+                        finalize_detail_rescue_effect(stats, item, keep_item)
                         record_fact_filter_diagnostic(stats, item, False, filter_reason)
                         add_trusted_deepen_jobs(stats, source_jobs, item, filter_reason, source_query)
                         record_source_item_quality(stats, source_name, item, kept=False, filter_reason=filter_reason)
@@ -12837,10 +13911,14 @@ def retrieve_evidence(
                         filtered_evidence_pool.append(rescued_item)
                         continue
                     record_fact_filter_diagnostic(stats, item, True, filter_reason)
+                    if item.get("second_pass_keep_review_used"):
+                        stats["second_pass_keep_recovered_count"] = int(stats.get("second_pass_keep_recovered_count", 0) or 0) + int(item.get("second_pass_keep_recovered_count") or 1)
+                        increment_named_counter(stats, "second_pass_keep_review_reason", str(item.get("second_pass_keep_review_reason") or filter_reason))
                     if item.get("readiness_promotion_used"):
                         stats["readiness_promotion_used"] = int(stats.get("readiness_promotion_used", 0) or 0) + 1
                         increment_named_counter(stats, "readiness_promotion_source", normalize_text(str(item.get("readiness_promotion_source") or "fact_page_keep_review")) or "fact_page_keep_review")
                         stats.setdefault("candidate_strength_before_keep_scores", []).append(int(item.get("candidate_strength_before_keep") or 0))
+                    finalize_detail_rescue_effect(stats, item, keep_item)
                     finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
                     record_source_item_quality(stats, source_name, item, kept=True)
                     claim_evidence.append(item)
@@ -12919,11 +13997,67 @@ def retrieve_evidence(
                                 "bad_before": query_bad_now,
                             }
                         )
+                if (
+                    authority_first_query
+                    and fallback_used_for_query < ADAPTIVE_SOURCE_FALLBACK_LIMIT
+                    and adaptive_fallback_used_for_claim < ADAPTIVE_SOURCE_FALLBACK_LIMIT
+                    and source_index >= len(source_jobs)
+                ):
+                    query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
+                    query_bad_now = sum(
+                        int(bucket.get("bad", 0) or 0)
+                        for bucket in (stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}).values()
+                    ) - query_bad_before
+                    query_kept_now = sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) - query_kept_before
+                    used_source_names = {name for name, _query in source_jobs}
+                    if query_raw_now <= 0 and query_kept_now <= 0:
+                        fallback_job = None
+                        for preferred_source in ["sogou_html", "bing_news_zh_rss", "bing_news_rss"]:
+                            if preferred_source in used_source_names:
+                                continue
+                            fallback_job = (preferred_source, query)
+                            break
+                        if fallback_job:
+                            source_jobs.append(fallback_job)
+                            fallback_used_for_query += 1
+                            adaptive_fallback_used_for_claim += 1
+                            stats["adaptive_source_fallback_used"] = int(stats.get("adaptive_source_fallback_used", 0) or 0) + 1
+                            stats.setdefault("adaptive_source_fallback_jobs", []).append(
+                                {
+                                    "query": query,
+                                    "source": fallback_job[0],
+                                    "reason": "authority_pair_no_raw_then_supplement",
+                                    "raw_before": query_raw_now,
+                                    "bad_before": query_bad_now,
+                                }
+                            )
             maybe_schedule_query_playwright_rescue()
+            executed_query_row["final_executed_source_order"] = dedupe_keep_order(executed_source_order)[:10]
+            executed_query_row["source_count"] = len(executed_query_row["final_executed_source_order"] or executed_query_row.get("sources") or [])
             if should_stop_querying_after_web_budget(claim_evidence, evidence_mode, source_intent, max_results_per_query):
                 break
             if is_recall_probe:
                 stats["recall_probe_raw_hits"] = int(stats.get("raw_results", 0) or 0) - query_raw_before
+            query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
+            query_kept_now = sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) - query_kept_before
+            if (
+                authority_first_query
+                and bool(executed_query_row.get("authority_pair_preserved"))
+                and query_raw_now <= 0
+                and query_kept_now <= 0
+            ):
+                stats["claim_retrieve_stop_reason"] = "authority_pair_attempted_no_progress"
+                if centrality != "core" and fallback_used_for_query <= 0:
+                    break
+            if (
+                centrality != "core"
+                and evidence_mode not in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+                and stats["query_count"] >= 2
+                and query_kept_now <= 0
+                and query_raw_now <= 0
+            ):
+                stats["claim_retrieve_stop_reason"] = "supporting_claim_stop_loss"
+                break
         claim_evidence.sort(
             key=lambda item: (
                 item.get("task_card_score", 0),
