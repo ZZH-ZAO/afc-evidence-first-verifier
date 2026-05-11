@@ -3503,6 +3503,25 @@ def official_discovery_queries(question: str, claim: str, source_intent: Dict[st
             append_query_term_unique(terms, term)
         return compact_text_for_query(" ".join(terms[:8]), 96)
 
+    direct_need = source_intent.get("evidence_need_program", {}).get("direct_evidence_need", {}) if isinstance(source_intent.get("evidence_need_program"), dict) else {}
+    source_strategy = source_intent.get("source_strategy", {}) if isinstance(source_intent.get("source_strategy"), dict) else {}
+    page_intent = source_intent.get("page_intent", {}) if isinstance(source_intent.get("page_intent"), dict) else {}
+    high_specific_terms: List[str] = []
+    for key in ("subject_entity", "time_scope", "object_entity", "status_or_result", "relation_or_metric"):
+        value = str(binding_terms.get(key) or "")
+        for term in binding_slot_search_values(key, value, source_intent, evidence_mode)[:2]:
+            append_query_term_unique(high_specific_terms, term)
+    for collection in (
+        source_strategy.get("must_have") if isinstance(source_strategy.get("must_have"), list) else [],
+        page_intent.get("must_contain") if isinstance(page_intent.get("must_contain"), list) else [],
+        direct_need.get("must_include") if isinstance(direct_need.get("must_include"), list) else [],
+    ):
+        for term in collection:
+            append_query_term_unique(high_specific_terms, normalize_text(str(term)).replace("数值", ""))
+    high_specific_seed = compact_text_for_query(" ".join(high_specific_terms[:10]), 112)
+    if high_specific_seed:
+        seeds.append(high_specific_seed)
+
     authority = str(metric_slots.get("source_authority") or "").lower()
     authority_extras = []
     if authority == "bank_rate_table":
@@ -7951,6 +7970,95 @@ def evidence_page_contract_features(
     }
 
 
+def title_fact_date_pairs(text: str) -> List[Tuple[str, str, str]]:
+    normalized = normalize_text(text)
+    pairs: List[Tuple[str, str, str]] = []
+    for match in re.finditer(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", normalized):
+        pairs.append((match.group(1), str(int(match.group(2))), str(int(match.group(3)))))
+    for match in re.finditer(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日", normalized):
+        pairs.append(("", str(int(match.group(1))), str(int(match.group(2)))))
+    seen: set[Tuple[str, str, str]] = set()
+    out: List[Tuple[str, str, str]] = []
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
+def title_fact_date_scope_conflicts(claim_time_scope: str, surface: str) -> bool:
+    claim_dates = title_fact_date_pairs(claim_time_scope)
+    surface_dates = title_fact_date_pairs(surface)
+    if not claim_dates or not surface_dates:
+        return False
+    for claim_year, claim_month, claim_day in claim_dates:
+        for surface_year, surface_month, surface_day in surface_dates:
+            if claim_month == surface_month and claim_day == surface_day and (not claim_year or not surface_year or claim_year == surface_year):
+                return False
+    return True
+
+
+def title_level_fact_evidence_ready(
+    item: Dict[str, Any],
+    source_intent: Dict[str, Any],
+    evidence_mode: str,
+) -> Tuple[bool, str]:
+    mode = effective_evidence_mode(source_intent, evidence_mode)
+    if mode not in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}:
+        return False, ""
+    source_type = normalize_text(str(item.get("source_type") or "")).lower()
+    if source_type not in {"official", "news", "finance", "sports"}:
+        return False, ""
+    title = normalize_text(str(item.get("title") or ""))
+    snippet = normalize_text(str(item.get("snippet") or ""))
+    binding_terms = source_strategy_binding_terms(source_intent, mode)
+    if len(title) < 8:
+        return False, ""
+    url = str(item.get("url") or "")
+    path = urlparse(url).path.lower().strip("/")
+    path_tail = path.rsplit("/", 1)[-1] if path else ""
+    if path in {"", "/", "home", "index", "news", "en", "cn", "zh"} or path_tail in {"", "index.html", "index.htm"}:
+        return False, ""
+    surface = f"{title} {snippet}"
+    surface_l = normalize_text(surface).lower()
+    if re.search(r"(首页|主页|频道|栏目|列表|入口|话题|百科|评论|解读|analysis|commentary|topic|wiki|portal|homepage|search|list)", title, flags=re.I):
+        return False, ""
+    temporal = int(item.get("temporal_score") or 0)
+    event_window = int(item.get("event_window_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    directness = int(item.get("directness_score") or 0)
+    if mode in {"numeric_fact", "date_fact", "schedule_fact"} and (temporal < 0 or event_window < 0):
+        return False, "title_fact_time_mismatch"
+    if mode == "event_result" and event_window < -1:
+        return False, "title_fact_event_window_mismatch"
+    grounded = entity_hits >= 1 or relevance >= 4 or directness >= 3
+    if not grounded:
+        return False, "title_fact_not_claim_grounded"
+    claim_time_scope = str(binding_terms.get("time_scope") or "")
+    if mode == "numeric_fact" and title_fact_date_scope_conflicts(claim_time_scope, surface):
+        return False, "title_fact_time_scope_mismatch"
+    has_time = bool(re.search(r"(20\d{2}|[01]?\d\s*月\s*[0-3]?\d\s*日|\d{4}[-/]\d{1,2}[-/]\d{1,2}|today|yesterday)", surface_l, flags=re.I))
+    if mode == "numeric_fact":
+        metric_marker = bool(re.search(r"(中间价|汇率|牌价|人民币对美元|兑美元|美元兑人民币|报|报价|上调|下调|上涨|下跌|涨|跌|基点|price|rate|quote|points?)", surface_l, flags=re.I))
+        value_marker = bool(re.search(r"(报|为|约为|上调|下调|上涨|下跌|涨|跌)\s*[0-9]+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?\s*(?:个?基点|%|％|元|点|美元|人民币|港元)", surface_l, flags=re.I))
+        if metric_marker and value_marker and (has_time or temporal >= 1):
+            return True, "trusted_title_numeric_fact_ready"
+        return False, "title_numeric_fact_missing_value_or_time"
+    if mode in {"date_fact", "schedule_fact"}:
+        schedule_marker = bool(re.search(r"(公告|通知|安排|日历|休市|开市|生效|发布|calendar|notice|schedule|holiday)", surface_l, flags=re.I))
+        if schedule_marker and has_time:
+            return True, "trusted_title_schedule_fact_ready"
+        return False, "title_schedule_fact_missing_marker_or_time"
+    if mode == "event_result":
+        result_marker = bool(re.search(r"(战报|赛果|比分|结果|获胜|击败|轻取|大胜|result|score|won|beat|defeated|\d+\s*[-:：]\s*\d+)", surface_l, flags=re.I))
+        if result_marker:
+            return True, "trusted_title_event_result_ready"
+        return False, "title_event_result_missing_result_marker"
+    return False, ""
+
+
 def page_role_contract_features(
     item: Dict[str, Any],
     source_intent: Dict[str, Any],
@@ -7979,7 +8087,10 @@ def page_role_contract_features(
     if evidence_mode == "event_result":
         fact_like_surface = bool(re.search(r"(战报|赛果|比分|结果|获胜|击败|轻取|大胜|result|score|won|beat|defeated|\d+\s*[-:：]\s*\d+)", surface, flags=re.I))
     elif evidence_mode in {"numeric_fact", "numeric_count_detail"}:
-        fact_like_surface = bool(re.search(r"(开盘|收盘|涨幅|跌幅|报|报价|牌价|汇率|中间价|数据|点|%|％|quote|rate|price|points?)", surface, flags=re.I))
+        fact_like_surface = bool(
+            re.search(r"(开盘|收盘|涨幅|跌幅|报价|牌价|汇率|中间价|数据|基点|%|％|quote|rate|price|points?)", surface, flags=re.I)
+            or re.search(r"(?:^|[\s，。；:：])报\s*[0-9]+(?:\.[0-9]+)?", surface, flags=re.I)
+        )
     elif evidence_mode in {"date_fact", "schedule_fact"}:
         fact_like_surface = bool(re.search(r"(公告|通知|日历|安排|休市|开市|发布|生效|日期|calendar|notice|schedule|holiday)", surface, flags=re.I))
     elif evidence_mode == "route_fact":
@@ -7991,6 +8102,7 @@ def page_role_contract_features(
     evidence_ready = False
     follow_required = False
     generic_block_reason = ""
+    title_fact_ready, title_fact_reason = title_level_fact_evidence_ready(item, source_intent, evidence_mode)
 
     if detail_error and any(marker in detail_error for marker in ["403", "anti_bot", "blocked", "captcha", "login"]):
         role_name = "blocked_page"
@@ -8006,7 +8118,18 @@ def page_role_contract_features(
         reason = "structured_table_point_ready"
         evidence_ready = True
         contract_score = max(contract_score, 84)
-    elif trusted_fact_source and fact_like_surface and not homepage_like and not generic_surface:
+    elif title_fact_ready:
+        role_name = "evidence_page"
+        reason = title_fact_reason or "title_level_fact_evidence_ready"
+        evidence_ready = True
+        contract_score = max(contract_score, 78)
+    elif (
+        trusted_fact_source
+        and fact_like_surface
+        and not homepage_like
+        and not generic_surface
+        and not any(risk in {"missing_binding_subject_entity", "missing_binding_relation_or_metric", "missing_binding_time_scope"} for risk in risks)
+    ):
         role_name = "evidence_page"
         reason = "trusted_fact_like_page_shape"
         evidence_ready = True
@@ -8050,6 +8173,8 @@ def page_role_contract_features(
         "entry_page_follow_required": follow_required,
         "evidence_page_ready": evidence_ready,
         "generic_page_block_reason": generic_block_reason,
+        "title_level_fact_evidence_ready": title_fact_ready,
+        "title_level_fact_evidence_reason": title_fact_reason,
     }
 
 
@@ -8769,6 +8894,8 @@ def has_direct_web_evidence(evidence: List[Dict[str, Any]], evidence_mode: str) 
             evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
             evidence_contract_role = normalize_text(str(item.get("evidence_contract_role") or "")).lower()
             if structured_point_status == "satisfied":
+                return True
+            if bool(item.get("evidence_page_ready")) and normalize_text(str(item.get("page_role") or "")).lower() == "evidence_page":
                 return True
             if (
                 source_type in {"official", "news"}
@@ -13615,6 +13742,14 @@ def retrieve_evidence(
             item["directness_score"] = evidence_directness_score(f"{question} {claim_text}", item, evidence_mode)
             item["temporal_score"] = evidence_temporal_score(f"{question} {claim_text}", item)
             item["event_window_score"] = event_window_score(f"{question} {claim_text}", item, evidence_mode)
+            item["answer_candidates"] = answer_candidate_sentences(f"{question} {claim_text}", item, evidence_mode=evidence_mode)
+            maybe_apply_deterministic_candidate_rescue(claim_item, item, evidence_mode, f"{question} {claim_text}")
+            item["answer_candidate_quality_score"] = answer_candidate_quality_score(item)
+            if item.get("direct_candidate_rescue_used"):
+                stats["direct_candidate_rescue_used"] = int(stats.get("direct_candidate_rescue_used", 0) or 0) + 1
+                source_field = str(item.get("direct_candidate_rescue_source") or "")
+                if source_field:
+                    increment_named_counter(stats, "direct_candidate_rescue_sources", source_field)
             item.update(source_quality_features(f"{question} {claim_text}", item, evidence_mode, preferred_domains))
             item.update(page_intent_features(item, source_intent, f"{question} {claim_text}", stats))
             record_page_intent_stats(stats, item)
@@ -13695,6 +13830,11 @@ def retrieve_evidence(
                     evidence_mode,
                     claim_item,
                 )
+            if not keep_item and should_soft_keep_key_evidence_page(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
+                original_filter_reason = filter_reason
+                keep_item = True
+                filter_reason = "key_evidence_page_keep_review"
+                annotate_key_evidence_page_keep(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
             stats["raw_results"] += 1
             if keep_item:
                 record_fact_filter_diagnostic(stats, item, True, filter_reason)

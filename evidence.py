@@ -116,7 +116,23 @@ def evidence_text(item: Dict[str, Any]) -> str:
 def is_discovery_only_item(item: Dict[str, Any]) -> bool:
     source = normalize_text(str(item.get("source") or "")).lower()
     snippet = normalize_text(str(item.get("snippet") or "")).lower()
-    return source == "official_discovery" or snippet == "official discovery candidate"
+    if source == "official_discovery" or snippet == "official discovery candidate":
+        page_role = normalize_text(str(item.get("page_role") or "")).lower()
+        contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+        contract_role = normalize_text(str(item.get("evidence_contract_role") or "")).lower()
+        structured_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+        if (
+            bool(item.get("evidence_page_ready"))
+            and page_role == "evidence_page"
+            and (
+                bool(item.get("title_level_fact_evidence_ready"))
+                or structured_status == "satisfied"
+                or (contract_status == "satisfied" and contract_role in {"evidence_sentence_page", "structured_metric_table_page"})
+            )
+        ):
+            return False
+        return True
+    return False
 
 
 def should_summarize_item(item: Dict[str, Any]) -> bool:
@@ -135,6 +151,12 @@ def point_source(item: Dict[str, Any]) -> Dict[str, Any]:
         "evidence_contract_score": item.get("evidence_contract_score"),
         "evidence_contract_role": item.get("evidence_contract_role"),
         "evidence_contract_risks": item.get("evidence_contract_risks", []),
+        "page_role": item.get("page_role"),
+        "page_role_reason": item.get("page_role_reason"),
+        "page_role_contract_score": item.get("page_role_contract_score"),
+        "evidence_page_ready": item.get("evidence_page_ready"),
+        "title_level_fact_evidence_ready": item.get("title_level_fact_evidence_ready"),
+        "title_level_fact_evidence_reason": item.get("title_level_fact_evidence_reason"),
     }
 
 
@@ -145,6 +167,15 @@ def direct_answer_level(item: Dict[str, Any], required_hits: int = 2) -> str:
     source_type = str(item.get("source_type") or "")
     contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
     contract_role = normalize_text(str(item.get("evidence_contract_role") or "")).lower()
+    page_role = normalize_text(str(item.get("page_role") or "")).lower()
+    if (
+        page_role == "evidence_page"
+        and bool(item.get("evidence_page_ready"))
+        and source_type in {"official", "news", "finance", "sports"}
+        and directness >= 3
+        and relevance >= 5
+    ):
+        return "direct"
     if source_type == "official" and directness >= 4 and relevance >= 6:
         return "direct"
     if directness >= 2 and entity_hits >= required_hits:
@@ -564,6 +595,20 @@ def answer_candidates_from_item(item: Dict[str, Any], claim: str, limit: int = 3
             enriched.setdefault("source_type", item.get("source_type"))
             enriched.setdefault("url", item.get("url"))
             enriched.setdefault("title", item.get("title"))
+            for key in (
+                "page_role",
+                "page_role_reason",
+                "page_role_contract_score",
+                "evidence_page_ready",
+                "title_level_fact_evidence_ready",
+                "title_level_fact_evidence_reason",
+                "evidence_contract_status",
+                "evidence_contract_score",
+                "evidence_contract_role",
+                "evidence_contract_risks",
+            ):
+                if key in item and key not in enriched:
+                    enriched[key] = item.get(key)
             out.append(enriched)
         if out:
             return out
@@ -1413,6 +1458,23 @@ def summarize_date_claim(
             mismatch = bool(sentence_dates) and bool(evidence_dates) and not exact_match
             if calendar_state_conflict:
                 mismatch = True
+            if claim_is_calendar_state and mismatch and not calendar_state_conflict:
+                point = apply_candidate_features_to_point(point_with_source(
+                    item,
+                    {
+                        "type": "date_reference",
+                        "claim_value": claim_value,
+                        "evidence_value": evidence_dates[0],
+                        "evidence_sentence": best_sentence or sentence_for_value(text, evidence_dates[0]),
+                        "date_contract_note": "calendar_page_date_not_claim_state_date",
+                    },
+                    required_hits=1,
+                ), best)
+                point["calendar_state_claim"] = claim_calendar_state
+                point["calendar_state_evidence"] = evidence_calendar_state
+                point["calendar_state_alignment"] = "none"
+                uncertain_points.append(point)
+                continue
             if not exact_match and not mismatch:
                 continue
             evidence_value = matched_value or evidence_dates[0]
