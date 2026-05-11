@@ -28,7 +28,10 @@ from afc_schema import (
     SENTENCE_DIRECTNESS_PARTIAL,
     SENTENCE_DIRECTNESS_RELATED_ONLY,
 )
-from evidence_contract import infer_missing_required_slots as shared_infer_missing_required_slots
+from evidence_contract import (
+    infer_missing_required_slots as shared_infer_missing_required_slots,
+    required_slot_profile_for_mode as shared_required_slot_profile_for_mode,
+)
 
 VERIFICATION_MECHANISM_TYPES = {
     "structured_numeric_authority",
@@ -731,6 +734,13 @@ def apply_candidate_features_to_point(point: Dict[str, Any], candidate: Dict[str
         "direct_candidate_gap_reason",
         "candidate_directness_rank",
         "direct_candidate_promotion_used",
+        "candidate_conflict_profile",
+        "conflict_type",
+        "conflict_strength",
+        "conflict_slot",
+        "claim_value",
+        "evidence_value",
+        "same_slot_conflict_ready",
     ):
         if key in candidate:
             out[key] = candidate.get(key)
@@ -1096,6 +1106,414 @@ def build_sentence_slot_coverage(mode: str, slot_match: str, gap_reason: str) ->
     )
     coverage["slot_match_signature"] = slot_match
     return coverage
+
+
+SLOT_CONTRACT_NAMES = (
+    "subject",
+    "time_scope",
+    "object",
+    "metric_or_relation",
+    "status_or_result",
+    "comparison_baseline",
+    "source_scope",
+)
+
+
+def _slot_contract_source_scope(source_intent: Dict[str, Any]) -> str:
+    preferred_domains = source_intent.get("preferred_domains") if isinstance(source_intent.get("preferred_domains"), list) else []
+    preferred_types = source_intent.get("preferred_source_types") if isinstance(source_intent.get("preferred_source_types"), list) else []
+    source_strategy = source_intent.get("source_strategy") if isinstance(source_intent.get("source_strategy"), dict) else {}
+    source_types = source_strategy.get("source_types") if isinstance(source_strategy.get("source_types"), list) else []
+    values = [
+        normalize_text(str(value))
+        for value in list(preferred_domains) + list(preferred_types) + list(source_types)
+        if normalize_text(str(value))
+    ]
+    return " ".join(dict.fromkeys(values[:4]))
+
+
+def build_claim_slot_contract(
+    claim: str,
+    mode: str,
+    source_intent: Optional[Dict[str, Any]] = None,
+    evidence_need_program: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    source_intent = source_intent if isinstance(source_intent, dict) else {}
+    program = evidence_need_program if isinstance(evidence_need_program, dict) else {}
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    route_meta = source_intent.get("route_meta") if isinstance(source_intent.get("route_meta"), dict) else {}
+    slots: Dict[str, str] = {}
+    for slot_name in SLOT_CONTRACT_NAMES:
+        value = normalize_text(str(decision_slots.get(slot_name) or ""))
+        if not value and slot_name == "subject":
+            value = normalize_text(str(route_meta.get("origin") or ""))
+        if not value and slot_name == "object":
+            value = normalize_text(str(route_meta.get("destination") or route_meta.get("route_area") or ""))
+        if not value and slot_name == "source_scope":
+            value = _slot_contract_source_scope(source_intent)
+        slots[slot_name] = value
+    direct_terms = [
+        normalize_text(str(term))
+        for term in (direct_need.get("must_include") or [])
+        if normalize_text(str(term))
+    ] if isinstance(direct_need.get("must_include"), list) else []
+    required_slots = shared_required_slot_profile_for_mode(
+        mode,
+        claim_text=claim,
+        source_intent=source_intent,
+        decision_slots=decision_slots,
+    )
+    return {
+        "slots": slots,
+        "required_slots": required_slots,
+        "normalized_assertion": normalize_text(str(program.get("normalized_assertion") or claim)),
+        "direct_must_include": direct_terms[:6],
+    }
+
+
+def _slot_text_contains(text: str, value: str) -> bool:
+    text_norm = normalize_text(text).lower()
+    value_norm = normalize_text(value).lower()
+    if not text_norm or not value_norm:
+        return False
+    if value_norm in text_norm:
+        return True
+    compact_text = re.sub(r"\s+", "", text_norm)
+    compact_value = re.sub(r"\s+", "", value_norm)
+    if compact_value and compact_value in compact_text:
+        return True
+    tokens = [token for token in re.split(r"[\s,，;；/|、()（）]+", value_norm) if len(token) >= 2]
+    return bool(tokens and any(token in text_norm for token in tokens[:4]))
+
+
+def _row_contract_text(row: Dict[str, Any]) -> str:
+    values: List[str] = []
+    for key in (
+        "evidence_sentence",
+        "sentence",
+        "answer",
+        "title",
+        "snippet",
+        "detail",
+        "claim_value",
+        "evidence_value",
+        "url",
+    ):
+        value = normalize_text(str(row.get(key) or ""))
+        if value:
+            values.append(value)
+    return " ".join(values)
+
+
+def _normalize_value_list(values: List[Any], limit: int = 6) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        text = normalize_text(str(value or ""))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = normalize_text(str(value or "")).lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _row_page_gate_allows_conflict(row: Dict[str, Any]) -> bool:
+    page_role = normalize_text(str(row.get("page_role") or ""))
+    direct_gate = normalize_text(str(row.get("direct_evidence_gate_result") or ""))
+    evidence_status = normalize_text(str(row.get("evidence_contract_status") or ""))
+    evidence_role = normalize_text(str(row.get("evidence_contract_role") or ""))
+    if _boolish(row.get("is_pseudo_evidence")) or direct_gate.startswith("blocked_"):
+        return False
+    if page_role in {"entry_page", "generic_page", "blocked_page"}:
+        return False
+    if page_role == "evidence_page" or _boolish(row.get("evidence_page_ready")):
+        return True
+    if evidence_status == "satisfied":
+        return True
+    if evidence_role in {"structured_metric_table_page", "structured_metric_candidate_page"} and evidence_status in {"satisfied", "partial"}:
+        return True
+    if _boolish(row.get("title_level_fact_evidence_ready")):
+        return True
+    return False
+
+
+def _status_signals(text: str) -> List[str]:
+    lowered = normalize_text(text).lower()
+    groups = [
+        ("closed", ["休市", "停牌", "暂停", "关闭", "closed", "suspended"]),
+        ("open", ["开市", "开盘", "交易", "开放", "open", "opened", "trading"]),
+        ("up", ["上涨", "上调", "升值", "走高", "高开", "涨", "gain", "gained", "higher", "up"]),
+        ("down", ["下跌", "下调", "贬值", "走低", "跌", "lower", "down", "declined"]),
+        ("win", ["战胜", "击败", "获胜", "赢", "won", "beat", "defeated"]),
+        ("lose", ["不敌", "输给", "落败", "lost", "lose"]),
+        ("support", ["支持", "配合", "协助", "推动", "游说", "support", "backed", "assist"]),
+        ("negated", ["未", "没有", "并未", "否认", "不支持", "not", "no ", "denied"]),
+    ]
+    signals: List[str] = []
+    for name, terms in groups:
+        if any(term.lower() in lowered for term in terms):
+            signals.append(name)
+    return signals
+
+
+def _score_like_values(text: str) -> List[str]:
+    return _normalize_value_list(re.findall(r"\b\d{1,3}\s*[-:：比]\s*\d{1,3}\b", normalize_text(text)))
+
+
+def _date_values(text: str) -> List[str]:
+    return _normalize_value_list([normalize_date_value(value) for value in extract_dates(text)])
+
+
+def _numeric_values(text: str) -> List[str]:
+    return _normalize_value_list([value for value, _unit in extract_numbers(text)])
+
+
+def _first_different(left: List[str], right: List[str]) -> Tuple[str, str]:
+    if not left or not right:
+        return "", ""
+    left_set = set(left)
+    right_set = set(right)
+    if left_set & right_set:
+        return "", ""
+    return left[0], right[0]
+
+
+def candidate_conflict_profile_for_row(
+    row: Dict[str, Any],
+    claim_contract: Dict[str, Any],
+    mode: str,
+    coverage: Dict[str, bool],
+    missing: List[str],
+    mismatch: List[str],
+    point_polarity: str = "",
+) -> Dict[str, Any]:
+    slots = claim_contract.get("slots") if isinstance(claim_contract.get("slots"), dict) else {}
+    claim_text = normalize_text(
+        " ".join(
+            str(value)
+            for value in [
+                claim_contract.get("normalized_assertion"),
+                slots.get("subject"),
+                slots.get("time_scope"),
+                slots.get("object"),
+                slots.get("metric_or_relation"),
+                slots.get("status_or_result"),
+            ]
+            if normalize_text(str(value or ""))
+        )
+    )
+    evidence_text = _row_contract_text(row)
+    gate_ready = _row_page_gate_allows_conflict(row)
+    partial_incomparable = normalize_text(str(row.get("comparability_status") or "")) == "partial_but_incomparable"
+    profile: Dict[str, Any] = {
+        "state": "observed_no_conflict",
+        "conflict_type": "",
+        "conflict_strength": "none",
+        "conflict_slot": "",
+        "claim_value": "",
+        "evidence_value": "",
+        "same_slot_conflict_ready": False,
+        "gate_ready": gate_ready,
+        "block_reason": "",
+    }
+
+    conflict_type = ""
+    conflict_slot = ""
+    claim_value = ""
+    evidence_value = ""
+    strength = "none"
+
+    claim_dates = _date_values(claim_text)
+    evidence_dates = _date_values(evidence_text)
+    date_claim, date_evidence = _first_different(claim_dates, evidence_dates)
+    if date_claim and date_evidence:
+        conflict_type = "date_conflict"
+        conflict_slot = "time_scope"
+        claim_value = date_claim
+        evidence_value = date_evidence
+        strength = "medium"
+
+    claim_scores = _score_like_values(claim_text)
+    evidence_scores = _score_like_values(evidence_text)
+    score_claim, score_evidence = _first_different(claim_scores, evidence_scores)
+    if score_claim and score_evidence:
+        conflict_type = "result_conflict"
+        conflict_slot = "status_or_result"
+        claim_value = score_claim
+        evidence_value = score_evidence
+        strength = "strong" if mode == "event_result" else "medium"
+
+    if not conflict_type:
+        claim_nums = _numeric_values(claim_text)
+        evidence_nums = _numeric_values(evidence_text)
+        num_claim, num_evidence = _first_different(claim_nums, evidence_nums)
+        if num_claim and num_evidence:
+            conflict_type = "numeric_conflict"
+            conflict_slot = "metric_or_relation"
+            claim_value = num_claim
+            evidence_value = num_evidence
+            strength = "medium"
+
+    claim_status = _status_signals(claim_text)
+    evidence_status = _status_signals(evidence_text)
+    opposite_pairs = {("open", "closed"), ("closed", "open"), ("up", "down"), ("down", "up"), ("win", "lose"), ("lose", "win"), ("support", "negated"), ("negated", "support")}
+    status_pair = next(((left, right) for left in claim_status for right in evidence_status if (left, right) in opposite_pairs), None)
+    if status_pair:
+        conflict_type = "status_conflict" if status_pair[0] not in {"support", "negated"} else "relation_conflict"
+        conflict_slot = "status_or_result" if conflict_type == "status_conflict" else "metric_or_relation"
+        claim_value, evidence_value = status_pair
+        strength = "strong" if gate_ready else "medium"
+
+    if point_polarity == "refute" and not conflict_type:
+        conflict_type = "explicit_refute_point"
+        conflict_slot = "status_or_result"
+        claim_value = normalize_text(str(row.get("claim_value") or ""))[:80]
+        evidence_value = normalize_text(str(row.get("evidence_value") or row.get("evidence_sentence") or row.get("sentence") or ""))[:120]
+        strength = "strong"
+
+    if not conflict_type:
+        return profile
+
+    tolerated_missing = {conflict_slot} if conflict_slot else set()
+    same_slot_except_conflict = all(slot in tolerated_missing for slot in missing) and all(slot in tolerated_missing for slot in mismatch)
+    if partial_incomparable:
+        same_slot_ready = False
+        block_reason = "partial_but_incomparable"
+    elif not gate_ready:
+        same_slot_ready = False
+        block_reason = "page_gate_not_ready"
+    elif not same_slot_except_conflict:
+        same_slot_ready = False
+        block_reason = "slot_context_not_aligned"
+    else:
+        same_slot_ready = strength == "strong"
+        block_reason = "" if same_slot_ready else "conflict_strength_not_strong"
+
+    return {
+        "state": "conflict_ready" if same_slot_ready else "conflict_diagnostic",
+        "conflict_type": conflict_type,
+        "conflict_strength": strength,
+        "conflict_slot": conflict_slot,
+        "claim_value": claim_value,
+        "evidence_value": evidence_value,
+        "same_slot_conflict_ready": same_slot_ready,
+        "gate_ready": gate_ready,
+        "block_reason": block_reason,
+    }
+
+
+def slot_contract_for_row(
+    row: Dict[str, Any],
+    claim_contract: Dict[str, Any],
+    mode: str,
+    point_polarity: str = "",
+) -> Dict[str, Any]:
+    slots = claim_contract.get("slots") if isinstance(claim_contract.get("slots"), dict) else {}
+    required_slots = [str(slot) for slot in (claim_contract.get("required_slots") or []) if str(slot)]
+    existing = row.get("candidate_slot_coverage") if isinstance(row.get("candidate_slot_coverage"), dict) else {}
+    text = _row_contract_text(row)
+    coverage: Dict[str, bool] = {}
+    observed_values: Dict[str, str] = {}
+    for slot_name in SLOT_CONTRACT_NAMES:
+        slot_value = normalize_text(str(slots.get(slot_name) or ""))
+        covered = bool(existing.get(slot_name))
+        if slot_value and _slot_text_contains(text, slot_value):
+            covered = True
+            observed_values[slot_name] = slot_value
+        elif covered:
+            observed_values[slot_name] = normalize_text(str(row.get("evidence_sentence") or row.get("sentence") or row.get("title") or ""))[:120]
+        coverage[slot_name] = covered
+    if existing.get("time"):
+        coverage["time_scope"] = True
+    if existing.get("metric_or_result"):
+        coverage["metric_or_relation"] = True
+        coverage["status_or_result"] = True
+    numeric_grounding = row.get("numeric_slot_grounding_result") if isinstance(row.get("numeric_slot_grounding_result"), dict) else {}
+    numeric_block = normalize_text(str(row.get("numeric_point_block_reason") or numeric_grounding.get("block_reason") or ""))
+    if numeric_grounding.get("state") == "passed":
+        coverage["metric_or_relation"] = True
+        coverage["status_or_result"] = True
+    gap_reason = normalize_text(str(row.get("direct_candidate_gap_reason") or ""))
+    mismatch: List[str] = []
+    if gap_reason in {"date_role_mismatch", "opening_slot_mismatch"} or "time_scope_mismatch" in numeric_block:
+        mismatch.append("time_scope")
+    if gap_reason == "result_granularity_mismatch":
+        mismatch.append("status_or_result")
+    if gap_reason == "route_relation_indirect":
+        mismatch.append("metric_or_relation")
+    if numeric_block in {"false_friend_metric", "numeric_family_mismatch"}:
+        mismatch.append("metric_or_relation")
+    if numeric_block == "numeric_target_not_found":
+        mismatch.append("status_or_result")
+    mismatch = list(dict.fromkeys(mismatch))
+    missing = [slot for slot in required_slots if not coverage.get(slot)]
+    point_type = normalize_text(str(row.get("type") or ""))
+    conflict: List[str] = []
+    if point_polarity == "refute" or "mismatch" in point_type or "refut" in point_type:
+        conflict = [
+            slot
+            for slot in ("object", "metric_or_relation", "status_or_result", "time_scope")
+            if coverage.get(slot) or slot in mismatch
+        ][:4] or ["status_or_result"]
+    conflict_profile = candidate_conflict_profile_for_row(row, claim_contract, mode, coverage, missing, mismatch, point_polarity)
+    same_slot_conflict_ready = bool(conflict_profile.get("same_slot_conflict_ready"))
+    if conflict_profile.get("conflict_slot"):
+        conflict = list(dict.fromkeys(conflict + [str(conflict_profile.get("conflict_slot"))]))
+    same_slot_ready = not missing and not mismatch
+    explicit_refute_like = point_polarity == "refute" or "mismatch" in point_type or "refut" in point_type
+    refute_slot_ready = (same_slot_ready and bool(conflict) and explicit_refute_like) or same_slot_conflict_ready
+    state = "refute_ready" if refute_slot_ready else "same_slot_ready" if same_slot_ready else "slot_mismatch" if mismatch else "slot_missing"
+    return {
+        "slot_contract_state": state,
+        "slot_coverage": coverage,
+        "slot_missing": missing,
+        "slot_mismatch": mismatch,
+        "slot_conflict": conflict,
+        "same_slot_ready": same_slot_ready,
+        "refute_slot_ready": refute_slot_ready,
+        "slot_observed_values": observed_values,
+        "candidate_conflict_profile": conflict_profile,
+        "conflict_type": str(conflict_profile.get("conflict_type") or ""),
+        "conflict_strength": str(conflict_profile.get("conflict_strength") or "none"),
+        "conflict_slot": str(conflict_profile.get("conflict_slot") or ""),
+        "claim_value": str(conflict_profile.get("claim_value") or row.get("claim_value") or ""),
+        "evidence_value": str(conflict_profile.get("evidence_value") or row.get("evidence_value") or ""),
+        "same_slot_conflict_ready": same_slot_conflict_ready,
+    }
+
+
+def attach_slot_contract_debug_to_summary(
+    summary: Dict[str, Any],
+    claim: str,
+    mode: str,
+    source_intent: Optional[Dict[str, Any]],
+    evidence_need_program: Optional[Dict[str, Any]],
+) -> None:
+    claim_contract = build_claim_slot_contract(claim, mode, source_intent, evidence_need_program)
+    summary["slot_contract"] = claim_contract
+    for bucket, polarity in (
+        ("supporting_points", "support"),
+        ("refuting_points", "refute"),
+        ("uncertain_points", ""),
+        ("evidence_sentence_candidates", ""),
+        ("answer_candidates", ""),
+    ):
+        rows = summary.get(bucket) if isinstance(summary.get(bucket), list) else []
+        for row in rows:
+            if isinstance(row, dict):
+                row.update(slot_contract_for_row(row, claim_contract, mode, polarity))
 
 
 def sentence_candidate_directness_rank(
@@ -2778,6 +3196,13 @@ def summarize_claim_evidence(claims: List[Dict[str, Any]], evidence_by_claim: Di
         summaries[claim_id]["mechanism_type"] = mechanism_type
         if evidence_need_program:
             summaries[claim_id]["evidence_need_program"] = evidence_need_program
+        attach_slot_contract_debug_to_summary(
+            summaries[claim_id],
+            claim_text,
+            mode,
+            source_intent,
+            evidence_need_program,
+        )
         coverage[claim_id] = claim_coverage(claim_id, mode, evidence, summaries[claim_id])
         coverage[claim_id]["mechanism_type"] = mechanism_type
         summaries[claim_id]["coverage"] = coverage[claim_id]

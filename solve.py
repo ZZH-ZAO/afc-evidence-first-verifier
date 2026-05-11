@@ -531,7 +531,11 @@ SYSTEM_VERIFY = """你是严格的AFC事实裁决器。你不会联网；你只�
 13. route_fact 必须优先看 route_relation.directly_answers_route；只有同一句明确说明“主体是否经由/绕开某领空或路线”时，才可判 supported/refuted。
 14. compact_evidence.qa_evidence 是 claim->核查问题->证据答案 的中间层；优先使用 stance=refute/support 且 directness=direct 的 QA 证据写 reason。
 15. 如果 qa_evidence 的 stance=unknown 或 directness=none，只能说明未形成直接证据，不能包装成事实错误。
-16. 输出必须是严格JSON。
+16. evidence_ledger 是证据账本：confirmed_points/refuted_points/unresolved_points/gate_blocked_pages/slot_blocked_candidates 必须优先用于自检。
+17. core_assertion_audit 标出“表层事实已命中/已确认但核心断言未闭合”的情况；这种情况不能因为表层事实相关就判 supported。
+18. cross_claim_consistency 标出跨 claim 的同题冲突和核心未闭合；needs_consistency_review=true 时要在 reason 中说明。
+19. 没有同槽直接反证时，不要把“未拿到证据”写成事实错误；可以输出 uncertain 或保守 label=2。
+20. 输出必须是严格JSON。
 
 输出格式：
 {
@@ -548,6 +552,12 @@ SYSTEM_VERIFY = """你是严格的AFC事实裁决器。你不会联网；你只�
         "severity": 0.0,
         "temporal": 0.0
       },
+      "initial_verdict": "supported|refuted|uncertain|not_checkable",
+      "counter_evidence_check": "是否看到同槽反证；没有则写 no_direct_counter_evidence",
+      "contradiction_found": false,
+      "needs_consistency_review": false,
+      "evidence_ledger_used": true,
+      "abstain_reason": "",
       "reason": "..."
     }
   ],
@@ -2542,6 +2552,24 @@ def claim_pipeline_diagnostic(
         if isinstance(point_conversion.get("candidate_slot_coverage"), dict)
         else {}
     )
+    slot_contract_state = str(point_conversion.get("slot_contract_state") or "")
+    slot_coverage = point_conversion.get("slot_coverage") if isinstance(point_conversion.get("slot_coverage"), dict) else {}
+    slot_missing = point_conversion.get("slot_missing") if isinstance(point_conversion.get("slot_missing"), list) else []
+    slot_mismatch = point_conversion.get("slot_mismatch") if isinstance(point_conversion.get("slot_mismatch"), list) else []
+    slot_conflict = point_conversion.get("slot_conflict") if isinstance(point_conversion.get("slot_conflict"), list) else []
+    same_slot_ready = int(bool(point_conversion.get("same_slot_ready")))
+    refute_slot_ready = int(bool(point_conversion.get("refute_slot_ready")))
+    candidate_conflict_profile = (
+        point_conversion.get("candidate_conflict_profile")
+        if isinstance(point_conversion.get("candidate_conflict_profile"), dict)
+        else {}
+    )
+    conflict_type = str(point_conversion.get("conflict_type") or "")
+    conflict_strength = str(point_conversion.get("conflict_strength") or "")
+    conflict_slot = str(point_conversion.get("conflict_slot") or "")
+    claim_value = point_conversion.get("claim_value")
+    evidence_value = point_conversion.get("evidence_value")
+    same_slot_conflict_ready = int(bool(point_conversion.get("same_slot_conflict_ready")))
     candidate_slot_coverage_summary_text = candidate_slot_coverage_summary(candidate_slot_coverage, top_candidate_slot_match)
     direct_candidate_gap_reason = str(point_conversion.get("direct_candidate_gap_reason") or "")
     candidate_directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
@@ -2623,6 +2651,17 @@ def claim_pipeline_diagnostic(
     slow_source_cutoff = diagnostic.get("slow_source_cutoff") if isinstance(diagnostic.get("slow_source_cutoff"), list) else []
     claim_retrieve_stop_reason = str(diagnostic.get("claim_retrieve_stop_reason") or "")
     retrieval_cost_review = diagnostic.get("retrieval_cost_review") if isinstance(diagnostic.get("retrieval_cost_review"), dict) else {}
+    refutation_target = diagnostic.get("refutation_target") if isinstance(diagnostic.get("refutation_target"), dict) else {}
+    refutation_query_plan = diagnostic.get("refutation_query_plan") if isinstance(diagnostic.get("refutation_query_plan"), list) else []
+    refutation_retry_trigger = str(diagnostic.get("refutation_retry_trigger") or "")
+    refutation_slot_gap = diagnostic.get("refutation_slot_gap") if isinstance(diagnostic.get("refutation_slot_gap"), list) else []
+    refutation_search_result = str(diagnostic.get("refutation_search_result") or "")
+    refutation_retrieval_stop_reason = str(diagnostic.get("refutation_retrieval_stop_reason") or "")
+    contrastive_query_plan = diagnostic.get("contrastive_query_plan") if isinstance(diagnostic.get("contrastive_query_plan"), dict) else {}
+    contrastive_retry_trigger = str(diagnostic.get("contrastive_retry_trigger") or "")
+    contrastive_slot_gap = diagnostic.get("contrastive_slot_gap") if isinstance(diagnostic.get("contrastive_slot_gap"), list) else []
+    contrastive_search_result = str(diagnostic.get("contrastive_search_result") or "")
+    contrastive_stop_reason = str(diagnostic.get("contrastive_stop_reason") or "")
     page_keep_review_state = diagnostic.get("page_keep_review_state") if isinstance(diagnostic.get("page_keep_review_state"), dict) else {}
     page_keep_review_reason = diagnostic.get("page_keep_review_reason") if isinstance(diagnostic.get("page_keep_review_reason"), dict) else {}
     filtered_rescue_pool_state = str(diagnostic.get("filtered_rescue_pool_state") or "")
@@ -2813,6 +2852,20 @@ def claim_pipeline_diagnostic(
         "sentence_candidate_profile": sentence_candidate_profile,
         "top_candidate_slot_match": top_candidate_slot_match,
         "candidate_slot_coverage": candidate_slot_coverage,
+        "slot_contract_state": slot_contract_state,
+        "slot_coverage": slot_coverage,
+        "slot_missing": slot_missing[:5],
+        "slot_mismatch": slot_mismatch[:5],
+        "slot_conflict": slot_conflict[:5],
+        "same_slot_ready": same_slot_ready,
+        "refute_slot_ready": refute_slot_ready,
+        "candidate_conflict_profile": candidate_conflict_profile,
+        "conflict_type": conflict_type,
+        "conflict_strength": conflict_strength,
+        "conflict_slot": conflict_slot,
+        "claim_value": claim_value,
+        "evidence_value": evidence_value,
+        "same_slot_conflict_ready": same_slot_conflict_ready,
         "direct_candidate_gap_reason": direct_candidate_gap_reason,
         "candidate_directness_rank": candidate_directness_rank,
         "direct_candidate_promotion_used": point_direct_candidate_promotion_used,
@@ -2864,6 +2917,17 @@ def claim_pipeline_diagnostic(
         "slow_source_cutoff": slow_source_cutoff[:5],
         "claim_retrieve_stop_reason": claim_retrieve_stop_reason,
         "retrieval_cost_review": retrieval_cost_review,
+        "refutation_target": refutation_target,
+        "refutation_query_plan": refutation_query_plan[:3],
+        "refutation_retry_trigger": refutation_retry_trigger,
+        "refutation_slot_gap": refutation_slot_gap[:5],
+        "refutation_search_result": refutation_search_result,
+        "refutation_retrieval_stop_reason": refutation_retrieval_stop_reason,
+        "contrastive_query_plan": contrastive_query_plan,
+        "contrastive_retry_trigger": contrastive_retry_trigger,
+        "contrastive_slot_gap": contrastive_slot_gap[:5],
+        "contrastive_search_result": contrastive_search_result,
+        "contrastive_stop_reason": contrastive_stop_reason,
         "page_keep_review_state": page_keep_review_state,
         "page_keep_review_reason": page_keep_review_reason,
         "filtered_rescue_pool_state": filtered_rescue_pool_state,
@@ -6262,6 +6326,256 @@ def augment_sports_structured_detail_claims(extracted: Dict[str, Any], claims: L
     return claims + additions
 
 
+ATOMIC_RISK_PRIORITY = {
+    "event_result_status": 92,
+    "exclusive_or_only_path": 90,
+    "market_calendar_status": 88,
+    "phase_boundary_time": 86,
+    "current_position_distance": 84,
+    "reality_vs_fiction_status": 82,
+    "numeric_quote_or_metric": 76,
+}
+
+
+EVENT_RESULT_SCORE_PATTERN = re.compile(r"(?<![\d.])\d{1,3}\s*[-:：比]\s*\d{1,3}(?![\d.])")
+EVENT_CONTEXT_PATTERN = re.compile(
+    r"(比赛|赛果|比分|对阵|主场|客场|战报|胜|负|击败|战胜|不敌|退赛|弃权|不战而胜|"
+    r"NBA|CBA|WTT|世界杯|小组赛|常规赛|球队|球员|选手|女单|男单|"
+    r"result|score|game|match|win|loss|walkover|withdrawal|retired)",
+    re.I,
+)
+
+
+def has_event_result_signal(text: str) -> bool:
+    clean = normalize_text(text)
+    if not clean:
+        return False
+    if re.search(r"(退赛|弃权|不战而胜|战胜|击败|不敌|获胜|赛果|晋级|walkover|withdrawal|retired)", clean, flags=re.I):
+        return True
+    if EVENT_RESULT_SCORE_PATTERN.search(clean) and EVENT_CONTEXT_PATTERN.search(clean):
+        return True
+    return False
+
+
+def atomic_claim_slot_contract(text: str, risk_type: str, source_claim: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    source_claim = source_claim if isinstance(source_claim, dict) else {}
+    source_intent = source_claim.get("source_intent") if isinstance(source_claim.get("source_intent"), dict) else {}
+    program = source_claim.get("evidence_need_program") if isinstance(source_claim.get("evidence_need_program"), dict) else {}
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    subject = first_nonempty_text(
+        decision_slots.get("subject"),
+        (source_intent.get("core_binding") or {}).get("subject_entity") if isinstance(source_intent.get("core_binding"), dict) else "",
+        width=50,
+    )
+    time_scope = first_nonempty_text(decision_slots.get("time_scope"), " ".join(claim_time_markers(text)[:2]), width=50)
+    object_value = first_nonempty_text(decision_slots.get("object"), width=50)
+    metric = first_nonempty_text(decision_slots.get("metric_or_relation"), width=50)
+    status = first_nonempty_text(decision_slots.get("status_or_result"), width=50)
+    if risk_type == "market_calendar_status":
+        if not subject:
+            subject = first_nonempty_text(*(re.findall(r"(A股|港股|沪深|上证|深证|创业板|恒生|美股|纳指|道指)", text)[:2]), width=30)
+        metric = metric or "交易日历/开休市状态"
+        status = first_nonempty_text(*(re.findall(r"(休市|开市|开盘|交易日|假期|节假日)", text)[:3]), width=40)
+    elif risk_type == "exclusive_or_only_path":
+        metric = metric or first_nonempty_text(exclusive_term_bucket(text), "排他路径/唯一性", width=40)
+        object_value = object_value or first_nonempty_text(*(re.findall(r"(海峡|通道|航道|管道|港口|路线|领空|出口|进口|霍尔木兹|阿曼湾)", text)[:4]), width=50)
+        status = status or "唯一/只能/必经"
+    elif risk_type == "event_result_status":
+        metric = metric or "赛果/比分/退赛状态"
+        status = first_nonempty_text(
+            *(EVENT_RESULT_SCORE_PATTERN.findall(text)[:4]),
+            *(re.findall(r"(战胜|击败|退赛|弃权|不战而胜|获胜|比分|胜)", text)[:4]),
+            width=50,
+        )
+    elif risk_type == "current_position_distance":
+        metric = metric or "当前位置/距离"
+        status = first_nonempty_text(*(re.findall(r"(\d+(?:\.\d+)?\s*(?:公里|千米|海里|km|nm|英里|mile))", text, flags=re.I)[:3]), width=50)
+    elif risk_type == "phase_boundary_time":
+        metric = metric or "阶段开始/结束/结果公布"
+        status = first_nonempty_text(*(re.findall(r"(开始|开启|启动|结束|完成|公布|发布|结果|第一阶段|第二阶段)", text)[:4]), width=50)
+    elif risk_type == "reality_vs_fiction_status":
+        metric = metric or "现实发生状态"
+        status = first_nonempty_text(*(re.findall(r"(虚构|网传|AI生成|未发生|并未|现实|真实|战争|断网|袭击)", text)[:4]), width=50)
+    elif risk_type == "numeric_quote_or_metric":
+        metric = metric or first_nonempty_text(*(re.findall(r"(汇率|中间价|买入价|卖出价|牌价|战绩|距离|人数|金额|奖金|基点)", text)[:3]), width=50)
+        status = first_nonempty_text(*(re.findall(r"\d+(?:\.\d+)?\s*(?:胜|负|公里|千米|美元|元|基点|%|人民币|CNY|USD)?", text, flags=re.I)[:4]), width=50)
+    return {
+        "subject": subject,
+        "time_scope": time_scope,
+        "object": object_value,
+        "metric_or_relation": metric,
+        "status_or_result": status,
+        "comparison_baseline": "",
+        "source_scope": "",
+    }
+
+
+def atomic_expected_evidence_shape(risk_type: str) -> str:
+    return {
+        "market_calendar_status": "exchange_calendar_or_trading_notice",
+        "exclusive_or_only_path": "route_or_logistics_explainer_with_alternative_path",
+        "event_result_status": "official_or_news_event_result_detail",
+        "current_position_distance": "time_bound_position_or_distance_report",
+        "phase_boundary_time": "official_schedule_or_phase_notice",
+        "reality_vs_fiction_status": "current_status_or_debunking_evidence",
+        "numeric_quote_or_metric": "structured_table_or_authoritative_numeric_point",
+    }.get(risk_type, "direct_evidence_page")
+
+
+def atomic_refutation_terms(text: str, risk_type: str, slots: Dict[str, str]) -> List[str]:
+    base_terms = compact_term_list(
+        [
+            slots.get("subject", ""),
+            slots.get("time_scope", ""),
+            slots.get("object", ""),
+            slots.get("metric_or_relation", ""),
+            slots.get("status_or_result", ""),
+        ],
+        5,
+        36,
+    )
+    if risk_type == "market_calendar_status":
+        extras = ["交易日历", "休市", "开市", "节假日", "公告"]
+    elif risk_type == "exclusive_or_only_path":
+        extras = ["替代通道", "管道", "港口", "绕开", "bypass", "alternative route"]
+    elif risk_type == "event_result_status":
+        extras = ["赛果", "比分", "退赛", "弃权", "不战而胜", "walkover", "withdrawal"]
+    elif risk_type == "current_position_distance":
+        extras = ["current position", "distance", "as of", "location", "公里"]
+    elif risk_type == "phase_boundary_time":
+        extras = ["phase begins", "phase ends", "result release", "开始", "结束", "公布"]
+    elif risk_type == "reality_vs_fiction_status":
+        extras = ["现实", "虚构", "网传", "未发生", "debunk", "fact check"]
+    elif risk_type == "numeric_quote_or_metric":
+        extras = ["官方", "历史数据", "表格", "中间价", "牌价"]
+    else:
+        extras = ["官方", "实际", "结果"]
+    return dedupe_keep_order([term for term in base_terms + extras if term])[:10]
+
+
+def infer_atomic_risk_type(text: str, need_type: str = "") -> str:
+    clean = normalize_text(text)
+    if not clean:
+        return ""
+    if re.search(r"(休市|开市|开盘|交易日|假期|节假日|清明|春节|圣诞|calendar)", clean, flags=re.I) and re.search(r"(A股|港股|沪深|上证|深证|恒生|美股|纳指|道指|交易所)", clean, flags=re.I):
+        return "market_calendar_status"
+    if EXCLUSIVE_PREMISE_PATTERN.search(clean) and EXCLUSIVE_ROUTE_HINT_PATTERN.search(clean):
+        return "exclusive_or_only_path"
+    if re.search(r"(当前位置|目前位于|截至|距离|离|海岸|航母|舰|号|carrier|current position|distance)", clean, flags=re.I) and re.search(r"(\d+(?:\.\d+)?\s*(公里|千米|海里|km|nm|英里|mile))", clean, flags=re.I):
+        return "current_position_distance"
+    if has_event_result_signal(clean):
+        return "event_result_status"
+    if re.search(r"(第一阶段|第二阶段|阶段|开始|开启|启动|结束|完成|公布|发布|结果|出炉)", clean) and re.search(r"(\d{4}|明年|今年|月|日|之后|之前)", clean):
+        return "phase_boundary_time"
+    if re.search(r"(虚构|网传|AI生成|剧本|现实|真实|未发生|并未|不存在|战争|断网|袭击|全面战争)", clean, flags=re.I):
+        return "reality_vs_fiction_status"
+    if re.search(r"(汇率|中间价|买入价|卖出价|牌价|战绩|比分|距离|人数|金额|奖金|基点|美元|人民币|公里|千米|胜|负)", clean, flags=re.I) and re.search(r"\d", clean):
+        return "numeric_quote_or_metric"
+    return ""
+
+
+def split_atomic_clause_candidates(sentence: str) -> List[str]:
+    clean = strip_markdown_noise(sentence)
+    if not clean:
+        return []
+    parts = [clean]
+    if len(clean) > 60:
+        parts.extend(split_mixed_sentence_clauses(clean))
+    out: List[str] = []
+    for part in parts:
+        text = normalize_text(part)
+        if not text or len(text) < 5:
+            continue
+        if text not in out:
+            out.append(text)
+    return out[:6]
+
+
+def find_parent_claim_for_atomic(text: str, claims: List[Dict[str, Any]]) -> Dict[str, Any]:
+    best: Dict[str, Any] = {}
+    best_score = -1
+    text_tokens = set(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", normalize_text(text)))
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_text = normalize_text(str(claim.get("claim") or ""))
+        if not claim_text:
+            continue
+        if claim_texts_overlap(text, claim_text):
+            return claim
+        claim_tokens = set(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", claim_text))
+        score = len(text_tokens & claim_tokens)
+        if score > best_score:
+            best = claim
+            best_score = score
+    return best if best_score > 0 else {}
+
+
+def build_atomic_claims_for_extracted(extracted: Dict[str, Any], claims: List[Dict[str, Any]]) -> Dict[str, Any]:
+    answer_text = normalize_text(str(extracted.get("_answer_text") or ""))
+    need_type = normalize_need_type(extracted.get("need_type"))
+    atomic_rows: List[Dict[str, Any]] = []
+    seen = set()
+    for sentence in split_answer_sentences_for_claims(answer_text):
+        for clause in split_atomic_clause_candidates(sentence):
+            risk_type = infer_atomic_risk_type(clause, need_type)
+            if not risk_type:
+                continue
+            canonical = normalize_text(re.sub(r"\s+", "", clause))
+            key = (risk_type, canonical[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+            parent = find_parent_claim_for_atomic(clause, claims)
+            parent_id = str(parent.get("claim_id") or parent.get("id") or "")
+            parent_centrality = str(parent.get("centrality") or "supporting")
+            centrality_hint = "core" if parent_centrality == "core" and risk_type in {"event_result_status", "current_position_distance", "reality_vs_fiction_status"} else "supporting"
+            slots = atomic_claim_slot_contract(clause, risk_type, parent)
+            refutation_terms = atomic_refutation_terms(clause, risk_type, slots)
+            query = compact_claim_text(" ".join(refutation_terms), 120)
+            atomic_rows.append(
+                {
+                    "atomic_claim_id": f"ac{len(atomic_rows) + 1}",
+                    "parent_claim_id": parent_id,
+                    "text": compact_claim_text(clause, 180),
+                    "risk_type": risk_type,
+                    "centrality_hint": centrality_hint,
+                    "expected_evidence_shape": atomic_expected_evidence_shape(risk_type),
+                    "slot_contract": slots,
+                    "search_priority": ATOMIC_RISK_PRIORITY.get(risk_type, 50),
+                    "refutation_target": {
+                        "state": "planned_only",
+                        "query": query,
+                        "target_terms": refutation_terms,
+                        "source_preference": ["official", "news", "html"],
+                    },
+                    "do_not_decide_without_gate": True,
+                }
+            )
+            if len(atomic_rows) >= 12:
+                break
+        if len(atomic_rows) >= 12:
+            break
+    high_risk = sorted(atomic_rows, key=lambda row: int(row.get("search_priority") or 0), reverse=True)[:6]
+    route_debug = [
+        {
+            "atomic_claim_id": row.get("atomic_claim_id"),
+            "parent_claim_id": row.get("parent_claim_id"),
+            "risk_type": row.get("risk_type"),
+            "text": compact_claim_text(str(row.get("text") or ""), 120),
+            "route_state": "extracted_only_no_retrieval",
+            "search_priority": row.get("search_priority"),
+            "refutation_query": (row.get("refutation_target") or {}).get("query") if isinstance(row.get("refutation_target"), dict) else "",
+        }
+        for row in high_risk
+    ]
+    return {
+        "atomic_claims": atomic_rows,
+        "high_risk_atomic_claims": high_risk,
+        "atomic_claim_route_debug": route_debug,
+    }
+
+
 def dedupe_structured_detail_claims(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def canonical_structured_detail_text(text: str) -> str:
         cleaned = strip_markdown_noise(text)
@@ -8258,6 +8572,24 @@ def apply_decision_useful_candidate_rerank(
         point_conversion["top_candidate_is_pseudo"] = bool(top_candidate.get("is_pseudo_evidence"))
         point_conversion["top_evidence_candidate_title"] = str(top_evidence_candidate.get("title") or "")
         point_conversion["top_evidence_candidate_profile"] = str(top_evidence_candidate.get("sentence_candidate_profile") or "")
+        point_conversion["slot_contract_state"] = str(top_candidate.get("slot_contract_state") or "")
+        point_conversion["slot_coverage"] = top_candidate.get("slot_coverage") if isinstance(top_candidate.get("slot_coverage"), dict) else {}
+        point_conversion["slot_missing"] = top_candidate.get("slot_missing") if isinstance(top_candidate.get("slot_missing"), list) else []
+        point_conversion["slot_mismatch"] = top_candidate.get("slot_mismatch") if isinstance(top_candidate.get("slot_mismatch"), list) else []
+        point_conversion["slot_conflict"] = top_candidate.get("slot_conflict") if isinstance(top_candidate.get("slot_conflict"), list) else []
+        point_conversion["same_slot_ready"] = bool(top_candidate.get("same_slot_ready"))
+        point_conversion["refute_slot_ready"] = bool(top_candidate.get("refute_slot_ready"))
+        point_conversion["candidate_conflict_profile"] = (
+            top_candidate.get("candidate_conflict_profile")
+            if isinstance(top_candidate.get("candidate_conflict_profile"), dict)
+            else {}
+        )
+        point_conversion["conflict_type"] = str(top_candidate.get("conflict_type") or "")
+        point_conversion["conflict_strength"] = str(top_candidate.get("conflict_strength") or "")
+        point_conversion["conflict_slot"] = str(top_candidate.get("conflict_slot") or "")
+        point_conversion["claim_value"] = top_candidate.get("claim_value")
+        point_conversion["evidence_value"] = top_candidate.get("evidence_value")
+        point_conversion["same_slot_conflict_ready"] = bool(top_candidate.get("same_slot_conflict_ready"))
         summary["point_conversion"] = point_conversion
         rerank_debug[claim_id] = {
             "query_effective_role": query_role,
@@ -8269,6 +8601,18 @@ def apply_decision_useful_candidate_rerank(
             "top_direct_evidence_gate_result": str(top_candidate.get("direct_evidence_gate_result") or ""),
             "top_candidate_is_pseudo": bool(top_candidate.get("is_pseudo_evidence")),
             "top_evidence_candidate_title": str(top_evidence_candidate.get("title") or ""),
+            "top_slot_contract_state": str(top_candidate.get("slot_contract_state") or ""),
+            "top_slot_missing": top_candidate.get("slot_missing") if isinstance(top_candidate.get("slot_missing"), list) else [],
+            "top_slot_mismatch": top_candidate.get("slot_mismatch") if isinstance(top_candidate.get("slot_mismatch"), list) else [],
+            "top_candidate_conflict_profile": (
+                top_candidate.get("candidate_conflict_profile")
+                if isinstance(top_candidate.get("candidate_conflict_profile"), dict)
+                else {}
+            ),
+            "top_conflict_type": str(top_candidate.get("conflict_type") or ""),
+            "top_conflict_strength": str(top_candidate.get("conflict_strength") or ""),
+            "top_conflict_slot": str(top_candidate.get("conflict_slot") or ""),
+            "top_same_slot_conflict_ready": bool(top_candidate.get("same_slot_conflict_ready")),
         }
     if isinstance(debug_bucket, dict):
         debug_bucket["decision_useful_rerank"] = rerank_debug
@@ -8686,10 +9030,15 @@ def normalize_extracted_plan(extracted: Dict[str, Any]) -> Dict[str, Any]:
     normalized_claims = dedupe_exclusive_premise_claims(normalized_claims)
     normalized_claims = dedupe_structured_detail_claims(normalized_claims)
     user_need = normalize_text(str(extracted.get("user_need") or ""))
+    selected_claims = select_claims_for_budget(normalized_claims, MAX_CLAIMS, user_need)
+    atomic_payload = build_atomic_claims_for_extracted(extracted, selected_claims)
     normalized = {
         "user_need": user_need,
         "need_type": normalize_need_type(extracted.get("need_type")),
-        "claims": select_claims_for_budget(normalized_claims, MAX_CLAIMS, user_need),
+        "claims": selected_claims,
+        "atomic_claims": atomic_payload.get("atomic_claims") or [],
+        "high_risk_atomic_claims": atomic_payload.get("high_risk_atomic_claims") or [],
+        "atomic_claim_route_debug": atomic_payload.get("atomic_claim_route_debug") or [],
     }
     return refresh_extracted_claim_programs(normalized)
 
@@ -10245,6 +10594,9 @@ def build_semantic_audit_prompt(item: Dict[str, Any], extracted: Dict[str, Any],
 # 15. Verify 输入构造：把 claims、压缩证据和结构化证据摘要交给裁决模型。
 def build_verify_prompt(item: Dict[str, Any], extracted: Dict[str, Any], evidence_bundle: Dict[str, Any], evidence_summary: Dict[str, Any]) -> str:
     compact_evidence = compact_evidence_for_verify(evidence_bundle, evidence_summary)
+    evidence_ledger = evidence_summary.get("_evidence_ledger") if isinstance(evidence_summary.get("_evidence_ledger"), dict) else {}
+    core_assertion_audit = evidence_summary.get("_core_assertion_audit") if isinstance(evidence_summary.get("_core_assertion_audit"), dict) else {}
+    cross_claim_consistency = evidence_summary.get("_cross_claim_consistency") if isinstance(evidence_summary.get("_cross_claim_consistency"), dict) else {}
     return f"""请基于下面信息判断最终标签。
 
 [time]
@@ -10262,9 +10614,21 @@ def build_verify_prompt(item: Dict[str, Any], extracted: Dict[str, Any], evidenc
 [compact_evidence]
 {json.dumps(compact_evidence, ensure_ascii=False)}
 
+[evidence_ledger]
+{json.dumps(evidence_ledger, ensure_ascii=False)}
+
+[core_assertion_audit]
+{json.dumps(core_assertion_audit, ensure_ascii=False)}
+
+[cross_claim_consistency]
+{json.dumps(cross_claim_consistency, ensure_ascii=False)}
+
 要求：
 - 先逐个claims判断，再聚合 final_label。
 - final_label 只能是 0/1/2。
+- 如果 evidence_ledger 没有 refuted_points，不要把未闭合/未拿到证据包装成事实错误。
+- 如果 core_assertion_audit 或 cross_claim_consistency 提示表层事实命中但核心断言未闭合，claim verdict 应优先为 uncertain，并在 counter_evidence_check 写明缺口。
+- 每条 claim_verdict 尽量补充 initial_verdict、counter_evidence_check、contradiction_found、needs_consistency_review、evidence_ledger_used、abstain_reason。
 - analyse 只写决定标签的关键错误点。
 """
 
@@ -12517,6 +12881,565 @@ def llm_reason_is_safe(reason: str, label: str, decision_basis: str, evidence_su
     return True
 
 
+CORE_ASSERTION_MARKERS = [
+    "代表", "意味着", "说明", "表明", "反映", "主要因为", "原因", "导致", "推动", "影响",
+    "抢筹", "定价", "解释", "本质", "说明了", "显示出", "源于", "由于", "因此",
+]
+
+SURFACE_FACT_MARKERS = [
+    "开盘", "收盘", "高开", "低开", "上涨", "下跌", "涨幅", "跌幅", "点", "比分",
+    "战胜", "击败", "休市", "开市", "日期", "时间", "汇率", "牌价", "中间价", "美元",
+]
+
+
+def claim_decision_slots(claim: Dict[str, Any]) -> Dict[str, Any]:
+    program = claim.get("evidence_need_program") if isinstance(claim.get("evidence_need_program"), dict) else {}
+    slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    return slots if isinstance(slots, dict) else {}
+
+
+def claim_answer_role_impact(claim: Dict[str, Any]) -> str:
+    program = claim.get("evidence_need_program") if isinstance(claim.get("evidence_need_program"), dict) else {}
+    return str(program.get("answer_role_impact") or claim.get("centrality") or "")
+
+
+def claim_evidence_mode_from_summary(claim: Dict[str, Any], summary: Optional[Dict[str, Any]]) -> str:
+    summary = summary if isinstance(summary, dict) else {}
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    return str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or "")
+
+
+def claim_is_core_assertion(claim: Dict[str, Any]) -> bool:
+    text = normalize_text(str(claim.get("claim") or ""))
+    centrality = str(claim.get("centrality") or "")
+    role = claim_answer_role_impact(claim)
+    if centrality != "core" and role != "core":
+        return False
+    if any(marker in text for marker in CORE_ASSERTION_MARKERS):
+        return True
+    if re.search(r"比.+更|更.+", text):
+        return True
+    if re.search(r"(主要|代表|意味着|反映|导致|因为|由于|抢筹|定价)", text):
+        return True
+    return False
+
+
+def claim_is_surface_fact(claim: Dict[str, Any], summary: Optional[Dict[str, Any]] = None) -> bool:
+    text = normalize_text(str(claim.get("claim") or ""))
+    if any(marker in text for marker in CORE_ASSERTION_MARKERS):
+        return False
+    mode = claim_evidence_mode_from_summary(claim, summary)
+    slots = claim_decision_slots(claim)
+    buckets = slots.get("anchor_buckets") if isinstance(slots.get("anchor_buckets"), list) else []
+    if mode in {"numeric_fact", "date_fact", "schedule_fact", "event_result", "financial_quote", "market_movement"}:
+        return True
+    if any(str(bucket) in {"time", "event", "numeric", "status"} for bucket in buckets):
+        return True
+    return any(marker in text for marker in SURFACE_FACT_MARKERS)
+
+
+def claim_topic_terms(claim: Dict[str, Any]) -> List[str]:
+    slots = claim_decision_slots(claim)
+    raw_terms: List[str] = []
+    for key in ("subject", "object", "metric_or_relation", "status_or_result"):
+        value = normalize_text(str(slots.get(key) or ""))
+        if value:
+            raw_terms.append(value)
+    claim_text = normalize_text(str(claim.get("claim") or ""))
+    if claim_text:
+        raw_terms.extend(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,12}", claim_text)[:6])
+    terms: List[str] = []
+    seen = set()
+    for term in raw_terms:
+        cleaned = re.sub(r"[，。；、/\\|（）()：:\s]+", "", term)
+        if len(cleaned) < 2 or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        terms.append(cleaned)
+    return terms[:8]
+
+
+def claim_topics_overlap(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    left_terms = claim_topic_terms(left)
+    right_terms = claim_topic_terms(right)
+    for left_term in left_terms:
+        for right_term in right_terms:
+            if left_term in right_term or right_term in left_term:
+                return True
+    return False
+
+
+def build_core_assertion_audit(
+    extracted: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]],
+    evidence_ledger: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    claims = extracted.get("claims") if isinstance(extracted, dict) and isinstance(extracted.get("claims"), list) else []
+    summaries = (
+        evidence_summary.get("claim_summaries")
+        if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("claim_summaries"), dict)
+        else {}
+    )
+    ledger = evidence_ledger if isinstance(evidence_ledger, dict) else {}
+    state_by_claim: Dict[str, str] = {}
+    for row in ledger.get("claim_rows") or []:
+        if isinstance(row, dict):
+            state_by_claim[str(row.get("claim_id") or "")] = str(row.get("state") or "")
+    pipeline_by_claim = {
+        str(row.get("claim_id") or ""): row
+        for row in (
+            claim_pipeline_diagnostics.get("items")
+            if isinstance(claim_pipeline_diagnostics, dict) and isinstance(claim_pipeline_diagnostics.get("items"), list)
+            else []
+        )
+        if isinstance(row, dict)
+    }
+    core_assertions: List[Dict[str, Any]] = []
+    unresolved_core: List[Dict[str, Any]] = []
+    surface_hits: List[Dict[str, Any]] = []
+    role_review: List[Dict[str, Any]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+        summary = summaries.get(claim_id) if isinstance(summaries.get(claim_id), dict) else {}
+        state = state_by_claim.get(claim_id, "unresolved")
+        pipeline_row = pipeline_by_claim.get(claim_id, {})
+        text = compact_claim_text(str(claim.get("claim") or ""), 110)
+        if claim_is_core_assertion(claim):
+            row = {
+                "claim_id": claim_id,
+                "claim": text,
+                "state": state,
+                "answer_role_impact": claim_answer_role_impact(claim),
+                "pipeline_stage": str(pipeline_row.get("pipeline_stage") or ""),
+            }
+            core_assertions.append(row)
+            if state not in {"confirmed", "refuted"}:
+                unresolved_core.append(row)
+            role_review.append(
+                {
+                    "claim_id": claim_id,
+                    "claim": text,
+                    "role_before": str(claim.get("centrality") or ""),
+                    "answer_role_impact": claim_answer_role_impact(claim),
+                    "role_after": "core_assertion",
+                    "reason": "claim_contains_explanation_or_interpretation_marker",
+                }
+            )
+        if claim_is_surface_fact(claim, summary):
+            hit_state = ""
+            if state == "confirmed":
+                hit_state = "confirmed"
+            elif str(pipeline_row.get("slot_contract_state") or "") == "same_slot_ready":
+                hit_state = "same_slot_ready"
+            elif int(pipeline_row.get("answer_candidate_total") or 0) > 0:
+                hit_state = "candidate_present"
+            if hit_state:
+                surface_hits.append(
+                    {
+                        "claim_id": claim_id,
+                        "claim": text,
+                        "state": state,
+                        "surface_hit_state": hit_state,
+                        "direct_evidence_gate_result": str(pipeline_row.get("direct_evidence_gate_result") or ""),
+                    }
+                )
+    same_topic_pairs: List[Dict[str, Any]] = []
+    for surface in surface_hits:
+        surface_claim = next((c for c in claims if isinstance(c, dict) and str(c.get("claim_id") or c.get("id") or "") == surface.get("claim_id")), {})
+        for core in unresolved_core:
+            core_claim = next((c for c in claims if isinstance(c, dict) and str(c.get("claim_id") or c.get("id") or "") == core.get("claim_id")), {})
+            if isinstance(surface_claim, dict) and isinstance(core_claim, dict) and claim_topics_overlap(surface_claim, core_claim):
+                same_topic_pairs.append(
+                    {
+                        "surface_claim_id": surface.get("claim_id"),
+                        "core_claim_id": core.get("claim_id"),
+                        "surface_state": surface.get("surface_hit_state"),
+                    }
+                )
+    surface_fact_risk = bool(surface_hits and unresolved_core)
+    missed_hint = ""
+    if unresolved_core:
+        missed_hint = f"核心解释/归因断言仍未闭合：{unresolved_core[0].get('claim')}"
+    state = "surface_fact_confirmed_core_unresolved" if surface_fact_risk else "ok"
+    return {
+        "state": state,
+        "surface_fact_risk": surface_fact_risk,
+        "surface_fact_confirmed_but_core_unresolved": surface_fact_risk,
+        "missed_core_assertion_hint": missed_hint,
+        "claim_role_before_after": role_review[:6],
+        "core_assertion_claims": core_assertions[:6],
+        "surface_fact_hits": surface_hits[:6],
+        "same_topic_surface_core_pairs": same_topic_pairs[:6],
+    }
+
+
+def build_cross_claim_consistency(
+    extracted: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]],
+    evidence_ledger: Optional[Dict[str, Any]],
+    core_assertion_audit: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ledger = evidence_ledger if isinstance(evidence_ledger, dict) else {}
+    audit = core_assertion_audit if isinstance(core_assertion_audit, dict) else {}
+    confirmed = ledger.get("confirmed_points") if isinstance(ledger.get("confirmed_points"), list) else []
+    refuted = ledger.get("refuted_points") if isinstance(ledger.get("refuted_points"), list) else []
+    unresolved = ledger.get("unresolved_points") if isinstance(ledger.get("unresolved_points"), list) else []
+    unresolved_core = [
+        row for row in (audit.get("core_assertion_claims") or [])
+        if isinstance(row, dict) and str(row.get("state") or "") not in {"confirmed", "refuted"}
+    ]
+    issues: List[Dict[str, Any]] = []
+    if audit.get("surface_fact_risk"):
+        issues.append(
+            {
+                "type": "surface_fact_confirmed_but_core_unresolved",
+                "reason": str(audit.get("missed_core_assertion_hint") or "surface_fact_hit_core_unresolved"),
+                "pairs": audit.get("same_topic_surface_core_pairs") or [],
+            }
+        )
+    if refuted and unresolved_core:
+        issues.append(
+            {
+                "type": "refuted_point_with_related_unresolved_core",
+                "reason": "存在反证点，但仍有核心解释/结论 claim 未闭合，聚合时需要区分主次作用域。",
+            }
+        )
+    consistency_label_pressure = "none"
+    if refuted:
+        consistency_label_pressure = "refute_pressure"
+    elif audit.get("surface_fact_risk"):
+        consistency_label_pressure = "keep_label_2_core_unresolved"
+    elif unresolved_core:
+        consistency_label_pressure = "core_unresolved"
+    return {
+        "state": "needs_review" if issues else "ok",
+        "issues": issues[:6],
+        "surface_fact_confirmed_but_core_unresolved": bool(audit.get("surface_fact_risk")),
+        "same_topic_refute_count": len(refuted),
+        "same_topic_unresolved_high_risk_count": len(unresolved_core),
+        "confirmed_point_count": len(confirmed),
+        "refuted_point_count": len(refuted),
+        "unresolved_point_count": len(unresolved),
+        "consistency_label_pressure": consistency_label_pressure,
+    }
+
+
+def cross_claim_consistency_reason(label: str, evidence_summary: Optional[Dict[str, Any]]) -> str:
+    if label != LABEL_2 or not isinstance(evidence_summary, dict):
+        return ""
+    consistency = evidence_summary.get("_cross_claim_consistency") if isinstance(evidence_summary.get("_cross_claim_consistency"), dict) else {}
+    audit = evidence_summary.get("_core_assertion_audit") if isinstance(evidence_summary.get("_core_assertion_audit"), dict) else {}
+    if not consistency.get("surface_fact_confirmed_but_core_unresolved"):
+        return ""
+    surface_hits = audit.get("surface_fact_hits") if isinstance(audit.get("surface_fact_hits"), list) else []
+    core_claims = [
+        row for row in (audit.get("core_assertion_claims") or [])
+        if isinstance(row, dict) and str(row.get("state") or "") not in {"confirmed", "refuted"}
+    ]
+    surface_text = str(surface_hits[0].get("claim") or "") if surface_hits else "表层事实"
+    core_text = str(core_claims[0].get("claim") or "") if core_claims else str(audit.get("missed_core_assertion_hint") or "核心解释/结论断言")
+    surface_state = str(surface_hits[0].get("surface_hit_state") or "") if surface_hits else ""
+    if surface_state == "confirmed":
+        surface_clause = f"表层事实已被证据账本确认：{surface_text}"
+    elif surface_state:
+        surface_clause = f"表层事实已有同槽候选命中但未越过 gate：{surface_text}"
+    else:
+        surface_clause = f"表层事实已有相关材料：{surface_text}"
+    return f"{surface_clause}；但真正影响裁决的核心断言仍未闭合：{core_text}。当前没有同槽可裁决的冲突证据，不能把未闭合包装成事实错误，因此保守判为无事实错误。"
+
+
+def _ledger_point_row(claim_id: str, claim_text: str, point: Dict[str, Any], state: str) -> Dict[str, Any]:
+    return {
+        "claim_id": claim_id,
+        "claim": compact_claim_text(claim_text, 90),
+        "state": state,
+        "point": compact_claim_text(point_text(point), 160),
+        "title": compact_claim_text(str(point.get("title") or ""), 90),
+        "url": str(point.get("url") or ""),
+        "slot_contract_state": str(point.get("slot_contract_state") or ""),
+        "slot_coverage": point.get("slot_coverage") if isinstance(point.get("slot_coverage"), dict) else {},
+        "slot_missing": point.get("slot_missing") if isinstance(point.get("slot_missing"), list) else [],
+        "slot_mismatch": point.get("slot_mismatch") if isinstance(point.get("slot_mismatch"), list) else [],
+        "slot_conflict": point.get("slot_conflict") if isinstance(point.get("slot_conflict"), list) else [],
+        "direct_evidence_gate_result": str(point.get("direct_evidence_gate_result") or ""),
+        "candidate_conflict_profile": point.get("candidate_conflict_profile") if isinstance(point.get("candidate_conflict_profile"), dict) else {},
+        "conflict_type": str(point.get("conflict_type") or ""),
+        "conflict_strength": str(point.get("conflict_strength") or ""),
+        "conflict_slot": str(point.get("conflict_slot") or ""),
+        "claim_value": point.get("claim_value"),
+        "evidence_value": point.get("evidence_value"),
+        "same_slot_conflict_ready": bool(point.get("same_slot_conflict_ready")),
+    }
+
+
+def build_evidence_ledger(
+    extracted: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    claims = extracted.get("claims") if isinstance(extracted, dict) and isinstance(extracted.get("claims"), list) else []
+    summaries = (
+        evidence_summary.get("claim_summaries")
+        if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("claim_summaries"), dict)
+        else {}
+    )
+    pipeline_items = {
+        str(item.get("claim_id") or ""): item
+        for item in (
+            claim_pipeline_diagnostics.get("items")
+            if isinstance(claim_pipeline_diagnostics, dict) and isinstance(claim_pipeline_diagnostics.get("items"), list)
+            else []
+        )
+        if isinstance(item, dict)
+    }
+    ledger: Dict[str, Any] = {
+        "confirmed_points": [],
+        "refuted_points": [],
+        "unresolved_points": [],
+        "gate_blocked_pages": [],
+        "slot_blocked_candidates": [],
+        "candidate_conflict_points": [],
+        "contrastive_unresolved_points": [],
+        "atomic_claims": [],
+        "high_risk_atomic_claims": [],
+        "atomic_refuted_points": [],
+        "atomic_unresolved_points": [],
+        "atomic_claim_route_debug": [],
+        "fallback_scope": "evidence_gate_first",
+        "final_label_reason": "",
+        "claim_rows": [],
+    }
+    atomic_claims = extracted.get("atomic_claims") if isinstance(extracted.get("atomic_claims"), list) else []
+    high_risk_atomic_claims = (
+        extracted.get("high_risk_atomic_claims")
+        if isinstance(extracted.get("high_risk_atomic_claims"), list)
+        else []
+    )
+    atomic_route_debug = (
+        extracted.get("atomic_claim_route_debug")
+        if isinstance(extracted.get("atomic_claim_route_debug"), list)
+        else []
+    )
+    ledger["atomic_claims"] = [
+        row for row in atomic_claims[:12]
+        if isinstance(row, dict)
+    ]
+    ledger["high_risk_atomic_claims"] = [
+        row for row in high_risk_atomic_claims[:6]
+        if isinstance(row, dict)
+    ]
+    ledger["atomic_claim_route_debug"] = [
+        row for row in atomic_route_debug[:8]
+        if isinstance(row, dict)
+    ]
+    for row in ledger["high_risk_atomic_claims"]:
+        ledger["atomic_unresolved_points"].append(
+            {
+                "atomic_claim_id": row.get("atomic_claim_id"),
+                "parent_claim_id": row.get("parent_claim_id"),
+                "text": compact_claim_text(str(row.get("text") or ""), 120),
+                "risk_type": str(row.get("risk_type") or ""),
+                "slot_contract": row.get("slot_contract") if isinstance(row.get("slot_contract"), dict) else {},
+                "refutation_target": row.get("refutation_target") if isinstance(row.get("refutation_target"), dict) else {},
+                "state": "extracted_only_no_gate_consumption",
+                "do_not_decide_without_gate": True,
+            }
+        )
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+        claim_text = normalize_text(str(claim.get("claim") or ""))
+        summary = summaries.get(claim_id) if isinstance(summaries.get(claim_id), dict) else {}
+        direct_refuting = claim_direct_refuting_points(summary)
+        direct_supporting = claim_direct_supporting_points(summary)
+        if direct_refuting:
+            row = _ledger_point_row(claim_id, claim_text, direct_refuting[0], "refuted")
+            ledger["refuted_points"].append(row)
+            claim_state = "refuted"
+        elif direct_supporting:
+            row = _ledger_point_row(claim_id, claim_text, direct_supporting[0], "confirmed")
+            ledger["confirmed_points"].append(row)
+            claim_state = "confirmed"
+        else:
+            point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+            pipeline_row = pipeline_items.get(claim_id, {})
+            slot_missing = point_conversion.get("slot_missing") if isinstance(point_conversion.get("slot_missing"), list) else []
+            slot_mismatch = point_conversion.get("slot_mismatch") if isinstance(point_conversion.get("slot_mismatch"), list) else []
+            if not slot_missing:
+                slot_missing = pipeline_row.get("missing_required_slots") if isinstance(pipeline_row.get("missing_required_slots"), list) else []
+            unresolved = {
+                "claim_id": claim_id,
+                "claim": compact_claim_text(claim_text, 90),
+                "state": "unresolved",
+                "pipeline_stage": str(pipeline_row.get("pipeline_stage") or ""),
+                "point_conversion_block_reason": str(point_conversion.get("block_reason") or pipeline_row.get("point_conversion_block_reason") or ""),
+                "slot_contract_state": str(point_conversion.get("slot_contract_state") or ""),
+                "slot_missing": [str(slot) for slot in slot_missing if str(slot)][:5],
+                "slot_mismatch": [str(slot) for slot in slot_mismatch if str(slot)][:5],
+                "slot_conflict": point_conversion.get("slot_conflict") if isinstance(point_conversion.get("slot_conflict"), list) else [],
+                "candidate_conflict_profile": (
+                    point_conversion.get("candidate_conflict_profile")
+                    if isinstance(point_conversion.get("candidate_conflict_profile"), dict)
+                    else {}
+                ),
+                "conflict_type": str(point_conversion.get("conflict_type") or ""),
+                "conflict_strength": str(point_conversion.get("conflict_strength") or ""),
+                "conflict_slot": str(point_conversion.get("conflict_slot") or ""),
+                "claim_value": point_conversion.get("claim_value"),
+                "evidence_value": point_conversion.get("evidence_value"),
+                "same_slot_conflict_ready": bool(point_conversion.get("same_slot_conflict_ready")),
+                "direct_evidence_gate_result": str(point_conversion.get("direct_evidence_gate_result") or ""),
+            }
+            ledger["unresolved_points"].append(unresolved)
+            claim_state = "unresolved"
+        candidates = summary.get("evidence_sentence_candidates") if isinstance(summary.get("evidence_sentence_candidates"), list) else []
+        for candidate in candidates[:4]:
+            if not isinstance(candidate, dict):
+                continue
+            gate = str(candidate.get("direct_evidence_gate_result") or "")
+            if gate.startswith("blocked_"):
+                ledger["gate_blocked_pages"].append(
+                    {
+                        "claim_id": claim_id,
+                        "title": compact_claim_text(str(candidate.get("title") or ""), 90),
+                        "page_role": str(candidate.get("page_role") or ""),
+                        "direct_evidence_gate_result": gate,
+                    }
+                )
+            slot_missing = candidate.get("slot_missing") if isinstance(candidate.get("slot_missing"), list) else []
+            slot_mismatch = candidate.get("slot_mismatch") if isinstance(candidate.get("slot_mismatch"), list) else []
+            if slot_missing or slot_mismatch:
+                ledger["slot_blocked_candidates"].append(
+                    {
+                        "claim_id": claim_id,
+                        "title": compact_claim_text(str(candidate.get("title") or ""), 90),
+                        "slot_contract_state": str(candidate.get("slot_contract_state") or ""),
+                        "slot_missing": slot_missing[:5],
+                        "slot_mismatch": slot_mismatch[:5],
+                    }
+                )
+            conflict_profile = (
+                candidate.get("candidate_conflict_profile")
+                if isinstance(candidate.get("candidate_conflict_profile"), dict)
+                else {}
+            )
+            conflict_state = str(conflict_profile.get("state") or "")
+            conflict_type = str(candidate.get("conflict_type") or conflict_profile.get("conflict_type") or "")
+            conflict_strength = str(candidate.get("conflict_strength") or conflict_profile.get("conflict_strength") or "")
+            if conflict_profile or conflict_type:
+                conflict_row = {
+                    "claim_id": claim_id,
+                    "claim": compact_claim_text(claim_text, 90),
+                    "sentence": compact_claim_text(
+                        str(candidate.get("sentence") or candidate.get("text") or candidate.get("snippet") or ""),
+                        180,
+                    ),
+                    "title": compact_claim_text(str(candidate.get("title") or ""), 90),
+                    "url": str(candidate.get("url") or ""),
+                    "conflict_state": conflict_state,
+                    "conflict_type": conflict_type,
+                    "conflict_strength": conflict_strength,
+                    "conflict_slot": str(candidate.get("conflict_slot") or conflict_profile.get("conflict_slot") or ""),
+                    "claim_value": candidate.get("claim_value", conflict_profile.get("claim_value")),
+                    "evidence_value": candidate.get("evidence_value", conflict_profile.get("evidence_value")),
+                    "same_slot_conflict_ready": bool(candidate.get("same_slot_conflict_ready") or conflict_profile.get("same_slot_conflict_ready")),
+                    "direct_evidence_gate_result": str(candidate.get("direct_evidence_gate_result") or ""),
+                    "page_role": str(candidate.get("page_role") or ""),
+                    "block_reason": str(
+                        conflict_profile.get("block_reason")
+                        or candidate.get("generic_page_not_consumed_reason")
+                        or candidate.get("entry_page_not_consumed_reason")
+                        or candidate.get("direct_evidence_gate_result")
+                        or ""
+                    ),
+                }
+                if conflict_strength in {"strong", "medium"} or conflict_state in {"conflict_ready", "conflict_diagnostic"}:
+                    ledger["candidate_conflict_points"].append(conflict_row)
+                elif not conflict_row["same_slot_conflict_ready"]:
+                    ledger["contrastive_unresolved_points"].append(conflict_row)
+        ledger["claim_rows"].append(
+            {
+                "claim_id": claim_id,
+                "claim": compact_claim_text(claim_text, 90),
+                "centrality": str(claim.get("centrality") or ""),
+                "state": claim_state,
+            }
+        )
+    for key in (
+        "confirmed_points",
+        "refuted_points",
+        "unresolved_points",
+        "gate_blocked_pages",
+        "slot_blocked_candidates",
+        "candidate_conflict_points",
+        "contrastive_unresolved_points",
+        "atomic_claims",
+        "high_risk_atomic_claims",
+        "atomic_refuted_points",
+        "atomic_unresolved_points",
+        "atomic_claim_route_debug",
+    ):
+        ledger[key] = ledger[key][:8]
+    return ledger
+
+
+def evidence_ledger_reason(label: str, evidence_summary: Optional[Dict[str, Any]]) -> str:
+    ledger = (
+        evidence_summary.get("_evidence_ledger")
+        if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("_evidence_ledger"), dict)
+        else {}
+    )
+    if not ledger:
+        return ""
+    refuted = ledger.get("refuted_points") if isinstance(ledger.get("refuted_points"), list) else []
+    confirmed = ledger.get("confirmed_points") if isinstance(ledger.get("confirmed_points"), list) else []
+    unresolved = ledger.get("unresolved_points") if isinstance(ledger.get("unresolved_points"), list) else []
+    conflict_points = ledger.get("candidate_conflict_points") if isinstance(ledger.get("candidate_conflict_points"), list) else []
+    contrastive_unresolved = ledger.get("contrastive_unresolved_points") if isinstance(ledger.get("contrastive_unresolved_points"), list) else []
+    if refuted:
+        first = refuted[0]
+        claim_text = str(first.get("claim") or "")
+        point = str(first.get("point") or "")
+        scope = "主需" if label == LABEL_0 else "次需"
+        return f"证据账本显示存在同槽反证：{claim_text}；{point}。因此判为{scope}事实错误。"
+    parts: List[str] = []
+    if confirmed:
+        first = confirmed[0]
+        parts.append(f"已确认：{first.get('claim')}；{first.get('point')}")
+    if conflict_points:
+        first = conflict_points[0]
+        slot = str(first.get("conflict_slot") or "冲突槽位")
+        strength = str(first.get("conflict_strength") or "diagnostic")
+        if first.get("same_slot_conflict_ready"):
+            parts.append(
+                f"候选冲突已成型但仍未进入直接反证点：{first.get('claim')} 的 {slot} 与材料值不一致"
+            )
+        else:
+            block = str(first.get("block_reason") or first.get("direct_evidence_gate_result") or "gate 未通过")
+            parts.append(
+                f"发现候选冲突诊断：{first.get('claim')} 的 {slot} 出现 {strength} 冲突信号，但卡在 {block}"
+            )
+    if unresolved:
+        first = unresolved[0]
+        gaps = ",".join(str(slot) for slot in (first.get("slot_missing") or first.get("slot_mismatch") or []) if str(slot))
+        block = str(first.get("point_conversion_block_reason") or first.get("pipeline_stage") or "证据未闭合")
+        gap_text = f"，缺口在 {gaps}" if gaps else ""
+        parts.append(f"未闭合：{first.get('claim')} 仍停在 {block}{gap_text}")
+    if not conflict_points and contrastive_unresolved:
+        first = contrastive_unresolved[0]
+        block = str(first.get("block_reason") or "主体/时间/指标仍未同槽")
+        parts.append(f"对照式反证仍未成型：{first.get('claim')} 卡在 {block}")
+    if parts:
+        tail = "。证据账本没有同槽反证，fallback 只做保守兜底，因此当前不判定为事实错误。" if label == LABEL_2 else "。当前仍未形成足以翻转标签的同槽反证，因此先按现有证据保守裁决。"
+        return "；".join(parts[:2]) + tail
+    return ""
+
+
 def choose_final_reason(
     verify_obj: Dict[str, Any],
     label: str,
@@ -12558,6 +13481,12 @@ def choose_final_reason(
             verify_obj.get("_evidence_non_decidable_state"),
         )
         candidates.insert(0, ("evidence_reason", evidence_based))
+    ledger_based = evidence_ledger_reason(label, evidence_summary)
+    if ledger_based and (label == LABEL_2 or has_direct_refuting_evidence(evidence_summary)):
+        candidates.insert(0, ("evidence_ledger_reason", ledger_based))
+    consistency_based = cross_claim_consistency_reason(label, evidence_summary)
+    if consistency_based:
+        candidates.insert(0, ("cross_claim_consistency_reason", consistency_based))
     for source, value in candidates:
         reason = normalize_reason_by_decision_basis(str(value or ""), label, decision_basis)
         if llm_reason_is_safe(reason, label, decision_basis, evidence_summary):
@@ -12644,6 +13573,11 @@ def aggregate_by_confidence(
     final_label = original_label
     result["_pre_aggregation_analyse"] = str(result.get("analyse") or "")
     result["_evidence_first_audit"] = evidence_first_audit(extracted, evidence_summary)
+    if isinstance(evidence_summary, dict):
+        if isinstance(evidence_summary.get("_core_assertion_audit"), dict):
+            result["_core_assertion_audit"] = evidence_summary.get("_core_assertion_audit")
+        if isinstance(evidence_summary.get("_cross_claim_consistency"), dict):
+            result["_cross_claim_consistency"] = evidence_summary.get("_cross_claim_consistency")
     if isinstance(claim_pipeline_diagnostics, dict):
         result["_claim_pipeline_diagnostics"] = claim_pipeline_diagnostics
     verdicts = result.get("claim_verdicts") or []
@@ -12830,6 +13764,11 @@ def aggregate_by_confidence(
         final_label,
         str(result.get("_decision_basis") or ""),
     )
+    consistency_reason = cross_claim_consistency_reason(final_label, evidence_summary)
+    if consistency_reason and str(result.get("_decision_basis") or "") == "insufficient_evidence":
+        result["analyse"] = consistency_reason
+        result["_aggregation_analyse"] = consistency_reason
+        result["_decision_policy"] = result.get("_decision_policy") or "surface_fact_confirmed_but_core_unresolved"
     result["_max_verdict_confidence"] = max_conf
     return result
 
@@ -12987,6 +13926,26 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     debug["qa_evidence"] = evidence_summary.get("_qa_evidence")
     claim_pipeline_diagnostics = build_claim_pipeline_diagnostics(extracted, evidence_bundle, evidence_summary)
     debug["claim_pipeline_diagnostics"] = claim_pipeline_diagnostics
+    evidence_ledger = build_evidence_ledger(extracted, evidence_summary, claim_pipeline_diagnostics)
+    evidence_summary["_evidence_ledger"] = evidence_ledger
+    debug["evidence_ledger"] = evidence_ledger
+    core_assertion_audit = build_core_assertion_audit(
+        extracted,
+        evidence_summary,
+        claim_pipeline_diagnostics,
+        evidence_ledger,
+    )
+    evidence_summary["_core_assertion_audit"] = core_assertion_audit
+    debug["core_assertion_audit"] = core_assertion_audit
+    cross_claim_consistency = build_cross_claim_consistency(
+        extracted,
+        evidence_summary,
+        claim_pipeline_diagnostics,
+        evidence_ledger,
+        core_assertion_audit,
+    )
+    evidence_summary["_cross_claim_consistency"] = cross_claim_consistency
+    debug["cross_claim_consistency"] = cross_claim_consistency
     debug["evidence_first_audit"] = evidence_first_audit(extracted, evidence_summary)
     verify_obj, raw2 = llm_chat(SYSTEM_VERIFY, build_verify_prompt(item, extracted, evidence_bundle, evidence_summary))
     mark_timing("verify")
@@ -13130,6 +14089,9 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
         verify_obj["_final_reason_conflict_guard"] = final_conflict_issues
     if not reason:
         reason = "未发现明确事实错误"
+    if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("_evidence_ledger"), dict):
+        evidence_summary["_evidence_ledger"]["final_label_reason"] = reason
+        debug["evidence_ledger"] = evidence_summary["_evidence_ledger"]
     result = {"id": item.get("id"), "label": label, "reason": reason}
     debug_final_result = dict(result)
     debug_final_result.update(

@@ -71,6 +71,7 @@ CACHE_DIR = os.environ.get("V2_CACHE_DIR") or os.path.join(os.path.dirname(__fil
 USE_CACHE = os.environ.get("V2_DISABLE_CACHE", "0").lower() not in {"1", "true", "yes"}
 FETCH_DETAILS_PER_CLAIM = int(os.environ.get("V2_FETCH_DETAILS_PER_CLAIM", "2"))
 MAX_QUERIES_PER_CLAIM = int(os.environ.get("V2_MAX_QUERIES_PER_CLAIM", "3"))
+ENABLE_CONTRASTIVE_RETRIEVAL = os.environ.get("V2_ENABLE_CONTRASTIVE_RETRIEVAL", "0").lower() in {"1", "true", "yes"}
 ENABLE_BING_HTML = os.environ.get("V2_ENABLE_BING_HTML", "0").lower() in {"1", "true", "yes"}
 ENABLE_DUCKDUCKGO = os.environ.get("V2_ENABLE_DUCKDUCKGO", "0").lower() in {"1", "true", "yes"}
 ENABLE_PLAYWRIGHT = os.environ.get("V2_ENABLE_PLAYWRIGHT", "1").lower() in {"1", "true", "yes"}
@@ -3899,6 +3900,8 @@ def query_texts_from_plan(question: str, claim: str, time_value: str, claim_item
     queries.extend(with_query_origin(structured_point_retry_queries(question, claim, source_intent, normalized_queries), "structured_point_retry"))
     queries.extend(with_query_origin(page_shape_probe_queries(question, claim, source_intent, normalized_queries), "page_shape_probe"))
     queries.extend(with_query_origin(page_intent_retry_queries, "page_intent_retry"))
+    queries.extend(refutation_target_query_items(claim_item, claim, evidence_mode))
+    queries.extend(contrastive_query_items(claim_item, claim, evidence_mode))
     queries.extend(normalized_queries[planner_front_count:])
     queries.extend(with_query_origin(numeric_value_discovery_queries(claim, source_intent), "numeric_discovery"))
     for query in build_specialized_queries(question, claim, time_value):
@@ -4026,6 +4029,215 @@ def build_fact_slot_probe_query_text(claim_item: Dict[str, Any], claim: str, evi
         normalize_text(str(program.get("normalized_assertion") or claim)),
         96,
     )
+
+
+REFUTATION_QUERY_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result", "route_fact", "entity_fact"}
+CONTRASTIVE_QUERY_MODES = {"numeric_fact", "date_fact", "schedule_fact", "event_result", "route_fact", "entity_fact"}
+
+
+def build_refutation_target(claim_item: Dict[str, Any], claim: str, evidence_mode: str) -> Dict[str, Any]:
+    source_intent = claim_item.get("source_intent") if isinstance(claim_item.get("source_intent"), dict) else {}
+    program = claim_program_from_claim_item(claim_item)
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    required_slots = (
+        [str(slot) for slot in (program.get("required_slot_profile") or []) if str(slot)]
+        if isinstance(program.get("required_slot_profile"), list)
+        else shared_required_slot_profile_for_mode(
+            evidence_mode,
+            claim_text=claim,
+            source_intent=source_intent,
+            decision_slots=decision_slots,
+        )
+    )
+    slots = {
+        key: normalize_text(str(decision_slots.get(key) or ""))
+        for key in ("subject", "time_scope", "object", "metric_or_relation", "status_or_result")
+    }
+    missing_slots = [slot for slot in required_slots if not slots.get(slot)]
+    must_include = [
+        normalize_text(str(term))
+        for term in (direct_need.get("must_include") or [])
+        if normalize_text(str(term))
+    ] if isinstance(direct_need.get("must_include"), list) else []
+    target_terms = dedupe_keep_order(
+        [
+            slots.get("subject", ""),
+            slots.get("time_scope", ""),
+            slots.get("metric_or_relation", ""),
+            slots.get("object", ""),
+            slots.get("status_or_result", ""),
+        ] + must_include[:3]
+    )
+    if evidence_mode in {"numeric_fact", "date_fact", "schedule_fact"}:
+        conflict_terms = ["实际", "官方", "历史", "公告", "公布"]
+    elif evidence_mode == "event_result":
+        conflict_terms = ["结果", "比分", "赛果", "官方"]
+    elif evidence_mode == "route_fact":
+        conflict_terms = ["实际", "路线", "是否经过", "官方"]
+    else:
+        conflict_terms = ["实际", "官方", "结果"]
+    query_text = compact_text_for_query(" ".join([term for term in target_terms + conflict_terms[:2] if term]), 96)
+    return {
+        "state": "ready" if len([term for term in target_terms if term]) >= 2 else "insufficient_slots",
+        "slots": slots,
+        "required_slots": required_slots,
+        "missing_slots": missing_slots,
+        "target_terms": [term for term in target_terms if term][:8],
+        "conflict_terms": conflict_terms[:4],
+        "query": query_text,
+    }
+
+
+def refutation_target_query_items(claim_item: Dict[str, Any], claim: str, evidence_mode: str) -> List[Dict[str, Any]]:
+    if evidence_mode not in REFUTATION_QUERY_MODES:
+        return []
+    if str(claim_item.get("centrality") or "") not in {"core", "supporting"}:
+        return []
+    target = build_refutation_target(claim_item, claim, evidence_mode)
+    claim_item["_refutation_target"] = target
+    query_text = normalize_text(str(target.get("query") or ""))
+    if target.get("state") != "ready" or not query_text:
+        return []
+    return [
+        {
+            "q": query_text,
+            "goal": "find_refutation_target",
+            "origin": "refutation_target",
+            "query_variant_origin": "refutation_target",
+            "source_preference": ["official", "news", "html"],
+        }
+    ]
+
+
+def build_contrastive_query_plan(claim_item: Dict[str, Any], claim: str, evidence_mode: str) -> Dict[str, Any]:
+    source_intent = claim_item.get("source_intent") if isinstance(claim_item.get("source_intent"), dict) else {}
+    program = claim_program_from_claim_item(claim_item)
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    slots = {
+        key: normalize_text(str(decision_slots.get(key) or ""))
+        for key in (
+            "subject",
+            "time_scope",
+            "object",
+            "metric_or_relation",
+            "status_or_result",
+            "comparison_baseline",
+            "source_scope",
+        )
+    }
+    required_slots = shared_required_slot_profile_for_mode(
+        evidence_mode,
+        claim_text=claim,
+        source_intent=source_intent,
+        decision_slots=decision_slots,
+    )
+    slot_gap = [slot for slot in required_slots if not slots.get(slot)]
+    must_include = [
+        normalize_text(str(term))
+        for term in (direct_need.get("must_include") or [])
+        if normalize_text(str(term))
+    ] if isinstance(direct_need.get("must_include"), list) else []
+    if evidence_mode in {"date_fact", "schedule_fact"}:
+        contrast_terms = ["官方", "公告", "安排", "日程", "休市", "开市"]
+        terms = [slots["subject"], slots["time_scope"], slots["status_or_result"]] + contrast_terms[:4]
+    elif evidence_mode == "numeric_fact":
+        contrast_terms = ["历史数据", "表格", "牌价", "中间价", "发布日期"]
+        terms = [slots["subject"], slots["metric_or_relation"], slots["time_scope"], slots["object"]] + contrast_terms[:4]
+    elif evidence_mode == "event_result":
+        contrast_terms = ["result", "final score", "赛果", "战报", "官方"]
+        terms = [slots["subject"], slots["object"], slots["time_scope"], slots["status_or_result"]] + contrast_terms[:4]
+    elif evidence_mode == "route_fact":
+        contrast_terms = ["实际", "是否", "路线", "经过", "官方", "说明"]
+        terms = [slots["subject"], slots["object"], slots["time_scope"], slots["metric_or_relation"]] + contrast_terms[:4]
+    else:
+        explanation_hint = bool(
+            re.search(r"(因为|导致|归因|抢筹|倒挂|资金|flow|inflow|outflow)", claim, flags=re.I)
+            or normalize_text(str(source_intent.get("claim_shape") or "")) in {"causal_explanation", "interpretation"}
+        )
+        contrast_terms = (
+            ["资金流", "南向资金", "外资", "机构", "成交额", "持仓"]
+            if explanation_hint
+            else ["实际", "官方", "结果", "说明"]
+        )
+        terms = [slots["subject"], slots["time_scope"], slots["metric_or_relation"], slots["object"]] + contrast_terms[:4]
+    query_text = compact_text_for_query(" ".join(term for term in dedupe_keep_order(terms + must_include[:2]) if term), 96)
+    filled = [value for value in (slots.get("subject"), slots.get("time_scope"), slots.get("metric_or_relation"), slots.get("object")) if value]
+    trigger = "slot_contrastive_gap" if len(filled) >= 2 else ""
+    return {
+        "state": "ready" if query_text and trigger else "insufficient_slots",
+        "trigger": trigger,
+        "slots": slots,
+        "slot_gap": slot_gap[:6],
+        "contrast_terms": contrast_terms[:6],
+        "query": query_text,
+    }
+
+
+def contrastive_query_items(claim_item: Dict[str, Any], claim: str, evidence_mode: str) -> List[Dict[str, Any]]:
+    if evidence_mode not in CONTRASTIVE_QUERY_MODES:
+        return []
+    if str(claim_item.get("centrality") or "") not in {"core", "supporting"}:
+        return []
+    plan = build_contrastive_query_plan(claim_item, claim, evidence_mode)
+    claim_item["_contrastive_query_plan"] = plan
+    query_text = normalize_text(str(plan.get("query") or ""))
+    if not ENABLE_CONTRASTIVE_RETRIEVAL:
+        return []
+    if plan.get("state") != "ready" or not query_text:
+        return []
+    return [
+        {
+            "q": query_text,
+            "goal": "find_contrastive_evidence",
+            "origin": "contrastive_query",
+            "query_variant_origin": "contrastive_query",
+            "source_preference": ["official", "news", "html"],
+        }
+    ]
+
+
+ATOMIC_CLAIM_QUERY_HINTS = {
+    "market_calendar_status": ["官方", "公告", "交易日历", "休市", "开市"],
+    "exclusive_or_only_path": ["替代通道", "管道", "港口", "绕开", "说明"],
+    "event_result_status": ["赛果", "比分", "退赛", "不战而胜", "官方"],
+    "current_position_distance": ["current position", "distance", "as of", "location"],
+    "phase_boundary_time": ["官方", "日程", "阶段", "开始", "结束", "公布"],
+    "reality_vs_fiction_status": ["现实", "虚构", "辟谣", "fact check", "current status"],
+    "numeric_quote_or_metric": ["官方", "历史数据", "表格", "牌价", "中间价"],
+}
+
+
+def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any]:
+    """Planned-only query hook for CI atomic claims; callers decide whether to execute it."""
+    if not isinstance(atomic_claim, dict):
+        return {"state": "invalid_atomic_claim", "query": ""}
+    slots = atomic_claim.get("slot_contract") if isinstance(atomic_claim.get("slot_contract"), dict) else {}
+    risk_type = normalize_text(str(atomic_claim.get("risk_type") or ""))
+    target = atomic_claim.get("refutation_target") if isinstance(atomic_claim.get("refutation_target"), dict) else {}
+    target_terms = target.get("target_terms") if isinstance(target.get("target_terms"), list) else []
+    terms = dedupe_keep_order(
+        [
+            normalize_text(str(slots.get("subject") or "")),
+            normalize_text(str(slots.get("time_scope") or "")),
+            normalize_text(str(slots.get("metric_or_relation") or "")),
+            normalize_text(str(slots.get("object") or "")),
+            normalize_text(str(slots.get("status_or_result") or "")),
+        ]
+        + [normalize_text(str(term)) for term in target_terms[:4]]
+        + ATOMIC_CLAIM_QUERY_HINTS.get(risk_type, ["官方", "实际", "结果"])[:4]
+    )
+    query_text = compact_text_for_query(" ".join(term for term in terms if term), 96)
+    priority = int(atomic_claim.get("search_priority") or 0)
+    return {
+        "state": "planned_only" if query_text else "insufficient_slots",
+        "risk_type": risk_type,
+        "priority": priority,
+        "query": query_text,
+        "source_preference": ["official", "news", "html"],
+        "do_not_execute_without_budget": True,
+    }
 
 
 def first_query_site_constraint(query_plan: List[Dict[str, Any]]) -> str:
@@ -12916,6 +13128,17 @@ def diagnose_claim_retrieval(
     detail_rescue_failure_reason = str(stats.get("detail_rescue_failure_reason") or "")
     family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
     claim_retrieve_stop_reason = str(stats.get("claim_retrieve_stop_reason") or "")
+    refutation_target = stats.get("refutation_target") if isinstance(stats.get("refutation_target"), dict) else {}
+    refutation_query_plan = stats.get("refutation_query_plan") if isinstance(stats.get("refutation_query_plan"), list) else []
+    refutation_retry_trigger = str(stats.get("refutation_retry_trigger") or "")
+    refutation_slot_gap = stats.get("refutation_slot_gap") if isinstance(stats.get("refutation_slot_gap"), list) else []
+    refutation_search_result = str(stats.get("refutation_search_result") or "")
+    refutation_retrieval_stop_reason = str(stats.get("refutation_retrieval_stop_reason") or "")
+    contrastive_query_plan = stats.get("contrastive_query_plan") if isinstance(stats.get("contrastive_query_plan"), dict) else {}
+    contrastive_retry_trigger = str(stats.get("contrastive_retry_trigger") or "")
+    contrastive_slot_gap = stats.get("contrastive_slot_gap") if isinstance(stats.get("contrastive_slot_gap"), list) else []
+    contrastive_search_result = str(stats.get("contrastive_search_result") or "")
+    contrastive_stop_reason = str(stats.get("contrastive_stop_reason") or "")
     retrieval_cost_review = {
         "query_count": int(stats.get("query_count", 0) or 0),
         "executed_source_count": len(dedupe_keep_order(final_executed_source_order)),
@@ -13274,6 +13497,21 @@ def diagnose_claim_retrieval(
         "slow_source_cutoff": source_latency_profile.get("slow_sources", []),
         "claim_retrieve_stop_reason": claim_retrieve_stop_reason,
         "retrieval_cost_review": retrieval_cost_review,
+        "refutation_target": refutation_target,
+        "refutation_query_plan": refutation_query_plan[:3],
+        "refutation_retry_trigger": refutation_retry_trigger,
+        "refutation_slot_gap": refutation_slot_gap[:5],
+        "refutation_search_result": (
+            "raw_positive" if refutation_retry_trigger and raw_results > 0
+            else "no_raw" if refutation_retry_trigger
+            else refutation_search_result
+        ),
+        "refutation_retrieval_stop_reason": refutation_retrieval_stop_reason or claim_retrieve_stop_reason,
+        "contrastive_query_plan": contrastive_query_plan,
+        "contrastive_retry_trigger": contrastive_retry_trigger,
+        "contrastive_slot_gap": contrastive_slot_gap[:5],
+        "contrastive_search_result": contrastive_search_result,
+        "contrastive_stop_reason": contrastive_stop_reason or claim_retrieve_stop_reason,
         "trusted_deepen_used": int(stats.get("trusted_deepen_used", 0) or 0),
         "trusted_deepen_domains": stats.get("trusted_deepen_domains", []),
         "trusted_deepen_jobs": stats.get("trusted_deepen_jobs", [])[:6],
@@ -13591,6 +13829,42 @@ def retrieve_evidence(
             if isinstance(item, dict)
         ):
             execution_query_plan.append(recall_probe_item)
+        refutation_target = planned_claim_item.get("_refutation_target") if isinstance(planned_claim_item.get("_refutation_target"), dict) else {}
+        refutation_query_text = normalize_text(str(refutation_target.get("query") or ""))
+        if refutation_target.get("state") == "ready" and refutation_query_text and not any(
+            normalize_text(str(item.get("q") or "")) == refutation_query_text
+            for item in execution_query_plan
+            if isinstance(item, dict)
+        ):
+            execution_query_plan.append(
+                {
+                    "q": refutation_query_text,
+                    "goal": "find_refutation_target",
+                    "origin": "refutation_target_execution",
+                    "query_variant_origin": "refutation_target",
+                    "source_preference": ["official", "news", "html"],
+                }
+            )
+        contrastive_query_plan = (
+            planned_claim_item.get("_contrastive_query_plan")
+            if isinstance(planned_claim_item.get("_contrastive_query_plan"), dict)
+            else {}
+        )
+        contrastive_query_text = normalize_text(str(contrastive_query_plan.get("query") or ""))
+        if ENABLE_CONTRASTIVE_RETRIEVAL and contrastive_query_plan.get("state") == "ready" and contrastive_query_text and not any(
+            normalize_text(str(item.get("q") or "")) == contrastive_query_text
+            for item in execution_query_plan
+            if isinstance(item, dict)
+        ):
+            execution_query_plan.append(
+                {
+                    "q": contrastive_query_text,
+                    "goal": "find_contrastive_evidence",
+                    "origin": "contrastive_query_execution",
+                    "query_variant_origin": "contrastive_query",
+                    "source_preference": ["official", "news", "html"],
+                }
+            )
         source_plan = source_plan_from_intent(question, claim_text, source_intent)
         search_request = build_search_request(planned_claim_item, source_intent, query_plan, evidence_mode)
         search_policy = build_search_policy(
@@ -13637,6 +13911,45 @@ def retrieve_evidence(
             "evidence_task_card": claim_item.get("evidence_task_card", {}) if isinstance(claim_item.get("evidence_task_card"), dict) else {},
             "search_request": search_request,
             "search_policy": search_policy,
+            "refutation_target": planned_claim_item.get("_refutation_target", {}) if isinstance(planned_claim_item.get("_refutation_target"), dict) else {},
+            "refutation_query_plan": [
+                item for item in execution_query_plan
+                if isinstance(item, dict) and query_variant_origin_value(item) == "refutation_target"
+            ][:2],
+            "refutation_retry_trigger": "slot_contract_target" if any(
+                isinstance(item, dict) and query_variant_origin_value(item) == "refutation_target"
+                for item in execution_query_plan
+            ) else "",
+            "refutation_slot_gap": (
+                planned_claim_item.get("_refutation_target", {}).get("missing_slots")
+                if isinstance(planned_claim_item.get("_refutation_target"), dict)
+                else []
+            ),
+            "refutation_search_result": "planned" if any(
+                isinstance(item, dict) and query_variant_origin_value(item) == "refutation_target"
+                for item in execution_query_plan
+            ) else "not_planned",
+            "refutation_retrieval_stop_reason": "",
+            "contrastive_query_plan": contrastive_query_plan,
+            "contrastive_retry_trigger": str(contrastive_query_plan.get("trigger") or "") if contrastive_query_plan.get("state") == "ready" else "",
+            "contrastive_slot_gap": (
+                contrastive_query_plan.get("slot_gap")
+                if isinstance(contrastive_query_plan.get("slot_gap"), list)
+                else []
+            ),
+            "contrastive_search_result": (
+                "planned" if any(
+                    isinstance(item, dict) and query_variant_origin_value(item) == "contrastive_query"
+                    for item in execution_query_plan
+                )
+                else "execution_disabled" if contrastive_query_plan.get("state") == "ready" and not ENABLE_CONTRASTIVE_RETRIEVAL
+                else "not_planned"
+            ),
+            "contrastive_stop_reason": (
+                "disabled_by_latency_guard"
+                if contrastive_query_plan.get("state") == "ready" and not ENABLE_CONTRASTIVE_RETRIEVAL
+                else ""
+            ),
             "playwright_roles": [],
             "claim_retrieve_stop_reason": "",
             "rescue_latency_ms": 0.0,
