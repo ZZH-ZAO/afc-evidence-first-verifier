@@ -3284,42 +3284,57 @@ def rubric_trigger_gate(
     if non_decidable_state == "direct_decidable":
         gate["reason"] = "direct_decision_available"
         return gate
+    has_risk_signal = explicit_core_risk or fictional_risk
     if critical_claim_blocking_state in {
         "access_blocked_but_rescuable",
         "access_blocked_and_unresolved",
         "official_discovery_failed",
     }:
         gate["reason"] = "access_blocked_not_evidence_absence"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if critical_claim_blocking_state in {
         "raw_hit_but_page_not_retained",
         "raw_hit_but_page_not_retained_after_review",
     }:
         gate["reason"] = "raw_hit_but_page_not_retained"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if official_entry_hit and raw_results > 0 and kept_web <= 0:
         gate["reason"] = "authority_hit_but_not_retained"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if critical_claim_blocking_state == "candidate_present_but_not_decidable" or (kept_web > 0 and answer_candidate_total > 0):
         gate["reason"] = "candidate_present_but_not_decidable"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if (
         non_decidable_state == "unsupported"
         and int(retrieval_effect_review.get("authority_hit_claims") or 0) > 0
         and int(retrieval_effect_review.get("kept_positive_claims") or 0) <= 0
     ):
         gate["reason"] = "authority_hit_but_not_retained"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if (
         non_decidable_state == "unsupported"
         and int(retrieval_effect_review.get("kept_progress_claims") or 0) > 0
         and int(retrieval_effect_review.get("kept_positive_claims") or 0) > 0
     ):
         gate["reason"] = "retained_progress_but_not_decidable"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if route_guard_blocked and non_decidable_state == "unsupported" and not high_risk_feature and unsupported_core_claim_count > 0:
         gate["reason"] = "open_route_summary_guard_blocked"
-        return gate
+        if has_risk_signal:
+            gate["allow"] = True
+            return gate
     if fictional_risk:
         gate["allow"] = True
         gate["reason"] = "fictional_contamination_signal"
