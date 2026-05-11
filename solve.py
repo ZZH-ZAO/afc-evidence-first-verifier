@@ -2928,6 +2928,12 @@ def claim_pipeline_diagnostic(
         "contrastive_slot_gap": contrastive_slot_gap[:5],
         "contrastive_search_result": contrastive_search_result,
         "contrastive_stop_reason": contrastive_stop_reason,
+        "atomic_query_plan": diagnostic.get("atomic_query_plan") if isinstance(diagnostic.get("atomic_query_plan"), list) else [],
+        "atomic_retrieval_attempted": bool(diagnostic.get("atomic_retrieval_attempted")),
+        "atomic_query_limit": int(diagnostic.get("atomic_query_limit") or 0),
+        "atomic_search_results": diagnostic.get("atomic_search_results") if isinstance(diagnostic.get("atomic_search_results"), list) else [],
+        "atomic_gate_result": str(diagnostic.get("atomic_gate_result") or ""),
+        "atomic_stop_reason": str(diagnostic.get("atomic_stop_reason") or ""),
         "page_keep_review_state": page_keep_review_state,
         "page_keep_review_reason": page_keep_review_reason,
         "filtered_rescue_pool_state": filtered_rescue_pool_state,
@@ -3012,6 +3018,17 @@ def build_claim_pipeline_diagnostics(
         "kept_positive_claims": sum(1 for row in items if int(row.get("kept_web") or 0) > 0),
         "kept_progress_claims": sum(1 for row in items if int(row.get("kept_progress_from_raw") or 0) > 0),
         "authority_hit_claims": sum(1 for row in items if normalize_bool(row.get("official_entry_hit"), False)),
+        "atomic_retrieval_claims": sum(1 for row in items if normalize_bool(row.get("atomic_retrieval_attempted"), False)),
+        "atomic_raw_positive_claims": sum(
+            1
+            for row in items
+            if any(int(result.get("raw_hits") or 0) > 0 for result in (row.get("atomic_search_results") or []) if isinstance(result, dict))
+        ),
+        "atomic_kept_positive_claims": sum(
+            1
+            for row in items
+            if any(int(result.get("kept_hits") or 0) > 0 for result in (row.get("atomic_search_results") or []) if isinstance(result, dict))
+        ),
         "anti_bot_or_access_blocked_claims": sum(
             1
             for row in items
@@ -6337,6 +6354,31 @@ ATOMIC_RISK_PRIORITY = {
 }
 
 
+def atomic_claim_search_priority(text: str, risk_type: str) -> int:
+    priority = ATOMIC_RISK_PRIORITY.get(risk_type, 50)
+    clean = normalize_text(text)
+    if risk_type == "market_calendar_status":
+        if re.search(r"(休市|假期|节假日|不开市|closed|holiday)", clean, flags=re.I):
+            priority += 12
+        if re.search(r"(A股|沪深|上证|深证|交易所)", clean, flags=re.I):
+            priority += 4
+    elif risk_type == "exclusive_or_only_path":
+        if re.search(r"(唯一|只能|必经|sole|only)", clean, flags=re.I):
+            priority += 8
+        if re.search(r"(替代|绕开|管道|港口|bypass|alternative)", clean, flags=re.I):
+            priority += 4
+    elif risk_type == "event_result_status":
+        if re.search(r"(退赛|弃权|不战而胜|walkover|withdrawal|retired)", clean, flags=re.I):
+            priority += 10
+    elif risk_type == "phase_boundary_time":
+        if re.search(r"(结束|完成|公布|发布|出炉|result release|completion)", clean, flags=re.I):
+            priority += 6
+    elif risk_type == "current_position_distance":
+        if re.search(r"(目前|当前|截至|as of|current)", clean, flags=re.I):
+            priority += 4
+    return priority
+
+
 EVENT_RESULT_SCORE_PATTERN = re.compile(r"(?<![\d.])\d{1,3}\s*[-:：比]\s*\d{1,3}(?![\d.])")
 EVENT_CONTEXT_PATTERN = re.compile(
     r"(比赛|赛果|比分|对阵|主场|客场|战报|胜|负|击败|战胜|不敌|退赛|弃权|不战而胜|"
@@ -6372,10 +6414,16 @@ def atomic_claim_slot_contract(text: str, risk_type: str, source_claim: Optional
     metric = first_nonempty_text(decision_slots.get("metric_or_relation"), width=50)
     status = first_nonempty_text(decision_slots.get("status_or_result"), width=50)
     if risk_type == "market_calendar_status":
-        if not subject:
-            subject = first_nonempty_text(*(re.findall(r"(A股|港股|沪深|上证|深证|创业板|恒生|美股|纳指|道指)", text)[:2]), width=30)
+        text_subject = first_nonempty_text(*(re.findall(r"(A股|港股|沪深|上证|深证|创业板|恒生|美股|纳指|道指|交易所)", text)[:2]), width=30)
+        if text_subject:
+            subject = text_subject
+        text_time = first_nonempty_text(*claim_time_markers(text)[:2], width=50)
+        if text_time:
+            time_scope = text_time
         metric = metric or "交易日历/开休市状态"
-        status = first_nonempty_text(*(re.findall(r"(休市|开市|开盘|交易日|假期|节假日)", text)[:3]), width=40)
+        text_status = first_nonempty_text(*(re.findall(r"(休市|开市|开盘|交易日|假期|节假日)", text)[:3]), width=40)
+        if text_status:
+            status = text_status
     elif risk_type == "exclusive_or_only_path":
         metric = metric or first_nonempty_text(exclusive_term_bucket(text), "排他路径/唯一性", width=40)
         object_value = object_value or first_nonempty_text(*(re.findall(r"(海峡|通道|航道|管道|港口|路线|领空|出口|进口|霍尔木兹|阿曼湾)", text)[:4]), width=50)
@@ -6494,7 +6542,15 @@ def split_atomic_clause_candidates(sentence: str) -> List[str]:
 def find_parent_claim_for_atomic(text: str, claims: List[Dict[str, Any]]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
     best_score = -1
-    text_tokens = set(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", normalize_text(text)))
+    def match_units(value: str) -> set:
+        normalized = normalize_text(value)
+        units = set(re.findall(r"[A-Za-z0-9]{2,}|\d+(?:\.\d+)?", normalized))
+        units.update(re.findall(r"(A股|港股|沪深|上证|深证|恒生|美元|人民币|中间价|买入价|卖出价|霍尔木兹|阿联酋|伊朗|篮网|黄蜂|考夫蔓|人口普查|林肯号)", normalized))
+        for span in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+            units.update(span[idx: idx + 2] for idx in range(max(0, len(span) - 1)))
+        return {unit for unit in units if unit}
+
+    text_tokens = match_units(text)
     for claim in claims:
         if not isinstance(claim, dict):
             continue
@@ -6503,7 +6559,7 @@ def find_parent_claim_for_atomic(text: str, claims: List[Dict[str, Any]]) -> Dic
             continue
         if claim_texts_overlap(text, claim_text):
             return claim
-        claim_tokens = set(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", claim_text))
+        claim_tokens = match_units(claim_text)
         score = len(text_tokens & claim_tokens)
         if score > best_score:
             best = claim
@@ -6542,7 +6598,7 @@ def build_atomic_claims_for_extracted(extracted: Dict[str, Any], claims: List[Di
                     "centrality_hint": centrality_hint,
                     "expected_evidence_shape": atomic_expected_evidence_shape(risk_type),
                     "slot_contract": slots,
-                    "search_priority": ATOMIC_RISK_PRIORITY.get(risk_type, 50),
+                    "search_priority": atomic_claim_search_priority(clause, risk_type),
                     "refutation_target": {
                         "state": "planned_only",
                         "query": query,
@@ -10541,6 +10597,102 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
     }
 
 
+def attach_atomic_claims_for_retrieval(
+    extracted: Dict[str, Any],
+    retrieval_claims: List[Dict[str, Any]],
+    retrieval_budget: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    claims = extracted.get("claims") if isinstance(extracted.get("claims"), list) else []
+    atomic_rows = extracted.get("high_risk_atomic_claims") if isinstance(extracted.get("high_risk_atomic_claims"), list) else []
+    if not atomic_rows:
+        return retrieval_claims, {"applied": False, "reason": "no_atomic_claims"}
+    attach_limit = max(0, int(os.environ.get("V2_ATOMIC_CLAIM_ATTACH_LIMIT", "1") or 0))
+    query_limit = max(0, int(os.environ.get("V2_ATOMIC_CLAIM_QUERY_LIMIT", "1") or 0))
+    if attach_limit <= 0 or query_limit <= 0:
+        return retrieval_claims, {"applied": False, "reason": "atomic_route_disabled_by_budget"}
+    preferred_risks = {
+        "market_calendar_status",
+        "exclusive_or_only_path",
+        "event_result_status",
+        "current_position_distance",
+        "phase_boundary_time",
+    }
+    selected_atomic_rows = [
+        row
+        for row in sorted(
+            [row for row in atomic_rows if isinstance(row, dict) and str(row.get("risk_type") or "") in preferred_risks],
+            key=lambda row: int(row.get("search_priority") or 0),
+            reverse=True,
+        )[:attach_limit]
+    ]
+    if not selected_atomic_rows:
+        return retrieval_claims, {"applied": False, "reason": "no_preferred_atomic_claims"}
+    retrieval_claims_out = [dict(claim) for claim in retrieval_claims if isinstance(claim, dict)]
+    claim_index = {
+        str(claim.get("claim_id") or claim.get("id") or ""): claim
+        for claim in retrieval_claims_out
+        if str(claim.get("claim_id") or claim.get("id") or "")
+    }
+    all_claims_index = {
+        str(claim.get("claim_id") or claim.get("id") or ""): claim
+        for claim in claims
+        if isinstance(claim, dict) and str(claim.get("claim_id") or claim.get("id") or "")
+    }
+    trace_rows: List[Dict[str, Any]] = []
+    for atomic_row in selected_atomic_rows:
+        parent_id = str(atomic_row.get("parent_claim_id") or "")
+        if not parent_id:
+            inferred_parent = find_parent_claim_for_atomic(str(atomic_row.get("text") or ""), claims)
+            parent_id = str(inferred_parent.get("claim_id") or inferred_parent.get("id") or "")
+            if parent_id:
+                atomic_row = dict(atomic_row)
+                atomic_row["parent_claim_id"] = parent_id
+        parent_claim = claim_index.get(parent_id)
+        parent_added = False
+        if parent_claim is None and parent_id in all_claims_index:
+            parent_claim = dict(all_claims_index[parent_id])
+            retrieval_claims_out.append(parent_claim)
+            claim_index[parent_id] = parent_claim
+            parent_added = True
+        if parent_claim is None:
+            trace_rows.append(
+                {
+                    "atomic_claim_id": atomic_row.get("atomic_claim_id"),
+                    "parent_claim_id": parent_id,
+                    "risk_type": atomic_row.get("risk_type"),
+                    "applied": False,
+                    "reason": "parent_claim_missing",
+                }
+            )
+            continue
+        parent_claim.setdefault("_atomic_claims_for_retrieval", [])
+        if not isinstance(parent_claim.get("_atomic_claims_for_retrieval"), list):
+            parent_claim["_atomic_claims_for_retrieval"] = []
+        parent_claim["_atomic_claims_for_retrieval"].append(dict(atomic_row))
+        parent_claim["query_budget_floor"] = max(int(parent_claim.get("query_budget_floor") or 0), 1)
+        parent_claim["source_budget_floor"] = max(int(parent_claim.get("source_budget_floor") or 0), 2)
+        budget_query_limits = retrieval_budget.setdefault("query_limits", {})
+        budget_source_limits = retrieval_budget.setdefault("source_limits", {})
+        budget_query_limits[parent_id] = max(int(budget_query_limits.get(parent_id, 0) or 0), 1)
+        budget_source_limits[parent_id] = max(int(budget_source_limits.get(parent_id, 0) or 0), 2)
+        trace_rows.append(
+            {
+                "atomic_claim_id": atomic_row.get("atomic_claim_id"),
+                "parent_claim_id": parent_id,
+                "risk_type": atomic_row.get("risk_type"),
+                "applied": True,
+                "parent_added": parent_added,
+                "search_priority": atomic_row.get("search_priority"),
+                "query": ((atomic_row.get("refutation_target") or {}).get("query") if isinstance(atomic_row.get("refutation_target"), dict) else ""),
+            }
+        )
+    retrieval_budget = dict(retrieval_budget)
+    retrieval_budget["atomic_claim_attach_trace"] = trace_rows
+    retrieval_budget["atomic_claim_attach_count"] = sum(1 for row in trace_rows if row.get("applied"))
+    retrieval_budget["atomic_claim_attach_applied"] = bool(retrieval_budget["atomic_claim_attach_count"])
+    return retrieval_claims_out, retrieval_budget
+
+
 def dedupe_dicts(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
     seen = set()
     out: List[Dict[str, str]] = []
@@ -13206,8 +13358,12 @@ def build_evidence_ledger(
         "contrastive_unresolved_points": [],
         "atomic_claims": [],
         "high_risk_atomic_claims": [],
+        "atomic_query_plan": [],
+        "atomic_search_results": [],
         "atomic_refuted_points": [],
         "atomic_unresolved_points": [],
+        "atomic_gate_blocked_points": [],
+        "atomic_label_pressure": [],
         "atomic_claim_route_debug": [],
         "fallback_scope": "evidence_gate_first",
         "final_label_reason": "",
@@ -13236,16 +13392,108 @@ def build_evidence_ledger(
         row for row in atomic_route_debug[:8]
         if isinstance(row, dict)
     ]
+    atomic_plan_rows: List[Dict[str, Any]] = []
+    atomic_result_rows: List[Dict[str, Any]] = []
+    atomic_parent_diag: Dict[str, Dict[str, Any]] = {}
+    for parent_claim_id, pipeline_row in pipeline_items.items():
+        plans = pipeline_row.get("atomic_query_plan") if isinstance(pipeline_row.get("atomic_query_plan"), list) else []
+        results = pipeline_row.get("atomic_search_results") if isinstance(pipeline_row.get("atomic_search_results"), list) else []
+        for plan in plans:
+            if not isinstance(plan, dict):
+                continue
+            plan_row = dict(plan)
+            plan_row.setdefault("parent_claim_id", parent_claim_id)
+            atomic_plan_rows.append(plan_row)
+            atomic_id = str(plan_row.get("atomic_claim_id") or "")
+            if atomic_id:
+                atomic_parent_diag[atomic_id] = pipeline_row
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            result_row = dict(result)
+            result_row.setdefault("parent_claim_id", parent_claim_id)
+            atomic_result_rows.append(result_row)
+            atomic_id = str(result_row.get("atomic_claim_id") or "")
+            if atomic_id:
+                atomic_parent_diag[atomic_id] = pipeline_row
+    ledger["atomic_query_plan"] = atomic_plan_rows[:8]
+    ledger["atomic_search_results"] = atomic_result_rows[:8]
+    atomic_plan_by_id = {
+        str(row.get("atomic_claim_id") or ""): row
+        for row in atomic_plan_rows
+        if str(row.get("atomic_claim_id") or "")
+    }
+    atomic_result_by_id = {
+        str(row.get("atomic_claim_id") or ""): row
+        for row in atomic_result_rows
+        if str(row.get("atomic_claim_id") or "")
+    }
+    enriched_route_debug: List[Dict[str, Any]] = []
+    for row in ledger["atomic_claim_route_debug"]:
+        if not isinstance(row, dict):
+            continue
+        atomic_id = str(row.get("atomic_claim_id") or "")
+        plan_row = atomic_plan_by_id.get(atomic_id, {})
+        result_row = atomic_result_by_id.get(atomic_id, {})
+        parent_diag = atomic_parent_diag.get(atomic_id, {})
+        enriched = dict(row)
+        if plan_row:
+            enriched["route_state"] = str(plan_row.get("execution_state") or plan_row.get("state") or "planned")
+            enriched["atomic_query"] = str(plan_row.get("query") or "")
+        if result_row:
+            enriched["raw_hits"] = int(result_row.get("raw_hits") or 0)
+            enriched["kept_hits"] = int(result_row.get("kept_hits") or 0)
+        if parent_diag:
+            enriched["atomic_gate_result"] = str(parent_diag.get("atomic_gate_result") or "")
+            enriched["atomic_stop_reason"] = str(parent_diag.get("atomic_stop_reason") or "")
+        enriched_route_debug.append(enriched)
+    if enriched_route_debug:
+        ledger["atomic_claim_route_debug"] = enriched_route_debug[:8]
     for row in ledger["high_risk_atomic_claims"]:
+        atomic_id = str(row.get("atomic_claim_id") or "")
+        plan_row = atomic_plan_by_id.get(atomic_id, {})
+        result_row = atomic_result_by_id.get(atomic_id, {})
+        parent_diag = atomic_parent_diag.get(atomic_id, {})
+        raw_hits = int(result_row.get("raw_hits") or 0) if result_row else 0
+        kept_hits = int(result_row.get("kept_hits") or 0) if result_row else 0
+        if kept_hits > 0:
+            state = "retrieved_waiting_gate"
+        elif raw_hits > 0:
+            state = "retrieval_raw_only_no_gate"
+        elif plan_row and str(plan_row.get("execution_state") or "") == "ready":
+            state = "retrieval_no_result"
+        elif plan_row:
+            state = str(plan_row.get("execution_state") or plan_row.get("state") or "planned_not_executed")
+        else:
+            state = "extracted_only_no_retrieval"
+        if state in {"retrieved_waiting_gate", "retrieval_raw_only_no_gate"}:
+            ledger["atomic_gate_blocked_points"].append(
+                {
+                    "atomic_claim_id": atomic_id,
+                    "parent_claim_id": row.get("parent_claim_id"),
+                    "risk_type": str(row.get("risk_type") or ""),
+                    "state": state,
+                    "atomic_gate_result": str(parent_diag.get("atomic_gate_result") or ""),
+                    "atomic_stop_reason": str(parent_diag.get("atomic_stop_reason") or ""),
+                    "raw_hits": raw_hits,
+                    "kept_hits": kept_hits,
+                    "query": str(result_row.get("query") or plan_row.get("query") or ""),
+                }
+            )
         ledger["atomic_unresolved_points"].append(
             {
-                "atomic_claim_id": row.get("atomic_claim_id"),
+                "atomic_claim_id": atomic_id,
                 "parent_claim_id": row.get("parent_claim_id"),
                 "text": compact_claim_text(str(row.get("text") or ""), 120),
                 "risk_type": str(row.get("risk_type") or ""),
                 "slot_contract": row.get("slot_contract") if isinstance(row.get("slot_contract"), dict) else {},
                 "refutation_target": row.get("refutation_target") if isinstance(row.get("refutation_target"), dict) else {},
-                "state": "extracted_only_no_gate_consumption",
+                "state": state,
+                "atomic_query": str(result_row.get("query") or plan_row.get("query") or ""),
+                "raw_hits": raw_hits,
+                "kept_hits": kept_hits,
+                "atomic_gate_result": str(parent_diag.get("atomic_gate_result") or ""),
+                "atomic_stop_reason": str(parent_diag.get("atomic_stop_reason") or ""),
                 "do_not_decide_without_gate": True,
             }
         )
@@ -13380,8 +13628,12 @@ def build_evidence_ledger(
         "contrastive_unresolved_points",
         "atomic_claims",
         "high_risk_atomic_claims",
+        "atomic_query_plan",
+        "atomic_search_results",
         "atomic_refuted_points",
         "atomic_unresolved_points",
+        "atomic_gate_blocked_points",
+        "atomic_label_pressure",
         "atomic_claim_route_debug",
     ):
         ledger[key] = ledger[key][:8]
@@ -13401,6 +13653,7 @@ def evidence_ledger_reason(label: str, evidence_summary: Optional[Dict[str, Any]
     unresolved = ledger.get("unresolved_points") if isinstance(ledger.get("unresolved_points"), list) else []
     conflict_points = ledger.get("candidate_conflict_points") if isinstance(ledger.get("candidate_conflict_points"), list) else []
     contrastive_unresolved = ledger.get("contrastive_unresolved_points") if isinstance(ledger.get("contrastive_unresolved_points"), list) else []
+    atomic_unresolved = ledger.get("atomic_unresolved_points") if isinstance(ledger.get("atomic_unresolved_points"), list) else []
     if refuted:
         first = refuted[0]
         claim_text = str(first.get("claim") or "")
@@ -13424,6 +13677,17 @@ def evidence_ledger_reason(label: str, evidence_summary: Optional[Dict[str, Any]
             parts.append(
                 f"发现候选冲突诊断：{first.get('claim')} 的 {slot} 出现 {strength} 冲突信号，但卡在 {block}"
             )
+    if atomic_unresolved:
+        first_atomic = atomic_unresolved[0]
+        state = str(first_atomic.get("state") or "")
+        risk = str(first_atomic.get("risk_type") or "高风险原子事实")
+        text = str(first_atomic.get("text") or "")
+        if state in {"retrieved_waiting_gate", "retrieval_raw_only_no_gate"}:
+            block = str(first_atomic.get("atomic_gate_result") or first_atomic.get("atomic_stop_reason") or "gate 未闭合")
+            parts.append(f"原子错点已进入检索但尚未可裁决：{risk}「{text}」卡在 {block}")
+        elif state not in {"extracted_only_no_retrieval", ""}:
+            block = str(first_atomic.get("atomic_stop_reason") or state)
+            parts.append(f"高风险原子 claim 已定位：{risk}「{text}」，当前停在 {block}")
     if unresolved:
         first = unresolved[0]
         gaps = ",".join(str(slot) for slot in (first.get("slot_missing") or first.get("slot_mismatch") or []) if str(slot))
@@ -13818,11 +14082,13 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     claims = extracted.get("claims") if isinstance(extracted.get("claims"), list) else []
     retrieval_claims, retrieval_scope_reason, retrieval_scope_trace = claims_for_initial_retrieval(item, extracted)
     retrieval_budget = retrieval_budget_for_initial(item, extracted, retrieval_claims, retrieval_scope_reason)
+    retrieval_claims, retrieval_budget = attach_atomic_claims_for_retrieval(extracted, retrieval_claims, retrieval_budget)
     annotate_claim_budget_metadata(claims, retrieval_budget)
     debug["retrieval_scope_reason"] = retrieval_scope_reason
     debug["initial_retrieval_scope_trace"] = retrieval_scope_trace
     debug["retrieval_claim_ids"] = [str(claim.get("claim_id") or claim.get("id") or "") for claim in retrieval_claims]
     debug["retrieval_budget"] = retrieval_budget
+    debug["atomic_claim_attach_trace"] = retrieval_budget.get("atomic_claim_attach_trace", [])
     evidence_bundle = retrieve_evidence(
         question=str(item.get("question", "")),
         answer=str(item.get("answer", "")),

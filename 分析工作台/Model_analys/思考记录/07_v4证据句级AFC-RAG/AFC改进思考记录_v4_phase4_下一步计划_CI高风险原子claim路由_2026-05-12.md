@@ -485,3 +485,172 @@ CK/CL 的真实价值是把标准 reason 的路径跑通：
 3. 确认 `0001/0003/0004` 至少 1 个能形成 gate 通过的 atomic 反证。
 4. 再打开 CL 的轻量标签压力：主需 atomic strong refutation -> `0`，次需/附带 atomic strong refutation -> `1`。
 5. 如果 retrieve 均值超过 CI 基线 10%，立即关掉真实 atomic route，只保留 query plan debug。
+
+---
+
+## 2026-05-12 CK/CL 第一轮实施记录：高风险 atomic query 受控执行与账本消费
+
+### 分类
+
+证据链路 / 路由 / 测试与回归
+
+### 这次要做什么
+
+本轮把 CI 只读抽取推进到 CK/CL 的最小闭环：
+
+- `solve.py`：把 `high_risk_atomic_claims` 中优先级最高的 1 个原子 claim 绑定到父 claim，并写入检索预算与 debug。
+- `retrieval.py`：新增 `V2_ENABLE_ATOMIC_CLAIM_RETRIEVAL` 和 `V2_ATOMIC_CLAIM_QUERY_LIMIT`，默认只执行 1 条 atomic query。
+- `retrieval.py`：把 atomic query 前置执行，并在检索结果、执行计划、诊断中保留 `atomic_claim_id / atomic_risk_type / atomic_search_results`。
+- `solve.py`：`evidence_ledger` 新增 `atomic_query_plan / atomic_search_results / atomic_gate_blocked_points / atomic_label_pressure`。
+- 仍然不允许 `risk_type` 直接改标签；atomic 证据只要没有越过现有 gate，就只进入 reason/debug。
+
+### 动机是什么
+
+CI 已经证明“原子 claim 能抓到标准 reason 的刀口”，但还不能说明它能不能被检索和账本稳定消费。CK/CL 的目标就是验证这条链：
+
+`标准错点 -> atomic claim -> 专用 query -> 搜索结果 -> gate -> ledger/reason`
+
+这一步不是扩大召回，而是把有限预算投到最像人工标注理由的“小而硬”断言上。
+
+### 对我们的项目有什么实际作用
+
+本轮后，系统可以区分三种状态：
+
+- 原子 claim 已抽取，但没有进入检索。
+- 原子 claim 已进入检索，但没有 raw/kept。
+- 原子 claim 已拿到候选材料，但还卡在 gate，不能当作直接反证。
+
+这让后续优化不再只看最终 label，而能定位到底是抽取、检索、页面质量、slot gate 还是聚合消费卡住。
+
+### 具体场景是什么
+
+本轮 5 锚点最终结果：
+
+- `afc_0001`：atomic query 改为优先搜索 `A股 今天 A股休市/港股开盘 交易日历 休市`，命中 raw/kept，但仍未越过 gate，因此不改标签。
+- `afc_0002`：仍稳定为 `1`，没有因 event atomic query 干扰原有闭合逻辑。
+- `afc_0003`：`霍尔木兹海峡/阿联酋 唯一海上通道 替代通道 管道 港口 绕开` 进入 atomic route，并出现 `retrieved_waiting_gate`。
+- `afc_0008 / afc_0010`：不进入高风险 atomic route，标签继续为 `2`，没有被数值口径误抬。
+
+8 样本扩展结果：
+
+- `afc_0004`：抽到 `event_result_status`，并把 `3-0 / 退赛 / 不战而胜` 放进 atomic query，但本轮仍卡在页面 gate。
+- `afc_0005`：抽到 `current_position_distance` 并执行距离口径 query，但没有形成同槽可裁决反证。
+- `afc_0007`：抽到 `phase_boundary_time` 并执行阶段边界 query，但仍停在检索或页面 gate。
+
+### 应该怎么使用
+
+调试时按这个顺序看：
+
+1. `debug.atomic_claim_attach_trace`：本轮到底把哪个 atomic claim 接进了检索。
+2. `debug.evidence_ledger.atomic_query_plan`：query 是否符合风险类型。
+3. `debug.evidence_ledger.atomic_search_results`：raw/kept 是否有进展。
+4. `debug.evidence_ledger.atomic_gate_blocked_points`：是否已经到了“拿到材料但 gate 未过”的状态。
+5. `final_label_reason`：是否只解释 atomic 状态，而不是绕过 gate 直接判错。
+
+### 对用户意味着什么
+
+用户会开始看到更接近人工标准 reason 的诊断语句，例如“高风险原子 claim 已定位”或“原子错点已进入检索但尚未可裁决”。这比单纯说“证据不足”更有解释力，也更诚实：它能指出系统已经找到了哪里可疑，但还没有足够证据改标签。
+
+### 对开发者意味着什么
+
+开发者下一轮要关注的不是继续加 query 数量，而是让 atomic query 的结果能通过页面和 slot gate。尤其是：
+
+- `market_calendar_status` 要接交易所日历/休市公告页。
+- `exclusive_or_only_path` 要把替代通道、管道、港口材料转成同槽反证。
+- `event_result_status` 要能区分比分、退赛、不战而胜。
+- `phase_boundary_time` 要能区分开始、结束、结果公布。
+
+### 当前结论
+
+CK/CL 第一轮实现成立：atomic route 已经从 planned-only 变成受控执行，并且 ledger 能展示检索进展。  
+5 锚点回归：
+
+- `afc_0002 = 1`
+- `afc_0008 = 2`
+- `afc_0010 = 2`
+- retrieve 均值 `46.987s`，低于 CI 5 锚点基线 `57.496s`
+
+8 样本回归：
+
+- retrieve 均值 `72.689s`
+- 相对 CI 8 样本基线 `66.175s` 增幅约 `9.8%`，仍在 10% 阈值内
+
+本轮没有让 atomic risk 直接改标签，这是有意保守的。现在已经证明“刀口能进检索和账本”，但还没有证明“强反证能稳定越过 gate 并打到标准标签”。
+
+### 下一步建议
+
+进入 CL 第二轮：只针对已经 `retrieved_waiting_gate` 的 atomic 点做页面/slot 转换修复。优先顺序：
+
+1. `afc_0001`：把 A 股交易日历/休市公告材料转成同槽 `market_calendar_status` 证据。
+2. `afc_0003`：把阿联酋替代出口通道材料转成同槽 `exclusive_or_only_path` 反证。
+3. `afc_0004`：让退赛/不战而胜证据优先于泛比分页，并避免体育无关比分污染。
+4. 只有当 `atomic_gate_result` 从 `retrieved_waiting_gate` 变成强同槽反证后，再允许 `atomic_label_pressure` 参与标签聚合。
+
+---
+
+## 2026-05-12 CL 第二轮打法判断：为什么不继续盲目扩大检索
+
+### 分类
+
+证据链路 / 路由 / 聚合裁决
+
+### 这次要做什么
+
+下一步不优先加更多 query，而是优先修 `retrieved_waiting_gate -> atomic_refuted_point` 的转换。重点是让已经搜到或接近搜到的原子错点过页面 gate、slot gate 和同槽冲突判断。
+
+### 动机是什么
+
+CK/CL 第一轮说明系统已经能把高风险原子 claim 打进检索，但真正的瓶颈出现在证据消费层：
+
+- `afc_0001` 已经能查到 A 股休市/交易日历方向，但仍没有被转成交易日状态反证。
+- `afc_0003` 已经能查到唯一通道/替代通道方向，并进入 `retrieved_waiting_gate`。
+- `afc_0004` 已经能把 `3-0 / 退赛 / 不战而胜` 放进 query，但仍容易被泛体育比分页污染。
+
+这说明继续扩大 query 数量的边际收益不高，反而可能增加噪声和耗时。
+
+### 对我们的项目有什么实际作用
+
+修转换层能直接提升“标准 reason 命中率”。因为人工标准 reason 本质上不是说“搜到了很多网页”，而是说“某个小事实与权威材料冲突”。因此下一步要让系统把材料变成可引用、可裁决的反证点。
+
+### 具体场景是什么
+
+优先修三类：
+
+1. `market_calendar_status`：交易日历/休市公告必须能反驳“某市场休市/开市/先开盘”。
+2. `exclusive_or_only_path`：替代通道、管道、港口材料必须能反驳“唯一/只能/必经”。
+3. `event_result_status`：退赛、不战而胜必须能反驳虚构比分，同时过滤无关赛事比分页。
+
+### 应该怎么使用
+
+调试时先筛：
+
+- `atomic_gate_blocked_points`
+- `atomic_search_results.raw_hits > 0`
+- `atomic_search_results.kept_hits > 0`
+- `candidate_conflict_points`
+- `page_gate_not_ready`
+- `conflict_strength_not_strong`
+
+这些才是下一步最有价值的样本，不应该平均用力。
+
+### 对用户意味着什么
+
+用户最终会看到更明确的 reason：不是“证据不足”，而是“回答中的某个原子事实与某个来源在同一主体、时间、指标上冲突”。
+
+### 对开发者意味着什么
+
+开发者要把精力放在 evidence/page/slot gate 的小型专用转换器上，而不是继续叠加 provider 或 fallback。否则很容易把噪声页误当反证，导致 0008/0010 这类无错样本被误抬。
+
+### 当前结论
+
+依据当前回归，问题不是“完全搜不到”，而是“搜到后没有安全转成可裁决反证”。所以 CL 第二轮应该做证据消费增强，不应该先扩大检索。
+
+### 下一步建议
+
+按最小闭环实现三个专用转换：
+
+1. calendar atomic converter：交易日历状态转换。
+2. exclusive-path atomic converter：唯一通道反证转换。
+3. event-result atomic converter：退赛/不战而胜反证转换。
+
+每个转换器都必须继续受 page role 和 slot gate 约束，不能绕过现有证据安全边界。

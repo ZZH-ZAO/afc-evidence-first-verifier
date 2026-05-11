@@ -72,6 +72,8 @@ USE_CACHE = os.environ.get("V2_DISABLE_CACHE", "0").lower() not in {"1", "true",
 FETCH_DETAILS_PER_CLAIM = int(os.environ.get("V2_FETCH_DETAILS_PER_CLAIM", "2"))
 MAX_QUERIES_PER_CLAIM = int(os.environ.get("V2_MAX_QUERIES_PER_CLAIM", "3"))
 ENABLE_CONTRASTIVE_RETRIEVAL = os.environ.get("V2_ENABLE_CONTRASTIVE_RETRIEVAL", "0").lower() in {"1", "true", "yes"}
+ENABLE_ATOMIC_CLAIM_RETRIEVAL = os.environ.get("V2_ENABLE_ATOMIC_CLAIM_RETRIEVAL", "1").lower() in {"1", "true", "yes"}
+ATOMIC_CLAIM_QUERY_LIMIT = int(os.environ.get("V2_ATOMIC_CLAIM_QUERY_LIMIT", "1"))
 ENABLE_BING_HTML = os.environ.get("V2_ENABLE_BING_HTML", "0").lower() in {"1", "true", "yes"}
 ENABLE_DUCKDUCKGO = os.environ.get("V2_ENABLE_DUCKDUCKGO", "0").lower() in {"1", "true", "yes"}
 ENABLE_PLAYWRIGHT = os.environ.get("V2_ENABLE_PLAYWRIGHT", "1").lower() in {"1", "true", "yes"}
@@ -2584,6 +2586,8 @@ def query_priority_score(item: Dict[str, Any], evidence_mode: str = "", source_i
         score += 3
     if goal == "find_metric_source_page" or origin == "metric_source_probe":
         score += 8 if is_structured_fact_mode(mode) else 4
+    if goal == "find_atomic_refutation" or origin == "atomic_claim_query":
+        score += 9
     if is_route_like_mode(mode) and goal in {"find_route_page", "find_route"}:
         score += 4
     if is_route_like_mode(mode) and origin in {"route_frame_probe", "gap_pseudo_page_probe", "page_shape_probe", "page_intent_retry"}:
@@ -2624,10 +2628,12 @@ def normalize_query_items(raw_queries: List[Any]) -> List[Dict[str, Any]]:
                 source_preference = [normalize_text(str(item)) for item in raw_preference if normalize_text(str(item))][:3]
                 if source_preference:
                     query_item["source_preference"] = source_preference
-                for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
+                for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin", "atomic_claim_id", "atomic_risk_type", "atomic_claim_text"):
                     extra_value = normalize_text(str(raw_query.get(extra_key) or ""))
                     if extra_value:
                         query_item[extra_key] = extra_value
+                if raw_query.get("atomic_query"):
+                    query_item["atomic_query"] = True
                 normalized.append(query_item)
     deduped: List[Dict[str, str]] = []
     seen = set()
@@ -3929,10 +3935,12 @@ def query_texts_from_plan(question: str, claim: str, time_value: str, claim_item
         source_preference = [normalize_text(str(value)) for value in raw_preference if normalize_text(str(value))][:3]
         if source_preference:
             query_item["source_preference"] = source_preference
-        for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
+        for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin", "atomic_claim_id", "atomic_risk_type", "atomic_claim_text"):
             extra_value = normalize_text(str(item.get(extra_key) or ""))
             if extra_value:
                 query_item[extra_key] = extra_value
+        if item.get("atomic_query"):
+            query_item["atomic_query"] = True
         deduped.append(query_item)
     limit = max(1, MAX_QUERIES_PER_CLAIM)
     return apply_query_plan_policy(deduped, limit, source_intent, task_card, evidence_mode)
@@ -4238,6 +4246,72 @@ def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any
         "source_preference": ["official", "news", "html"],
         "do_not_execute_without_budget": True,
     }
+
+
+def atomic_claim_query_plan_rows(claim_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_claims = (
+        claim_item.get("_atomic_claims_for_retrieval")
+        if isinstance(claim_item.get("_atomic_claims_for_retrieval"), list)
+        else []
+    )
+    atomic_claims = [row for row in raw_claims if isinstance(row, dict)]
+    if not atomic_claims:
+        return []
+    limit = max(0, int(ATOMIC_CLAIM_QUERY_LIMIT or 0))
+    if limit <= 0:
+        return []
+    ordered = sorted(
+        atomic_claims,
+        key=lambda row: int(row.get("search_priority") or 0),
+        reverse=True,
+    )[:limit]
+    rows: List[Dict[str, Any]] = []
+    for atomic_claim in ordered:
+        plan = build_atomic_claim_query_plan(atomic_claim)
+        query_text = normalize_text(str(plan.get("query") or ""))
+        state = str(plan.get("state") or "")
+        execution_state = "ready" if ENABLE_ATOMIC_CLAIM_RETRIEVAL and state == "planned_only" and query_text else state
+        if not ENABLE_ATOMIC_CLAIM_RETRIEVAL and state == "planned_only" and query_text:
+            execution_state = "disabled_by_latency_guard"
+        row = {
+            "atomic_claim_id": str(atomic_claim.get("atomic_claim_id") or ""),
+            "parent_claim_id": str(atomic_claim.get("parent_claim_id") or claim_item.get("claim_id") or claim_item.get("id") or ""),
+            "risk_type": normalize_text(str(atomic_claim.get("risk_type") or plan.get("risk_type") or "")),
+            "text": compact_text_for_query(str(atomic_claim.get("text") or ""), 140),
+            "query": query_text,
+            "priority": int(plan.get("priority") or atomic_claim.get("search_priority") or 0),
+            "source_preference": plan.get("source_preference") if isinstance(plan.get("source_preference"), list) else ["official", "news", "html"],
+            "state": state,
+            "execution_state": execution_state,
+            "enabled": bool(ENABLE_ATOMIC_CLAIM_RETRIEVAL),
+        }
+        rows.append(row)
+    return rows
+
+
+def atomic_claim_query_items_from_plan(plan_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for row in plan_rows or []:
+        if not isinstance(row, dict):
+            continue
+        query_text = normalize_text(str(row.get("query") or ""))
+        if row.get("execution_state") != "ready" or not query_text:
+            continue
+        items.append(
+            {
+                "q": query_text,
+                "goal": "find_atomic_refutation",
+                "origin": "atomic_claim_query",
+                "query_family_role": "refute",
+                "query_variant_origin": "atomic_claim_query",
+                "source_preference": row.get("source_preference") if isinstance(row.get("source_preference"), list) else ["official", "news", "html"],
+                "atomic_claim_id": str(row.get("atomic_claim_id") or ""),
+                "atomic_risk_type": str(row.get("risk_type") or ""),
+                "atomic_claim_text": str(row.get("text") or ""),
+                "atomic_query": True,
+            }
+        )
+    return items
 
 
 def first_query_site_constraint(query_plan: List[Dict[str, Any]]) -> str:
@@ -12312,10 +12386,12 @@ def apply_query_plan_policy(
         source_preference = [normalize_text(str(value)) for value in raw_preference if normalize_text(str(value))][:3]
         if source_preference:
             query_item["source_preference"] = source_preference
-        for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin"):
+        for extra_key in ("operator", "variant", "gap_flag", "query_variant_origin", "atomic_claim_id", "atomic_risk_type", "atomic_claim_text"):
             extra_value = normalize_text(str(item.get(extra_key) or ""))
             if extra_value:
                 query_item[extra_key] = extra_value
+        if item.get("atomic_query"):
+            query_item["atomic_query"] = True
         deduped.append(query_item)
     if not deduped:
         return []
@@ -13512,6 +13588,12 @@ def diagnose_claim_retrieval(
         "contrastive_slot_gap": contrastive_slot_gap[:5],
         "contrastive_search_result": contrastive_search_result,
         "contrastive_stop_reason": contrastive_stop_reason or claim_retrieve_stop_reason,
+        "atomic_query_plan": stats.get("atomic_query_plan", []),
+        "atomic_retrieval_attempted": bool(stats.get("atomic_retrieval_attempted")),
+        "atomic_query_limit": int(stats.get("atomic_query_limit") or 0),
+        "atomic_search_results": stats.get("atomic_search_results", []),
+        "atomic_gate_result": str(stats.get("atomic_gate_result") or ""),
+        "atomic_stop_reason": str(stats.get("atomic_stop_reason") or claim_retrieve_stop_reason or ""),
         "trusted_deepen_used": int(stats.get("trusted_deepen_used", 0) or 0),
         "trusted_deepen_domains": stats.get("trusted_deepen_domains", []),
         "trusted_deepen_jobs": stats.get("trusted_deepen_jobs", [])[:6],
@@ -13865,6 +13947,23 @@ def retrieve_evidence(
                     "source_preference": ["official", "news", "html"],
                 }
             )
+        atomic_query_plan = atomic_claim_query_plan_rows(planned_claim_item)
+        atomic_query_items = atomic_claim_query_items_from_plan(atomic_query_plan)
+        atomic_items_to_prepend: List[Dict[str, Any]] = []
+        for atomic_query_item in atomic_query_items:
+            atomic_query_text = normalize_text(str(atomic_query_item.get("q") or ""))
+            if not atomic_query_text:
+                continue
+            if any(
+                normalize_text(str(item.get("q") or "")) == atomic_query_text
+                and str(item.get("atomic_claim_id") or "") == str(atomic_query_item.get("atomic_claim_id") or "")
+                for item in execution_query_plan
+                if isinstance(item, dict)
+            ):
+                continue
+            atomic_items_to_prepend.append(atomic_query_item)
+        if atomic_items_to_prepend:
+            execution_query_plan = atomic_items_to_prepend + execution_query_plan
         source_plan = source_plan_from_intent(question, claim_text, source_intent)
         search_request = build_search_request(planned_claim_item, source_intent, query_plan, evidence_mode)
         search_policy = build_search_policy(
@@ -13948,6 +14047,27 @@ def retrieve_evidence(
             "contrastive_stop_reason": (
                 "disabled_by_latency_guard"
                 if contrastive_query_plan.get("state") == "ready" and not ENABLE_CONTRASTIVE_RETRIEVAL
+                else ""
+            ),
+            "atomic_query_plan": atomic_query_plan,
+            "atomic_retrieval_attempted": any(
+                isinstance(item, dict) and bool(item.get("atomic_claim_id"))
+                for item in execution_query_plan
+            ),
+            "atomic_query_limit": max(0, int(ATOMIC_CLAIM_QUERY_LIMIT or 0)),
+            "atomic_search_results": [],
+            "atomic_gate_result": (
+                "not_planned"
+                if not atomic_query_plan
+                else "execution_disabled"
+                if atomic_query_plan and not ENABLE_ATOMIC_CLAIM_RETRIEVAL
+                else "planned_waiting_execution"
+            ),
+            "atomic_stop_reason": (
+                "no_atomic_claims_attached"
+                if not atomic_query_plan
+                else "disabled_by_latency_guard"
+                if atomic_query_plan and not ENABLE_ATOMIC_CLAIM_RETRIEVAL
                 else ""
             ),
             "playwright_roles": [],
@@ -14200,6 +14320,7 @@ def retrieve_evidence(
             query = normalize_text(query_item.get("q") or "")
             if not query:
                 continue
+            is_atomic_query = bool(query_item.get("atomic_claim_id")) or query_variant_origin_value(query_item) == "atomic_claim_query"
             stats["query_count"] += 1
             if should_stop_querying_after_web_budget(claim_evidence, evidence_mode, source_intent, max_results_per_query):
                 break
@@ -14285,6 +14406,14 @@ def retrieve_evidence(
                 "final_source_selection_reason": str((stats.get("source_budget_cutoff") or {}).get("final_source_selection_reason") or ""),
                 "authority_pair_preserved": bool((stats.get("source_budget_cutoff") or {}).get("authority_pair_preserved")),
             }
+            if is_atomic_query:
+                executed_query_row.update(
+                    {
+                        "atomic_query": True,
+                        "atomic_claim_id": str(query_item.get("atomic_claim_id") or ""),
+                        "atomic_risk_type": str(query_item.get("atomic_risk_type") or ""),
+                    }
+                )
             stats.setdefault("executed_query_source_plan", []).append(executed_query_row)
             fallback_jobs = adaptive_fallback_candidates(source_plan, source_jobs, query)
             fallback_used_for_query = 0
@@ -14443,6 +14572,11 @@ def retrieve_evidence(
                     item["query"] = source_query
                     item["query_goal"] = query_goal
                     item["query_origin"] = normalize_text(str(query_item.get("origin") or "")) or "planner"
+                    if is_atomic_query:
+                        item["atomic_query"] = True
+                        item["atomic_claim_id"] = str(query_item.get("atomic_claim_id") or "")
+                        item["atomic_risk_type"] = str(query_item.get("atomic_risk_type") or "")
+                        item["atomic_claim_text"] = str(query_item.get("atomic_claim_text") or "")
                     item["retrieved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                     item["source_type"] = dynamic_source_type(str(item.get("url", "")), source_query, preferred_domains, source_intent)
                     rough_relevance = evidence_relevance_score(source_query, item)
@@ -14843,6 +14977,18 @@ def retrieve_evidence(
                 stats["recall_probe_raw_hits"] = int(stats.get("raw_results", 0) or 0) - query_raw_before
             query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
             query_kept_now = sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) - query_kept_before
+            if is_atomic_query:
+                stats.setdefault("atomic_search_results", []).append(
+                    {
+                        "atomic_claim_id": str(query_item.get("atomic_claim_id") or ""),
+                        "risk_type": str(query_item.get("atomic_risk_type") or ""),
+                        "query": query,
+                        "raw_hits": query_raw_now,
+                        "kept_hits": query_kept_now,
+                        "sources": executed_query_row.get("final_executed_source_order") or executed_query_row.get("sources") or [],
+                        "stop_reason": str(stats.get("claim_retrieve_stop_reason") or ""),
+                    }
+                )
             if (
                 authority_first_query
                 and bool(executed_query_row.get("authority_pair_preserved"))
@@ -14861,6 +15007,20 @@ def retrieve_evidence(
             ):
                 stats["claim_retrieve_stop_reason"] = "supporting_claim_stop_loss"
                 break
+        if stats.get("atomic_query_plan"):
+            atomic_results = stats.get("atomic_search_results") if isinstance(stats.get("atomic_search_results"), list) else []
+            if not stats.get("atomic_retrieval_attempted"):
+                stats["atomic_gate_result"] = "planned_not_executed"
+                stats["atomic_stop_reason"] = stats.get("atomic_stop_reason") or "no_atomic_query_executed"
+            elif any(int(row.get("kept_hits") or 0) > 0 for row in atomic_results if isinstance(row, dict)):
+                stats["atomic_gate_result"] = "retrieved_waiting_gate"
+                stats["atomic_stop_reason"] = ""
+            elif any(int(row.get("raw_hits") or 0) > 0 for row in atomic_results if isinstance(row, dict)):
+                stats["atomic_gate_result"] = "raw_only_filtered_or_gate_pending"
+                stats["atomic_stop_reason"] = "raw_without_kept_atomic_evidence"
+            elif stats.get("atomic_retrieval_attempted"):
+                stats["atomic_gate_result"] = "retrieval_no_result"
+                stats["atomic_stop_reason"] = stats.get("claim_retrieve_stop_reason") or "atomic_query_no_result"
         claim_evidence.sort(
             key=lambda item: (
                 item.get("task_card_score", 0),
