@@ -5407,13 +5407,18 @@ def infer_playwright_rescue_state(stats: Dict[str, Any]) -> str:
     playwright_rescued = int(stats.get("playwright_rescued", 0) or 0)
     playwright_queries = stats.get("playwright_queries") if isinstance(stats.get("playwright_queries"), list) else []
     skipped_reasons = stats.get("playwright_skipped_reasons") if isinstance(stats.get("playwright_skipped_reasons"), list) else []
+    family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
+    serp_count = int(family_rescue_budget_used.get("serp_count", 0) or 0)
+    detail_count = int(family_rescue_budget_used.get("detail_count", 0) or 0)
     pollution = stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}
     playwright_bucket = pollution.get("playwright_duckduckgo") if isinstance(pollution.get("playwright_duckduckgo"), dict) else {}
     playwright_calls = int(playwright_bucket.get("calls", 0) or 0)
     playwright_raw = int(playwright_bucket.get("raw", 0) or 0)
-    if playwright_rescued > 0 or playwright_raw > 0:
+    rescue_success_gate = str(stats.get("rescue_success_gate") or "")
+    rescue_roi_state = str(stats.get("rescue_roi_state") or "")
+    if playwright_rescued > 0 or playwright_raw > 0 or rescue_success_gate or rescue_roi_state in {"search_result_recovered", "detail_content_recovered", "detail_candidates_recovered"}:
         return "playwright_rescue_succeeded"
-    if playwright_calls > 0 or playwright_queries:
+    if playwright_calls > 0 or playwright_queries or serp_count > 0 or detail_count > 0:
         return "playwright_rescue_failed"
     if skipped_reasons:
         return "playwright_rescue_skipped_by_policy"
@@ -9109,6 +9114,95 @@ def annotate_soft_kept_claim_aligned_item(
     item["program_used_for_retention"] = True
 
 
+KEY_EVIDENCE_KEEP_PAGE_TYPES = {
+    "result_page",
+    "event_detail",
+    "calendar_page",
+    "quote_page",
+    "historical_table",
+    "official_notice",
+    "mixed_page",
+    "current_status_page",
+}
+
+
+def should_soft_keep_key_evidence_page(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    if mode not in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}:
+        return False
+    if filter_reason in {
+        "site_domain_mismatch",
+        "search_engine_result_page",
+        "sitemap_generic_landing_page",
+        "official_structured_discovery_stub",
+    }:
+        return False
+    source_type = str(item.get("source_type") or "")
+    if source_type not in {"official", "news", "encyclopedia"}:
+        return False
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        return False
+    claim_item = claim_item if isinstance(claim_item, dict) else {}
+    task_card = claim_item.get("evidence_task_card") if isinstance(claim_item.get("evidence_task_card"), dict) else {}
+    centrality = str(claim_item.get("centrality") or "supporting")
+    priority_label = str(task_card.get("priority_label") or "normal")
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type not in KEY_EVIDENCE_KEEP_PAGE_TYPES:
+        return False
+    page_retention_score = int(item.get("page_retention_score") or 0)
+    page_utility_score = int(item.get("page_utility_score") or 0)
+    directness = int(item.get("directness_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    answer_quality = int(item.get("answer_candidate_quality_score") or 0)
+    anchor_hits = claim_anchor_bucket_hits(query, item, mode, claim_item)
+    anchor_hit_set = {str(hit) for hit in anchor_hits if str(hit)}
+    subject_like = bool(anchor_hit_set & {"subject", "entity", "actor"})
+    time_like = bool(anchor_hit_set & {"time", "time_scope"})
+    fact_like = bool(anchor_hit_set & {"event", "status", "metric", "metric_or_relation", "status_or_result"})
+    if len(anchor_hits) < 2:
+        return False
+    if not ((subject_like and time_like) or (subject_like and fact_like) or (time_like and fact_like)):
+        return False
+    if centrality == "core" or priority_label in {"critical", "high"}:
+        return (
+            page_retention_score >= 44
+            and page_utility_score >= 42
+            and relevance >= 1
+            and (entity_hits >= 1 or directness >= 2 or answer_quality >= 6)
+        )
+    return (
+        page_retention_score >= 52
+        and page_utility_score >= 48
+        and relevance >= 2
+        and entity_hits >= 1
+        and (directness >= 1 or answer_quality >= 6)
+    )
+
+
+def annotate_key_evidence_page_keep(
+    item: Dict[str, Any],
+    query: str,
+    evidence_mode: str,
+    original_filter_reason: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> None:
+    item["page_keep_review_state"] = "kept_review"
+    item["page_keep_review_reason"] = original_filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = str(item.get("source_type") or "")
+    item["soft_keep_anchor_buckets"] = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    item["program_anchor_buckets"] = list(item.get("soft_keep_anchor_buckets") or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    item["program_used_for_retention"] = True
+
+
 def is_official_structured_discovery_stub(item: Dict[str, Any]) -> bool:
     source_type = str(item.get("source_type") or "")
     if source_type != "official":
@@ -11858,6 +11952,10 @@ def diagnose_claim_retrieval(
     direct_candidate_rescue_used = sum(1 for item in web_items if isinstance(item, dict) and item.get("direct_candidate_rescue_used"))
     direct_candidate_rescue_sources = count_item_field_values(web_items, "direct_candidate_rescue_source")
     direct_candidate_rescue_stages = count_item_field_values(web_items, "direct_candidate_rescue_stage")
+    page_keep_review_state = count_item_field_values(web_items, "page_keep_review_state")
+    page_keep_review_reason = count_item_field_values(web_items, "page_keep_review_reason")
+    kept_candidate_source_type = count_item_field_values(web_items, "kept_candidate_source_type")
+    kept_progress_from_raw = sum(1 for item in web_items if isinstance(item, dict) and item.get("kept_progress_from_raw"))
     rescue_promoted_from_filter = sum(1 for item in web_items if isinstance(item, dict) and item.get("rescue_promoted_from_filter"))
     readiness_promotion_used = sum(1 for item in web_items if isinstance(item, dict) and item.get("readiness_promotion_used"))
     readiness_promotion_source = count_item_field_values(web_items, "readiness_promotion_source")
@@ -11952,6 +12050,10 @@ def diagnose_claim_retrieval(
     rescue_skip_reasons = stats.get("rescue_skip_reasons") if isinstance(stats.get("rescue_skip_reasons"), dict) else {}
     rescue_skip_reason = next(iter(rescue_skip_reasons.keys()), "")
     rescue_latency_ms = round(float(stats.get("rescue_latency_ms", 0.0) or 0.0), 1)
+    rescue_progress_delta = stats.get("rescue_progress_delta") if isinstance(stats.get("rescue_progress_delta"), dict) else {}
+    rescue_success_gate = str(stats.get("rescue_success_gate") or "")
+    rescue_target_page_type = str(stats.get("rescue_target_page_type") or "")
+    rescue_non_roi_reason = str(stats.get("rescue_non_roi_reason") or "")
     family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
     claim_retrieve_stop_reason = str(stats.get("claim_retrieve_stop_reason") or "")
     retrieval_cost_review = {
@@ -12195,6 +12297,10 @@ def diagnose_claim_retrieval(
         "rescue_roi_state": str(stats.get("rescue_roi_state") or ""),
         "rescue_skip_reason": rescue_skip_reason,
         "rescue_latency_ms": rescue_latency_ms,
+        "rescue_progress_delta": rescue_progress_delta,
+        "rescue_success_gate": rescue_success_gate,
+        "rescue_target_page_type": rescue_target_page_type,
+        "rescue_non_roi_reason": rescue_non_roi_reason,
         "family_rescue_budget_used": family_rescue_budget_used,
         "official_entry_attempted": official_entry_attempted,
         "official_entry_hit": official_entry_hit,
@@ -12204,6 +12310,10 @@ def diagnose_claim_retrieval(
         "search_execution_trace": search_execution_trace,
         "search_outcome": search_outcome,
         "detail_fetch_paths": detail_fetch_paths,
+        "page_keep_review_state": page_keep_review_state,
+        "page_keep_review_reason": page_keep_review_reason,
+        "kept_candidate_source_type": kept_candidate_source_type,
+        "kept_progress_from_raw": kept_progress_from_raw,
         "direct_candidate_rescue_used": direct_candidate_rescue_used,
         "direct_candidate_rescue_sources": direct_candidate_rescue_sources,
         "direct_candidate_rescue_stages": direct_candidate_rescue_stages,
@@ -12691,6 +12801,13 @@ def retrieve_evidence(
                     apply_detail_fetch_trace(stats, item, detail_trace, "official_discovery")
                     if detail_trace.get("playwright_rescued"):
                         used_playwright_detail_rescues += 1
+                        stats["rescue_progress_delta"] = {
+                            "raw_delta": 0,
+                            "kept_delta": 0,
+                            "stage": "detail_content_recovered",
+                        }
+                        stats["rescue_success_gate"] = "detail_content_recovered"
+                        stats["rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
                         record_rescue_budget_event(
                             stats,
                             "detail",
@@ -12714,6 +12831,8 @@ def retrieve_evidence(
                             latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
                             skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
                         )
+                        if not detail_trace.get("playwright_used"):
+                            stats["rescue_non_roi_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                     record_detail_fetch_failure(stats, item, exc)
             item["relevance_score"] = evidence_relevance_score(f"{question} {claim_text}", item)
             item["entity_match_count"] = entity_match_count(f"{question} {claim_text}", item)
@@ -12765,6 +12884,11 @@ def retrieve_evidence(
                 keep_item = True
                 filter_reason = "soft_keep_claim_aligned_fact_page"
                 annotate_soft_kept_claim_aligned_item(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
+            if not keep_item and should_soft_keep_key_evidence_page(f"{question} {claim_text}", item, filter_reason, evidence_mode, claim_item):
+                original_filter_reason = filter_reason
+                keep_item = True
+                filter_reason = "key_evidence_page_keep_review"
+                annotate_key_evidence_page_keep(item, f"{question} {claim_text}", evidence_mode, original_filter_reason, claim_item)
             if not keep_item and should_soft_keep_route_review_item(item, filter_reason, evidence_mode):
                 keep_item = True
                 filter_reason = "soft_keep_route_review_candidate"
@@ -13017,6 +13141,14 @@ def retrieve_evidence(
                 if source_name == "playwright_duckduckgo":
                     family_name = source_family_name(query_rescue_family or "playwright_duckduckgo")
                     if items:
+                        stats["playwright_rescued"] = int(stats.get("playwright_rescued", 0) or 0) + 1
+                        stats["rescue_progress_delta"] = {
+                            "raw_delta": len(items),
+                            "kept_delta": 0,
+                            "stage": "search_result_recovered",
+                        }
+                        stats["rescue_success_gate"] = "search_result_recovered"
+                        stats["rescue_target_page_type"] = normalize_text(str(page_intent.get("needed_page_type") or "")) or "serp_result"
                         record_rescue_budget_event(
                             stats,
                             "serp",
@@ -13044,6 +13176,14 @@ def retrieve_evidence(
                     stats.setdefault("playwright_roles", []).append("serp_rescue")
                     if used_playwright_queries < PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
                         used_playwright_queries += 1
+                    stats["playwright_rescued"] = int(stats.get("playwright_rescued", 0) or 0) + 1
+                    stats["rescue_progress_delta"] = {
+                        "raw_delta": len(items),
+                        "kept_delta": 0,
+                        "stage": "search_result_recovered",
+                    }
+                    stats["rescue_success_gate"] = "search_result_recovered"
+                    stats["rescue_target_page_type"] = normalize_text(str(page_intent.get("needed_page_type") or "")) or "serp_result"
                     record_rescue_budget_event(stats, "serp", source_name, "succeeded", latency_ms=timing_seconds(stats, source_name) * 1000.0)
                     stats["rescue_roi_state"] = "search_source_internal_rescue_succeeded"
                 stats["raw_results"] += len(items)
@@ -13132,6 +13272,13 @@ def retrieve_evidence(
                             apply_detail_fetch_trace(stats, item, detail_trace, source_name)
                             if detail_trace.get("playwright_rescued"):
                                 used_playwright_detail_rescues += 1
+                                stats["rescue_progress_delta"] = {
+                                    "raw_delta": 0,
+                                    "kept_delta": 0,
+                                    "stage": "detail_content_recovered",
+                                }
+                                stats["rescue_success_gate"] = "detail_content_recovered"
+                                stats["rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
                                 record_rescue_budget_event(
                                     stats,
                                     "detail",
@@ -13167,6 +13314,8 @@ def retrieve_evidence(
                                 if detail_trace.get("playwright_used"):
                                     failed_rescue_families.add(source_family_name(source_name))
                                     stats["rescue_roi_state"] = "detail_rescue_failed"
+                                else:
+                                    stats["rescue_non_roi_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                             record_detail_fetch_failure(stats, item, exc, source_name)
                     item["relevance_score"] = evidence_relevance_score(source_query, item)
                     item["entity_match_count"] = entity_match_count(source_query, item)
@@ -13249,6 +13398,11 @@ def retrieve_evidence(
                         keep_item = True
                         filter_reason = "soft_keep_claim_aligned_fact_page"
                         annotate_soft_kept_claim_aligned_item(item, source_query, evidence_mode, original_filter_reason, claim_item)
+                    if not keep_item and should_soft_keep_key_evidence_page(source_query, item, filter_reason, evidence_mode, claim_item):
+                        original_filter_reason = filter_reason
+                        keep_item = True
+                        filter_reason = "key_evidence_page_keep_review"
+                        annotate_key_evidence_page_keep(item, source_query, evidence_mode, original_filter_reason, claim_item)
                     if not keep_item and should_soft_keep_route_review_item(item, filter_reason, evidence_mode):
                         keep_item = True
                         filter_reason = "soft_keep_route_review_candidate"
