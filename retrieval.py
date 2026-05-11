@@ -326,6 +326,10 @@ def apply_detail_fetch_trace(
         if trigger:
             stats.setdefault("playwright_reasons", []).append(trigger)
             item["playwright_rescue_trigger"] = trigger
+    if trace.get("playwright_rescue_skipped_by_policy"):
+        stats.setdefault("playwright_skipped_reasons", []).append(str(trace.get("rescue_skip_reason") or "detail_rescue_budget_exhausted"))
+        item["playwright_rescue_skipped_by_policy"] = True
+        item["rescue_skip_reason"] = str(trace.get("rescue_skip_reason") or "detail_rescue_budget_exhausted")
     if trace.get("environment_block_reason"):
         item["environment_block_reason"] = str(trace.get("environment_block_reason") or "")
         increment_named_counter(stats, "environment_block_reasons", str(trace.get("environment_block_reason") or ""))
@@ -450,6 +454,61 @@ def source_family_name(source_name: str) -> str:
     if "sitemap" in text:
         return "sitemap"
     return "other"
+
+
+def source_is_authority_or_news(source_name: str) -> bool:
+    text = normalize_text(str(source_name)).lower()
+    return text in {"domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss"} or source_family_name(text) in {"news_rss", "rss", "sitemap"}
+
+
+def source_is_non_sogou_html(source_name: str) -> bool:
+    text = normalize_text(str(source_name)).lower()
+    return text in {"bing_html", "duckduckgo_html"}
+
+
+def query_needs_authority_pair(
+    query_goal: str,
+    query_family_role: str,
+    source_intent: Optional[Dict[str, Any]] = None,
+) -> bool:
+    evidence_mode = effective_evidence_mode(source_intent or {}, str((source_intent or {}).get("evidence_mode") or ""))
+    return query_family_role in {"closure", "distinguish", "refute"} or (
+        query_goal == "verification_question"
+        and evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+    )
+
+
+def source_order_trace_entry(stage: str, sources: List[str], previous_sources: Optional[List[str]] = None, reason: str = "") -> Dict[str, Any]:
+    prev = [str(item) for item in (previous_sources or []) if str(item)]
+    curr = [str(item) for item in (sources or []) if str(item)]
+    return {
+        "stage": stage,
+        "sources": curr[:10],
+        "changed": curr != prev if prev else False,
+        "reason": reason,
+    }
+
+
+def note_source_order_stage(
+    query_item: Optional[Dict[str, Any]],
+    stage: str,
+    sources: List[str],
+    previous_sources: Optional[List[str]] = None,
+    reason: str = "",
+) -> None:
+    if not isinstance(query_item, dict):
+        return
+    trace = query_item.setdefault("_source_order_trace", [])
+    if not isinstance(trace, list):
+        trace = []
+        query_item["_source_order_trace"] = trace
+    trace.append(source_order_trace_entry(stage, sources, previous_sources, reason))
+
+
+def preserved_authority_pair(selected_sources: List[str]) -> bool:
+    has_authority_or_news = any(source_is_authority_or_news(source_name) for source_name in selected_sources)
+    has_non_sogou_html = any(source_is_non_sogou_html(source_name) for source_name in selected_sources)
+    return has_authority_or_news and has_non_sogou_html
 
 
 def summarize_source_recall_diagnosis(
@@ -629,42 +688,70 @@ def budgeted_source_jobs(
     source_intent: Dict[str, Any],
     query_item: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[tuple[str, str]], Dict[str, Any]]:
-    if limit <= 0 or len(source_jobs) <= limit:
-        return source_jobs, {
-            "applied": False,
-            "limit": limit,
-            "original_count": len(source_jobs),
-            "selected_count": len(source_jobs),
-            "selected_sources": [str(source) for source, _ in source_jobs],
-            "omitted_sources": [],
-            "omitted_families": [],
-            "different_family_omitted": False,
-            "higher_priority_omitted": False,
-            "preserved_family_diversity": False,
-            "high_value_query": False,
-        }
     query_item = query_item if isinstance(query_item, dict) else {}
+    planned_source_order = [str(item) for item in (query_item.get("_planned_source_order") or []) if str(item)]
+    post_role_priority_order = [str(item) for item in (query_item.get("_post_role_priority_order") or []) if str(item)]
     query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
     high_value_query = (
         query_goal in {"verification_question", "find_page_intent_page", "find_route_page", "find_metric_source_page"}
         or query_family_role in {"closure", "distinguish", "refute"}
     )
+    authority_pair_needed = query_needs_authority_pair(query_goal, query_family_role, source_intent)
+
+    def build_result(
+        selected_jobs: List[tuple[str, str]],
+        omitted_jobs: List[tuple[str, str]],
+        *,
+        applied: bool,
+        preserved_family_diversity: bool,
+        priority_drop_stage: str = "",
+        selection_reason: str = "",
+    ) -> Dict[str, Any]:
+        selected_sources = [str(source) for source, _ in selected_jobs]
+        omitted_sources = [str(source) for source, _ in omitted_jobs]
+        top_priority_omitted = [
+            name for name in post_role_priority_order[:limit + 2]
+            if name not in selected_sources
+        ]
+        return {
+            "applied": applied,
+            "limit": limit,
+            "original_count": len(source_jobs),
+            "selected_count": len(selected_jobs),
+            "selected_sources": selected_sources,
+            "omitted_sources": omitted_sources[:6],
+            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted_jobs)[:4],
+            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted_jobs} - {source_family_name(str(source)) for source, _ in selected_jobs}),
+            "higher_priority_omitted": bool(top_priority_omitted),
+            "preserved_family_diversity": preserved_family_diversity,
+            "high_value_query": high_value_query,
+            "planned_source_order": planned_source_order[:10],
+            "post_role_priority_order": post_role_priority_order[:10],
+            "post_budget_selected_order": selected_sources[:10],
+            "priority_source_dropped_stage": priority_drop_stage or ("budget" if top_priority_omitted else ""),
+            "final_source_selection_reason": selection_reason,
+            "authority_pair_preserved": preserved_authority_pair(selected_sources) if authority_pair_needed else False,
+        }
+
+    if limit <= 0 or len(source_jobs) <= limit:
+        return source_jobs, build_result(
+            source_jobs,
+            [],
+            applied=False,
+            preserved_family_diversity=False,
+            selection_reason="within_budget",
+        )
     if limit == 1:
         selected = source_jobs[:1]
         omitted = source_jobs[1:]
-        return selected, {
-            "applied": True,
-            "limit": limit,
-            "original_count": len(source_jobs),
-            "selected_count": len(selected),
-            "selected_sources": [str(source) for source, _ in selected],
-            "omitted_sources": [str(source) for source, _ in omitted][:6],
-            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
-            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(selected[0][0]))}),
-            "higher_priority_omitted": False,
-            "preserved_family_diversity": False,
-            "high_value_query": high_value_query,
-        }
+        return selected, build_result(
+            selected,
+            omitted,
+            applied=True,
+            preserved_family_diversity=False,
+            priority_drop_stage="budget" if omitted else "",
+            selection_reason="single_slot_budget",
+        )
     page_intent = normalize_page_intent(source_intent)
     needed_page_type = str(page_intent.get("needed_page_type") or "")
     preserve_family_diversity = query_goal in {"find_route_page", "find_page_intent_page"} or (
@@ -674,19 +761,14 @@ def budgeted_source_jobs(
     if not preserve_family_diversity:
         selected = source_jobs[:limit]
         omitted = source_jobs[limit:]
-        return selected, {
-            "applied": True,
-            "limit": limit,
-            "original_count": len(source_jobs),
-            "selected_count": len(selected),
-            "selected_sources": [str(source) for source, _ in selected],
-            "omitted_sources": [str(source) for source, _ in omitted][:6],
-            "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
-            "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(source)) for source, _ in selected}),
-            "higher_priority_omitted": False,
-            "preserved_family_diversity": False,
-            "high_value_query": high_value_query,
-        }
+        return selected, build_result(
+            selected,
+            omitted,
+            applied=True,
+            preserved_family_diversity=False,
+            priority_drop_stage="budget" if omitted else "",
+            selection_reason="head_preserved_without_diversity",
+        )
 
     selected: List[tuple[str, str]] = []
     used_names = set()
@@ -713,7 +795,15 @@ def budgeted_source_jobs(
             used_names.add(source_name)
             return
 
-    if high_value_query and limit >= 2:
+    if authority_pair_needed and limit >= 2:
+        pick_family("authority_or_news", ["domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss"])
+        if len(selected) < limit:
+            pick_family("html", ["bing_html", "duckduckgo_html"])
+        if len(selected) < limit and not any(source_is_authority_or_news(str(source_name)) for source_name, _ in selected):
+            pick_family("news_rss", ["bing_news_zh_rss", "bing_news_rss"])
+        if len(selected) < limit and not any(source_is_non_sogou_html(str(source_name)) for source_name, _ in selected):
+            pick_family("html", ["bing_html", "duckduckgo_html"])
+    elif high_value_query and limit >= 2:
         if query_family_role in {"closure", "distinguish"}:
             pick_family("authority_or_news", ["domain_sitemap", "bing_rss"])
             if len(selected) < limit:
@@ -749,21 +839,19 @@ def budgeted_source_jobs(
     selected = selected[:limit]
     selected_names = {str(source) for source, _ in selected}
     omitted = [job for job in source_jobs if str(job[0]) not in selected_names]
-    selected_indexes = [index for index, job in enumerate(source_jobs) if str(job[0]) in selected_names]
-    omitted_indexes = [index for index, job in enumerate(source_jobs) if str(job[0]) not in selected_names]
-    return selected, {
-        "applied": True,
-        "limit": limit,
-        "original_count": len(source_jobs),
-        "selected_count": len(selected),
-        "selected_sources": [str(source) for source, _ in selected],
-        "omitted_sources": [str(source) for source, _ in omitted][:6],
-        "omitted_families": dedupe_keep_order(source_family_name(str(source)) for source, _ in omitted)[:4],
-        "different_family_omitted": bool({source_family_name(str(source)) for source, _ in omitted} - {source_family_name(str(source)) for source, _ in selected}),
-        "higher_priority_omitted": bool(selected_indexes and omitted_indexes and min(omitted_indexes) < max(selected_indexes)),
-        "preserved_family_diversity": preserve_family_diversity,
-        "high_value_query": high_value_query,
-    }
+    selection_reason = "family_diversity_budget"
+    if authority_pair_needed:
+        selection_reason = "authority_pair_guarded"
+    elif query_family_role in {"closure", "distinguish", "refute"}:
+        selection_reason = f"{query_family_role}_priority_budget"
+    return selected, build_result(
+        selected,
+        omitted,
+        applied=True,
+        preserved_family_diversity=preserve_family_diversity,
+        priority_drop_stage="budget" if omitted else "",
+        selection_reason=selection_reason,
+    )
 
 
 def clamp_int(value: Any, lower: int, upper: int) -> int:
@@ -4770,6 +4858,7 @@ def dynamic_source_type(
 def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace: Optional[Dict[str, Any]] = None) -> str:
     if not url:
         return ""
+    allow_playwright_rescue = True if not isinstance(trace, dict) else bool(trace.get("allow_playwright_detail_rescue", True))
     cached = cache_get("page", url, max_chars)
     if isinstance(cached, str):
         repaired_cached = repair_mojibake_text(cached)
@@ -4783,13 +4872,21 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_blocked_before_playwright",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_text = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=False)
             except Exception as fallback_exc:
@@ -4847,13 +4944,21 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_blocked_after_fetch",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_text = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=False)
             except Exception as fallback_exc:
@@ -4893,6 +4998,7 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
 def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, Any]] = None) -> str:
     if not url:
         return ""
+    allow_playwright_rescue = True if not isinstance(trace, dict) else bool(trace.get("allow_playwright_detail_rescue", True))
     cached = cache_get("page_html", url, 0)
     if isinstance(cached, str):
         repaired_cached = repair_mojibake_text(cached)
@@ -4906,13 +5012,21 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_html_blocked_before_playwright",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_html = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=True)
             except Exception as fallback_exc:
@@ -4954,13 +5068,21 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
             merge_fetch_trace(
                 trace,
                 anti_bot_blocked=True,
-                playwright_used=True,
                 playwright_rescue_role="detail_rescue",
                 playwright_rescue_trigger="detail_read_blocked",
                 environment_block_reason="detail_access_blocked",
                 detail_fetch_path="requests_html_blocked_after_fetch",
                 request_block_reasons=[str(exc)],
             )
+            if not allow_playwright_rescue:
+                merge_fetch_trace(
+                    trace,
+                    playwright_rescue_skipped_by_policy=True,
+                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    environment_block_reason="requests_blocked_playwright_failed",
+                )
+                raise exc
+            merge_fetch_trace(trace, playwright_used=True)
             try:
                 fallback_html = fetch_with_playwright(url, timeout_sec=timeout_sec, return_html=True)
             except Exception as fallback_exc:
@@ -5150,6 +5272,10 @@ def source_plan_for_query_goal(
     query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
     source_preference = query_item.get("source_preference") if isinstance(query_item.get("source_preference"), list) else []
     sources = source_plan_for_query(source_plan, query)
+    initial_sources = list(sources)
+    query_item["_source_order_trace"] = []
+    query_item["_planned_source_order"] = initial_sources[:10]
+    note_source_order_stage(query_item, "planned_source_order", initial_sources, reason="source_plan_for_query")
     evidence_mode = effective_evidence_mode(source_intent, str(source_intent.get("evidence_mode") or ""))
     if query_goal == "find_metric_source_page":
         priority_sources = ["bing_html", "sogou_html", "bing_rss"]
@@ -5158,17 +5284,26 @@ def source_plan_for_query_goal(
         priority_sources.extend(["bing_news_zh_rss", "bing_news_rss"])
         sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
         sources = reorder_sources_by_query_preference(sources, query_goal, query, [str(item) for item in source_preference])
-        return finalize_route_source_plan(sources, source_intent, query_goal)
+        note_source_order_stage(query_item, "post_role_priority_order", sources, initial_sources, "metric_source_priority")
+        sources = finalize_route_source_plan(sources, source_intent, query_goal)
+        note_source_order_stage(query_item, "post_route_finalize_order", sources, query_item.get("_post_role_priority_order") or initial_sources, "route_finalize")
+        query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
+        return sources
     if query_goal == "find_page_intent_page":
         priority_sources = ["bing_html", "sogou_html"]
         if ENABLE_DUCKDUCKGO:
             priority_sources.append("duckduckgo_html")
         priority_sources.extend(["bing_news_rss", "bing_news_zh_rss", "bing_rss"])
-        return reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+        sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+        note_source_order_stage(query_item, "post_role_priority_order", sources, initial_sources, "page_intent_priority")
+        query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
+        return sources
     profile = retrieval_profile(source_intent)
     priority_sources = profile_sources_for_goal(profile, query_goal, query, source_intent)
     if priority_sources:
+        before_priority = list(sources)
         sources = reorder_sources_by_priority_order(dedupe_keep_order(priority_sources + sources), priority_sources)
+        note_source_order_stage(query_item, "profile_priority_order", sources, before_priority, "profile_sources_for_goal")
     role_priority: List[str] = []
     if query_family_role == "closure":
         role_priority = ["domain_sitemap", "bing_rss", "bing_news_zh_rss", "bing_news_rss", "bing_html"]
@@ -5182,16 +5317,26 @@ def source_plan_for_query_goal(
         insert_after = role_priority.index("bing_html") + 1 if "bing_html" in role_priority else len(role_priority)
         role_priority = role_priority[:insert_after] + ["duckduckgo_html"] + role_priority[insert_after:]
     if role_priority:
+        before_role = list(sources)
         sources = reorder_sources_by_priority_order(dedupe_keep_order(role_priority + sources), role_priority)
+        note_source_order_stage(query_item, "role_priority_order", sources, before_role, "query_family_role")
+    before_shape = list(sources)
     sources = reorder_sources_by_evidence_shape(sources, source_intent)
+    note_source_order_stage(query_item, "evidence_shape_order", sources, before_shape, "reorder_sources_by_evidence_shape")
+    before_preference = list(sources)
     sources = reorder_sources_by_query_preference(sources, query_goal, query, [str(item) for item in source_preference])
-    authority_first = query_family_role in {"closure", "distinguish", "refute"} or (
-        query_goal == "verification_question"
-        and evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
-    )
+    note_source_order_stage(query_item, "query_preference_order", sources, before_preference, "reorder_sources_by_query_preference")
+    authority_first = query_needs_authority_pair(query_goal, query_family_role, source_intent)
     if authority_first and "sogou_html" in sources:
+        before_sogou = list(sources)
         sources = [item for item in sources if item != "sogou_html"] + ["sogou_html"]
+        note_source_order_stage(query_item, "authority_first_sogou_demoted", sources, before_sogou, "non_sogou_html_preferred")
+    query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
+    note_source_order_stage(query_item, "post_role_priority_order", sources, initial_sources, "pre_budget_contract")
+    before_finalize = list(sources)
     sources = finalize_route_source_plan(sources, source_intent, query_goal)
+    note_source_order_stage(query_item, "post_route_finalize_order", sources, before_finalize, "finalize_route_source_plan")
+    query_item["_post_role_priority_order"] = [str(item) for item in sources][:10]
     if query_goal != "verification_question" or not ENABLE_QA_ENHANCED_SOURCES:
         return sources
     return sources
@@ -5350,6 +5495,7 @@ def summarize_search_execution_trace(stats: Dict[str, Any]) -> Dict[str, Any]:
     effective_source_plan = [str(item) for item in (stats.get("effective_source_plan") or []) if str(item)][:10]
     source_budget_cutoff = stats.get("source_budget_cutoff") if isinstance(stats.get("source_budget_cutoff"), dict) else {}
     provider_health_snapshot = stats.get("provider_health_snapshot") if isinstance(stats.get("provider_health_snapshot"), list) else []
+    first_row = executed_plan[0] if executed_plan and isinstance(executed_plan[0], dict) else {}
     return {
         "query_count": int(stats.get("query_count", 0) or 0),
         "planned_query_count": int(stats.get("planned_query_count", 0) or 0),
@@ -5361,6 +5507,8 @@ def summarize_search_execution_trace(stats: Dict[str, Any]) -> Dict[str, Any]:
         "playwright_rescue_roles": dedupe_keep_order([str(item) for item in (stats.get("playwright_roles") or []) if str(item)])[:4],
         "playwright_rescue_triggers": dedupe_keep_order([str(item) for item in (stats.get("playwright_reasons") or []) if str(item)])[:4],
         "detail_fetch_paths": stats.get("detail_fetch_paths", {}) if isinstance(stats.get("detail_fetch_paths"), dict) else {},
+        "source_order_trace": first_row.get("source_order_trace", []) if isinstance(first_row, dict) else [],
+        "final_executed_source_order": first_row.get("final_executed_source_order", []) if isinstance(first_row, dict) else [],
     }
 
 
@@ -9768,6 +9916,96 @@ def add_timing(stats: Dict[str, Any], name: str, elapsed: float) -> None:
     item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + elapsed, 3)
 
 
+def timing_seconds(stats: Dict[str, Any], name: str) -> float:
+    timings = stats.get("source_timings") if isinstance(stats.get("source_timings"), dict) else {}
+    bucket = timings.get(name) if isinstance(timings.get(name), dict) else {}
+    return float(bucket.get("seconds", 0.0) or 0.0)
+
+
+def record_rescue_budget_event(
+    stats: Dict[str, Any],
+    rescue_type: str,
+    family: str,
+    state: str,
+    latency_ms: float = 0.0,
+    skip_reason: str = "",
+) -> None:
+    family_key = normalize_text(str(family or "")) or "unknown"
+    rescue_key = f"{normalize_text(str(rescue_type or 'unknown'))}_count"
+    budget = stats.setdefault(
+        "family_rescue_budget_used",
+        {
+            "serp_count": 0,
+            "detail_count": 0,
+            "families": {},
+        },
+    )
+    budget[rescue_key] = int(budget.get(rescue_key, 0) or 0) + (1 if state in {"succeeded", "failed"} else 0)
+    families = budget.setdefault("families", {})
+    family_bucket = families.setdefault(
+        family_key,
+        {"serp": {"succeeded": 0, "failed": 0}, "detail": {"succeeded": 0, "failed": 0}},
+    )
+    if state in {"succeeded", "failed"}:
+        family_bucket.setdefault(rescue_type, {"succeeded": 0, "failed": 0})
+        family_bucket[rescue_type][state] = int(family_bucket[rescue_type].get(state, 0) or 0) + 1
+    if latency_ms > 0:
+        stats["rescue_latency_ms"] = round(float(stats.get("rescue_latency_ms", 0.0) or 0.0) + latency_ms, 1)
+    if skip_reason:
+        skips = stats.setdefault("rescue_skip_reasons", {})
+        skips[skip_reason] = int(skips.get(skip_reason, 0) or 0) + 1
+
+
+def source_timing_stage_profile(stats: Dict[str, Any]) -> Dict[str, Any]:
+    timings = stats.get("source_timings") if isinstance(stats.get("source_timings"), dict) else {}
+    search_seconds = 0.0
+    detail_seconds = 0.0
+    official_discovery_seconds = timing_seconds(stats, "official_discovery")
+    slow_sources: List[Dict[str, Any]] = []
+    for name, bucket in timings.items():
+        if not isinstance(bucket, dict):
+            continue
+        seconds = float(bucket.get("seconds", 0.0) or 0.0)
+        calls = int(bucket.get("calls", 0) or 0)
+        if name == "fetch_detail":
+            detail_seconds += seconds
+            continue
+        if name.endswith("_precheck") or name == "official_discovery":
+            continue
+        search_seconds += seconds
+        if calls > 0 and seconds >= 4.0:
+            slow_sources.append(
+                {
+                    "source": str(name),
+                    "seconds": round(seconds, 3),
+                    "calls": calls,
+                }
+            )
+    slow_sources.sort(key=lambda item: (item.get("seconds", 0.0), item.get("calls", 0)), reverse=True)
+    return {
+        "official_discovery_seconds": round(official_discovery_seconds, 3),
+        "search_seconds": round(search_seconds, 3),
+        "detail_fetch_seconds": round(detail_seconds, 3),
+        "slow_sources": slow_sources[:5],
+    }
+
+
+def source_family_stop_loss_triggered(
+    stats: Dict[str, Any],
+    source_name: str,
+    slow_threshold_sec: float = 6.0,
+) -> str:
+    bucket = source_pollution_bucket(stats, source_name)
+    seconds = timing_seconds(stats, source_name)
+    if int(bucket.get("anti_bot_blocks", 0) or 0) >= 1 and int(bucket.get("requests_blocked_playwright_failed", 0) or 0) >= 1:
+        return "anti_bot_and_rescue_failed"
+    if int(bucket.get("raw", 0) or 0) <= 0 and int(bucket.get("calls", 0) or 0) >= 1 and seconds >= slow_threshold_sec:
+        return "empty_and_slow"
+    if int(bucket.get("playwright_failed", 0) or 0) >= 1:
+        return "repeated_rescue_failed"
+    return ""
+
+
 def add_filtered_sample(stats: Dict[str, Any], reason: str, item: Dict[str, Any]) -> None:
     samples = stats.setdefault("filtered_samples", [])
     if len(samples) >= 8:
@@ -11693,6 +11931,39 @@ def diagnose_claim_retrieval(
     search_request = stats.get("search_request") if isinstance(stats.get("search_request"), dict) else {}
     search_policy = stats.get("search_policy") if isinstance(stats.get("search_policy"), dict) else {}
     search_execution_trace = summarize_search_execution_trace(stats)
+    executed_query_rows = stats.get("executed_query_source_plan") if isinstance(stats.get("executed_query_source_plan"), list) else []
+    source_order_trace = []
+    final_executed_source_order: List[str] = []
+    priority_source_dropped_stage = ""
+    final_source_selection_reason = ""
+    authority_pair_preserved = False
+    for row in executed_query_rows:
+        if not isinstance(row, dict):
+            continue
+        if not source_order_trace and isinstance(row.get("source_order_trace"), list):
+            source_order_trace = row.get("source_order_trace", [])[:8]
+        final_executed_source_order.extend([str(item) for item in (row.get("final_executed_source_order") or []) if str(item)])
+        if not priority_source_dropped_stage:
+            priority_source_dropped_stage = str(row.get("priority_source_dropped_stage") or "")
+        if not final_source_selection_reason:
+            final_source_selection_reason = str(row.get("final_source_selection_reason") or "")
+        authority_pair_preserved = authority_pair_preserved or bool(row.get("authority_pair_preserved"))
+    source_latency_profile = source_timing_stage_profile(stats)
+    rescue_skip_reasons = stats.get("rescue_skip_reasons") if isinstance(stats.get("rescue_skip_reasons"), dict) else {}
+    rescue_skip_reason = next(iter(rescue_skip_reasons.keys()), "")
+    rescue_latency_ms = round(float(stats.get("rescue_latency_ms", 0.0) or 0.0), 1)
+    family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
+    claim_retrieve_stop_reason = str(stats.get("claim_retrieve_stop_reason") or "")
+    retrieval_cost_review = {
+        "query_count": int(stats.get("query_count", 0) or 0),
+        "executed_source_count": len(dedupe_keep_order(final_executed_source_order)),
+        "detail_attempts": int(stats.get("detail_attempts", 0) or 0),
+        "detail_successes": int(stats.get("detail_successes", 0) or 0),
+        "rescue_latency_ms": rescue_latency_ms,
+        "search_seconds": source_latency_profile.get("search_seconds", 0.0),
+        "detail_fetch_seconds": source_latency_profile.get("detail_fetch_seconds", 0.0),
+        "official_discovery_seconds": source_latency_profile.get("official_discovery_seconds", 0.0),
+    }
     search_outcome = summarize_search_outcome(
         raw_results,
         len(web_items),
@@ -11880,6 +12151,11 @@ def diagnose_claim_retrieval(
         "planned_query_count": stats.get("planned_query_count"),
         "executed_query_plan": stats.get("executed_query_plan", []),
         "executed_query_source_plan": stats.get("executed_query_source_plan", [])[:6],
+        "source_order_trace": source_order_trace,
+        "priority_source_dropped_stage": priority_source_dropped_stage,
+        "final_source_selection_reason": final_source_selection_reason,
+        "final_executed_source_order": dedupe_keep_order(final_executed_source_order)[:10],
+        "authority_pair_preserved": authority_pair_preserved,
         "query_variant_origin": stats.get("query_variant_origin", [])[:8],
         "recall_probe_used": int(stats.get("recall_probe_used", 0) or 0),
         "recall_probe_query": stats.get("recall_probe_query", ""),
@@ -11916,6 +12192,10 @@ def diagnose_claim_retrieval(
         "playwright_rescue_trigger": playwright_rescue_trigger,
         "playwright_rescue_source": playwright_rescue_source,
         "playwright_rescue_result_count": playwright_rescue_result_count,
+        "rescue_roi_state": str(stats.get("rescue_roi_state") or ""),
+        "rescue_skip_reason": rescue_skip_reason,
+        "rescue_latency_ms": rescue_latency_ms,
+        "family_rescue_budget_used": family_rescue_budget_used,
         "official_entry_attempted": official_entry_attempted,
         "official_entry_hit": official_entry_hit,
         "official_entry_source_family": official_entry_source_family,
@@ -11992,6 +12272,10 @@ def diagnose_claim_retrieval(
         "source_precheck_skipped_sources": int(stats.get("source_precheck_skipped_sources", 0) or 0),
         "source_health_before": stats.get("source_health_before", {}),
         "source_health_reorder_actions": stats.get("source_health_reorder_actions", [])[:10],
+        "source_latency_profile": source_latency_profile,
+        "slow_source_cutoff": source_latency_profile.get("slow_sources", []),
+        "claim_retrieve_stop_reason": claim_retrieve_stop_reason,
+        "retrieval_cost_review": retrieval_cost_review,
         "trusted_deepen_used": int(stats.get("trusted_deepen_used", 0) or 0),
         "trusted_deepen_domains": stats.get("trusted_deepen_domains", []),
         "trusted_deepen_jobs": stats.get("trusted_deepen_jobs", [])[:6],
@@ -12246,7 +12530,28 @@ def retrieve_evidence(
             source_intent = dict(source_intent)
             existing_domains = preferred_domains_from_intent(source_intent)
             source_intent["preferred_domains"] = dedupe_keep_order(existing_domains + inline_query_domains)
-        discovery_result = discover_official_domains(question, claim_text, source_intent, timeout_sec=min(timeout_sec, 8))
+        should_attempt_official_discovery = (
+            bool(preferred_domains_from_intent(source_intent))
+            or evidence_mode in {"date_fact", "schedule_fact", "route_fact", "numeric_fact"}
+            or (evidence_mode == "event_result" and centrality == "core")
+        )
+        if should_attempt_official_discovery:
+            discovery_started = time.perf_counter()
+            discovery_timeout = min(timeout_sec, 6 if evidence_mode in {"date_fact", "schedule_fact", "route_fact", "numeric_fact"} else 4)
+            discovery_result = discover_official_domains(question, claim_text, source_intent, timeout_sec=discovery_timeout)
+            discovery_elapsed = time.perf_counter() - discovery_started
+        else:
+            discovery_result = {
+                "official_discovery_attempted": False,
+                "official_domain_candidates": [],
+                "discovered_domains": [],
+                "official_discovery_score": 0,
+                "official_discovery_used": False,
+                "official_discovery_queries": [],
+                "official_discovery_logs": [],
+                "official_discovery_block_reason": "skipped_low_roi",
+            }
+            discovery_elapsed = 0.0
         if discovery_result.get("discovered_domains"):
             source_intent = dict(source_intent)
             existing_domains = preferred_domains_from_intent(source_intent)
@@ -12335,8 +12640,12 @@ def retrieve_evidence(
             "search_request": search_request,
             "search_policy": search_policy,
             "playwright_roles": [],
+            "claim_retrieve_stop_reason": "",
+            "rescue_latency_ms": 0.0,
+            "family_rescue_budget_used": {"serp_count": 0, "detail_count": 0, "families": {}},
             **source_strategy_eval,
         }
+        add_timing(stats, "official_discovery", discovery_elapsed)
         if source_strategy_eval.get("source_strategy_label") in {"weak", "bad"}:
             stats["source_strategy_fallback"] = "default_source_plan"
         retry_policy = retry_source_plan_policy(source_intent)
@@ -12344,7 +12653,9 @@ def retrieve_evidence(
             stats["route_retry_source_strategy"] = retry_policy
         detail_fetches = 0
         used_playwright_queries = 0
+        used_playwright_detail_rescues = 0
         adaptive_fallback_used_for_claim = 0
+        failed_rescue_families: set[str] = set()
         claim_evidence.extend(context_evidence(question, answer, history, claim_id))
         claim_evidence.extend(computational_evidence(question, answer, claim_text, claim_id, time_value))
         for candidate in discovery_result.get("official_domain_candidates", []) or []:
@@ -12365,20 +12676,44 @@ def retrieve_evidence(
             }
             if fetch_details > 0 and item.get("url") and detail_fetches < FETCH_DETAILS_PER_CLAIM:
                 stats["detail_attempts"] = int(stats.get("detail_attempts", 0) or 0) + 1
+                detail_trace: Dict[str, Any] = {
+                    "allow_playwright_detail_rescue": used_playwright_detail_rescues < 1,
+                }
                 try:
                     detail_started = time.perf_counter()
-                    page_text = fetch_page_text(str(item["url"]), max_chars=5000, timeout_sec=timeout_sec)
+                    page_text = fetch_page_text(str(item["url"]), max_chars=5000, timeout_sec=timeout_sec, trace=detail_trace)
                     item["detail"] = extract_relevant_passage(
                         page_text,
                         passage_focus_terms(f"{question} {claim_text}", str(item.get("title") or "")),
                         max_chars=1800,
                     )
-                    enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec)
+                    enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec, fetch_trace=detail_trace)
+                    apply_detail_fetch_trace(stats, item, detail_trace, "official_discovery")
+                    if detail_trace.get("playwright_rescued"):
+                        used_playwright_detail_rescues += 1
+                        record_rescue_budget_event(
+                            stats,
+                            "detail",
+                            "official_discovery",
+                            "succeeded",
+                            latency_ms=(time.perf_counter() - detail_started) * 1000.0,
+                        )
                     detail_fetches += 1
                     stats["detail_successes"] = int(stats.get("detail_successes", 0) or 0) + 1
                     add_timing(stats, "fetch_detail", time.perf_counter() - detail_started)
                 except Exception as exc:
                     add_timing(stats, "fetch_detail", time.perf_counter() - detail_started if "detail_started" in locals() else 0.0)
+                    apply_detail_fetch_trace(stats, item, detail_trace, "official_discovery")
+                    if detail_trace.get("playwright_used") or detail_trace.get("playwright_rescue_skipped_by_policy"):
+                        used_playwright_detail_rescues += 1 if detail_trace.get("playwright_used") else 0
+                        record_rescue_budget_event(
+                            stats,
+                            "detail",
+                            "official_discovery",
+                            "failed" if detail_trace.get("playwright_used") else "skipped",
+                            latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
+                            skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
+                        )
                     record_detail_fetch_failure(stats, item, exc)
             item["relevance_score"] = evidence_relevance_score(f"{question} {claim_text}", item)
             item["entity_match_count"] = entity_match_count(f"{question} {claim_text}", item)
@@ -12489,6 +12824,7 @@ def retrieve_evidence(
             if is_recall_probe and int(stats.get("raw_results", 0) or 0) > 0:
                 continue
             query_goal = normalize_text(query_item.get("goal") or "general_verify") or "general_verify"
+            query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
             query = normalize_text(query_item.get("q") or "")
             if not query:
                 continue
@@ -12503,11 +12839,14 @@ def retrieve_evidence(
                     and str(page_intent.get("needed_page_type") or "") not in {"", "general_page"}
                 )
             )
-            allow_adaptive_fallback = (ENABLE_ADAPTIVE_SOURCE_FALLBACK or page_probe_adaptive_fallback) and not is_recall_probe
+            authority_first_query = query_needs_authority_pair(query_goal, query_family_role, source_intent)
+            allow_adaptive_fallback = (ENABLE_ADAPTIVE_SOURCE_FALLBACK or page_probe_adaptive_fallback or authority_first_query) and not is_recall_probe
             source_jobs = [
                 (source_name, query)
                 for source_name in source_plan_for_query_goal(source_plan, query_item, query_goal, source_intent)
             ]
+            planned_source_order = [str(item) for item in (query_item.get("_planned_source_order") or []) if str(item)]
+            post_role_priority_order = [str(item) for item in (query_item.get("_post_role_priority_order") or []) if str(item)]
             if is_recall_probe:
                 source_jobs = restrict_recall_probe_source_jobs(source_jobs, evidence_mode)
                 stats["recall_probe_used"] = 1
@@ -12518,16 +12857,26 @@ def retrieve_evidence(
                     key: dict(value)
                     for key, value in list(source_health.items())[:20]
                 }
+                before_health_reorder = [source_name for source_name, _ in source_jobs]
                 source_jobs, health_actions = reorder_sources_by_health(source_jobs, source_health, evidence_mode, query_goal)
                 if health_actions:
                     stats.setdefault("source_health_reorder_actions", []).extend(health_actions[:5])
                     stats["provider_health_snapshot"] = health_actions[:5]
+                note_source_order_stage(query_item, "health_reorder_order", [source_name for source_name, _ in source_jobs], before_health_reorder, "reorder_sources_by_health")
             original_source_job_count = len(source_jobs)
             if claim_source_limit > 0:
                 source_jobs, source_budget_cutoff = budgeted_source_jobs(source_jobs, claim_source_limit, query_goal, source_intent, query_item)
                 stats["skipped_sources_by_budget"] = int(stats.get("skipped_sources_by_budget", 0) or 0) + max(0, original_source_job_count - len(source_jobs))
                 if source_budget_cutoff.get("applied"):
                     stats["source_budget_cutoff"] = source_budget_cutoff
+            post_budget_selected_order = [source_name for source_name, _ in source_jobs]
+            note_source_order_stage(
+                query_item,
+                "post_budget_selected_order",
+                post_budget_selected_order,
+                post_role_priority_order or planned_source_order,
+                str((stats.get("source_budget_cutoff") or {}).get("final_source_selection_reason") or "budgeted_source_jobs"),
+            )
             stats["effective_source_plan"] = dedupe_keep_order(
                 list(stats.get("effective_source_plan", [])) + [source_name for source_name, _ in source_jobs]
             )[:10]
@@ -12547,17 +12896,24 @@ def retrieve_evidence(
             )
             if not query_playwright_allowed and not is_recall_probe and ENABLE_PLAYWRIGHT:
                 stats.setdefault("playwright_skipped_reasons", []).append(playwright_policy_reason)
-            stats.setdefault("executed_query_source_plan", []).append(
-                {
-                    "q": query,
-                    "goal": query_goal,
-                    "origin": normalize_text(str(query_item.get("origin") or "")) or "planner",
-                    "query_variant_origin": query_variant_origin_value(query_item),
-                    "probe_only_if_raw_zero": is_recall_probe,
-                    "sources": [source_name for source_name, _ in source_jobs],
-                    "source_count": len(source_jobs),
-                }
-            )
+            executed_query_row = {
+                "q": query,
+                "goal": query_goal,
+                "origin": normalize_text(str(query_item.get("origin") or "")) or "planner",
+                "query_variant_origin": query_variant_origin_value(query_item),
+                "probe_only_if_raw_zero": is_recall_probe,
+                "sources": post_budget_selected_order[:10],
+                "source_count": len(source_jobs),
+                "planned_source_order": planned_source_order[:10],
+                "post_role_priority_order": post_role_priority_order[:10],
+                "post_budget_selected_order": post_budget_selected_order[:10],
+                "final_executed_source_order": [],
+                "source_order_trace": list(query_item.get("_source_order_trace") or [])[:8],
+                "priority_source_dropped_stage": str((stats.get("source_budget_cutoff") or {}).get("priority_source_dropped_stage") or ""),
+                "final_source_selection_reason": str((stats.get("source_budget_cutoff") or {}).get("final_source_selection_reason") or ""),
+                "authority_pair_preserved": bool((stats.get("source_budget_cutoff") or {}).get("authority_pair_preserved")),
+            }
+            stats.setdefault("executed_query_source_plan", []).append(executed_query_row)
             fallback_jobs = adaptive_fallback_candidates(source_plan, source_jobs, query)
             fallback_used_for_query = 0
             source_index = 0
@@ -12570,12 +12926,24 @@ def retrieve_evidence(
             query_high_priority_attempted = False
             query_anti_bot_blocked = False
             query_playwright_scheduled = any(source_name == "playwright_duckduckgo" for source_name, _ in source_jobs)
+            executed_source_order: List[str] = []
+            query_rescue_family = ""
 
             def maybe_schedule_query_playwright_rescue() -> None:
                 nonlocal query_playwright_scheduled, used_playwright_queries
                 if not query_playwright_allowed or query_playwright_scheduled:
                     return
                 if used_playwright_queries >= PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
+                    record_rescue_budget_event(stats, "serp", query_rescue_family or "playwright_duckduckgo", "skipped", skip_reason="serp_rescue_budget_exhausted")
+                    stats["rescue_roi_state"] = "budget_exhausted_before_rescue"
+                    return
+                if int(stats.get("kept_web", 0) or 0) > 0 or sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) > query_kept_before:
+                    record_rescue_budget_event(stats, "serp", query_rescue_family or "playwright_duckduckgo", "skipped", skip_reason="kept_web_already_positive")
+                    stats["rescue_roi_state"] = "skipped_after_kept_progress"
+                    return
+                if query_rescue_family and query_rescue_family in failed_rescue_families:
+                    record_rescue_budget_event(stats, "serp", query_rescue_family, "skipped", skip_reason="same_family_rescue_failed")
+                    stats["rescue_roi_state"] = "skipped_same_family_failed"
                     return
                 query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
                 rescue_trigger = ""
@@ -12588,10 +12956,12 @@ def retrieve_evidence(
                 source_jobs.append(("playwright_duckduckgo", query))
                 query_playwright_scheduled = True
                 used_playwright_queries += 1
+                stats["playwright_rescue_trigger"] = rescue_trigger
                 stats.setdefault("playwright_queries", []).append(query)
                 stats.setdefault("playwright_reasons", []).append(rescue_trigger)
                 role = "authority_entry_opener" if query_item.get("query_family_role") in {"closure", "distinguish", "refute"} else "serp_rescue"
                 stats.setdefault("playwright_roles", []).append(role)
+                stats["rescue_roi_state"] = f"scheduled_{rescue_trigger}"
 
             while source_index < len(source_jobs):
                 source_name, source_query = source_jobs[source_index]
@@ -12599,6 +12969,12 @@ def retrieve_evidence(
                 if budget_exhausted():
                     stats["budget_exhausted"] = True
                     break
+                if source_name != "playwright_duckduckgo":
+                    stop_reason = source_family_stop_loss_triggered(stats, source_name)
+                    if stop_reason:
+                        stats["claim_retrieve_stop_reason"] = normalize_text(f"{source_name}:{stop_reason}") or stop_reason
+                        continue
+                executed_source_order.append(source_name)
                 if source_name != "playwright_duckduckgo" and high_priority_search_source(source_name):
                     query_high_priority_attempted = True
                 if should_precheck_source(source_name, source_query, max_results_per_query) and not source_precheck_passes(
@@ -12621,19 +12997,55 @@ def retrieve_evidence(
                     error_reason = "anti_bot_blocked" if exception_looks_like_anti_bot(exc) else "source_error"
                     if error_reason == "anti_bot_blocked":
                         query_anti_bot_blocked = True
+                        query_rescue_family = source_name
                     record_source_call(stats, source_name, 0, error=True, error_reason=error_reason)
+                    if source_name == "playwright_duckduckgo":
+                        family_name = source_family_name(query_rescue_family or "playwright_duckduckgo")
+                        failed_rescue_families.add(family_name)
+                        record_rescue_budget_event(
+                            stats,
+                            "serp",
+                            family_name,
+                            "failed",
+                            latency_ms=timing_seconds(stats, source_name) * 1000.0,
+                        )
+                        stats["rescue_roi_state"] = "playwright_rescue_failed"
                     all_logs.append({"claim_id": claim_id, "query": source_query, "source": source_name, "error": str(exc), "error_reason": error_reason})
                     maybe_schedule_query_playwright_rescue()
                     continue
                 record_source_call(stats, source_name, len(items))
+                if source_name == "playwright_duckduckgo":
+                    family_name = source_family_name(query_rescue_family or "playwright_duckduckgo")
+                    if items:
+                        record_rescue_budget_event(
+                            stats,
+                            "serp",
+                            family_name,
+                            "succeeded",
+                            latency_ms=timing_seconds(stats, source_name) * 1000.0,
+                        )
+                        stats["rescue_roi_state"] = "playwright_rescue_succeeded"
+                    else:
+                        failed_rescue_families.add(family_name)
+                        record_rescue_budget_event(
+                            stats,
+                            "serp",
+                            family_name,
+                            "failed",
+                            latency_ms=timing_seconds(stats, source_name) * 1000.0,
+                        )
+                        stats["rescue_roi_state"] = "playwright_rescue_no_raw"
                 search_fallback_from_anti_bot = any(bool(item.get("search_fallback_from_anti_bot")) for item in items if isinstance(item, dict))
                 if search_fallback_from_anti_bot:
                     query_anti_bot_blocked = True
+                    query_rescue_family = source_name
                     stats.setdefault("playwright_queries", []).append(source_query)
                     stats.setdefault("playwright_reasons", []).append("anti_bot_blocked")
                     stats.setdefault("playwright_roles", []).append("serp_rescue")
                     if used_playwright_queries < PLAYWRIGHT_MAX_QUERIES_PER_CLAIM:
                         used_playwright_queries += 1
+                    record_rescue_budget_event(stats, "serp", source_name, "succeeded", latency_ms=timing_seconds(stats, source_name) * 1000.0)
+                    stats["rescue_roi_state"] = "search_source_internal_rescue_succeeded"
                 stats["raw_results"] += len(items)
                 for item in items:
                     if budget_exhausted():
@@ -12706,7 +13118,10 @@ def retrieve_evidence(
                         stats["source_quality_detail_skipped"] = int(stats.get("source_quality_detail_skipped", 0) or 0) + 1
                     if should_fetch_detail:
                         stats["detail_attempts"] = int(stats.get("detail_attempts", 0) or 0) + 1
-                        detail_trace: Dict[str, Any] = {}
+                        allow_detail_rescue = used_playwright_detail_rescues < 1
+                        detail_trace: Dict[str, Any] = {
+                            "allow_playwright_detail_rescue": allow_detail_rescue,
+                        }
                         try:
                             detail_started = time.perf_counter()
                             raw_chars = 5000 if evidence_mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact"} else 1600
@@ -12715,12 +13130,43 @@ def retrieve_evidence(
                             item["detail"] = extract_relevant_passage(page_text, passage_focus_terms(source_query, str(item.get("title") or "")), max_chars=passage_chars)
                             enrich_structured_table_evidence(item, source_intent, timeout_sec=timeout_sec, fetch_trace=detail_trace)
                             apply_detail_fetch_trace(stats, item, detail_trace, source_name)
+                            if detail_trace.get("playwright_rescued"):
+                                used_playwright_detail_rescues += 1
+                                record_rescue_budget_event(
+                                    stats,
+                                    "detail",
+                                    source_family_name(source_name),
+                                    "succeeded",
+                                    latency_ms=(time.perf_counter() - detail_started) * 1000.0,
+                                )
+                                stats["rescue_roi_state"] = "detail_rescue_succeeded"
+                            elif detail_trace.get("playwright_rescue_skipped_by_policy"):
+                                record_rescue_budget_event(
+                                    stats,
+                                    "detail",
+                                    source_family_name(source_name),
+                                    "skipped",
+                                    skip_reason=str(detail_trace.get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
+                                )
                             detail_fetches += 1
                             stats["detail_successes"] = int(stats.get("detail_successes", 0) or 0) + 1
                             add_timing(stats, "fetch_detail", time.perf_counter() - detail_started)
                         except Exception as exc:
                             add_timing(stats, "fetch_detail", time.perf_counter() - detail_started if "detail_started" in locals() else 0.0)
                             apply_detail_fetch_trace(stats, item, detail_trace, source_name)
+                            if detail_trace.get("playwright_used") or detail_trace.get("playwright_rescue_skipped_by_policy"):
+                                used_playwright_detail_rescues += 1 if detail_trace.get("playwright_used") else 0
+                                record_rescue_budget_event(
+                                    stats,
+                                    "detail",
+                                    source_family_name(source_name),
+                                    "failed" if detail_trace.get("playwright_used") else "skipped",
+                                    latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
+                                    skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
+                                )
+                                if detail_trace.get("playwright_used"):
+                                    failed_rescue_families.add(source_family_name(source_name))
+                                    stats["rescue_roi_state"] = "detail_rescue_failed"
                             record_detail_fetch_failure(stats, item, exc, source_name)
                     item["relevance_score"] = evidence_relevance_score(source_query, item)
                     item["entity_match_count"] = entity_match_count(source_query, item)
@@ -12913,11 +13359,67 @@ def retrieve_evidence(
                                 "bad_before": query_bad_now,
                             }
                         )
+                if (
+                    authority_first_query
+                    and fallback_used_for_query < ADAPTIVE_SOURCE_FALLBACK_LIMIT
+                    and adaptive_fallback_used_for_claim < ADAPTIVE_SOURCE_FALLBACK_LIMIT
+                    and source_index >= len(source_jobs)
+                ):
+                    query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
+                    query_bad_now = sum(
+                        int(bucket.get("bad", 0) or 0)
+                        for bucket in (stats.get("source_pollution_stats") if isinstance(stats.get("source_pollution_stats"), dict) else {}).values()
+                    ) - query_bad_before
+                    query_kept_now = sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) - query_kept_before
+                    used_source_names = {name for name, _query in source_jobs}
+                    if query_raw_now <= 0 and query_kept_now <= 0:
+                        fallback_job = None
+                        for preferred_source in ["sogou_html", "bing_news_zh_rss", "bing_news_rss"]:
+                            if preferred_source in used_source_names:
+                                continue
+                            fallback_job = (preferred_source, query)
+                            break
+                        if fallback_job:
+                            source_jobs.append(fallback_job)
+                            fallback_used_for_query += 1
+                            adaptive_fallback_used_for_claim += 1
+                            stats["adaptive_source_fallback_used"] = int(stats.get("adaptive_source_fallback_used", 0) or 0) + 1
+                            stats.setdefault("adaptive_source_fallback_jobs", []).append(
+                                {
+                                    "query": query,
+                                    "source": fallback_job[0],
+                                    "reason": "authority_pair_no_raw_then_supplement",
+                                    "raw_before": query_raw_now,
+                                    "bad_before": query_bad_now,
+                                }
+                            )
             maybe_schedule_query_playwright_rescue()
+            executed_query_row["final_executed_source_order"] = dedupe_keep_order(executed_source_order)[:10]
+            executed_query_row["source_count"] = len(executed_query_row["final_executed_source_order"] or executed_query_row.get("sources") or [])
             if should_stop_querying_after_web_budget(claim_evidence, evidence_mode, source_intent, max_results_per_query):
                 break
             if is_recall_probe:
                 stats["recall_probe_raw_hits"] = int(stats.get("raw_results", 0) or 0) - query_raw_before
+            query_raw_now = int(stats.get("raw_results", 0) or 0) - query_raw_before
+            query_kept_now = sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) - query_kept_before
+            if (
+                authority_first_query
+                and bool(executed_query_row.get("authority_pair_preserved"))
+                and query_raw_now <= 0
+                and query_kept_now <= 0
+            ):
+                stats["claim_retrieve_stop_reason"] = "authority_pair_attempted_no_progress"
+                if centrality != "core" and fallback_used_for_query <= 0:
+                    break
+            if (
+                centrality != "core"
+                and evidence_mode not in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+                and stats["query_count"] >= 2
+                and query_kept_now <= 0
+                and query_raw_now <= 0
+            ):
+                stats["claim_retrieve_stop_reason"] = "supporting_claim_stop_loss"
+                break
         claim_evidence.sort(
             key=lambda item: (
                 item.get("task_card_score", 0),

@@ -2190,11 +2190,29 @@ def build_retrieval_effect_review(
         or str(row.get("official_discovery_block_reason") or "") == "anti_bot_blocked"
     )
     rescue_states: Dict[str, int] = {}
+    rescue_latency_ms = 0.0
+    cost_rows = []
+    stop_reasons: Dict[str, int] = {}
     for row in rows:
         state = str(row.get("playwright_rescue_state") or "")
         if not state:
-            continue
-        rescue_states[state] = int(rescue_states.get(state, 0) or 0) + 1
+            pass
+        else:
+            rescue_states[state] = int(rescue_states.get(state, 0) or 0) + 1
+        rescue_latency_ms += float(row.get("rescue_latency_ms") or 0.0)
+        cost_review = row.get("retrieval_cost_review") if isinstance(row.get("retrieval_cost_review"), dict) else {}
+        if cost_review:
+            cost_rows.append(cost_review)
+        stop_reason = str(row.get("claim_retrieve_stop_reason") or "")
+        if stop_reason:
+            stop_reasons[stop_reason] = int(stop_reasons.get(stop_reason, 0) or 0) + 1
+    avg_search_seconds = 0.0
+    avg_detail_fetch_seconds = 0.0
+    avg_official_discovery_seconds = 0.0
+    if cost_rows:
+        avg_search_seconds = round(sum(float(row.get("search_seconds") or 0.0) for row in cost_rows) / len(cost_rows), 3)
+        avg_detail_fetch_seconds = round(sum(float(row.get("detail_fetch_seconds") or 0.0) for row in cost_rows) / len(cost_rows), 3)
+        avg_official_discovery_seconds = round(sum(float(row.get("official_discovery_seconds") or 0.0) for row in cost_rows) / len(cost_rows), 3)
     return {
         "claim_count": len(rows),
         "raw_positive_claims": raw_positive,
@@ -2202,6 +2220,11 @@ def build_retrieval_effect_review(
         "authority_hit_claims": authority_hits,
         "anti_bot_or_access_blocked_claims": anti_bot_like,
         "playwright_rescue_states": rescue_states,
+        "avg_rescue_latency_ms": round(rescue_latency_ms / max(1, len(rows)), 1),
+        "avg_search_seconds": avg_search_seconds,
+        "avg_detail_fetch_seconds": avg_detail_fetch_seconds,
+        "avg_official_discovery_seconds": avg_official_discovery_seconds,
+        "claim_stop_reasons": stop_reasons,
         "retrieve_seconds": round(float((timing or {}).get("retrieve") or 0.0), 3),
         "total_so_far_seconds": round(float((timing or {}).get("total_so_far") or 0.0), 3),
     }
@@ -2546,6 +2569,19 @@ def claim_pipeline_diagnostic(
     official_entry_hit = normalize_bool(diagnostic.get("official_entry_hit"), False)
     official_entry_source_family = str(diagnostic.get("official_entry_source_family") or "")
     official_discovery_block_reason = str(diagnostic.get("official_discovery_block_reason") or "")
+    source_order_trace = diagnostic.get("source_order_trace") if isinstance(diagnostic.get("source_order_trace"), list) else []
+    priority_source_dropped_stage = str(diagnostic.get("priority_source_dropped_stage") or "")
+    final_source_selection_reason = str(diagnostic.get("final_source_selection_reason") or "")
+    final_executed_source_order = diagnostic.get("final_executed_source_order") if isinstance(diagnostic.get("final_executed_source_order"), list) else []
+    authority_pair_preserved = normalize_bool(diagnostic.get("authority_pair_preserved"), False)
+    rescue_roi_state = str(diagnostic.get("rescue_roi_state") or "")
+    rescue_skip_reason = str(diagnostic.get("rescue_skip_reason") or "")
+    rescue_latency_ms = float(diagnostic.get("rescue_latency_ms") or 0.0)
+    family_rescue_budget_used = diagnostic.get("family_rescue_budget_used") if isinstance(diagnostic.get("family_rescue_budget_used"), dict) else {}
+    source_latency_profile = diagnostic.get("source_latency_profile") if isinstance(diagnostic.get("source_latency_profile"), dict) else {}
+    slow_source_cutoff = diagnostic.get("slow_source_cutoff") if isinstance(diagnostic.get("slow_source_cutoff"), list) else []
+    claim_retrieve_stop_reason = str(diagnostic.get("claim_retrieve_stop_reason") or "")
+    retrieval_cost_review = diagnostic.get("retrieval_cost_review") if isinstance(diagnostic.get("retrieval_cost_review"), dict) else {}
     raw_results = int(diagnostic.get("raw_results") or 0)
     kept_web = int(diagnostic.get("kept_web") or 0)
     answer_candidate_total = int(diagnostic.get("answer_candidate_total") or 0)
@@ -2736,10 +2772,23 @@ def claim_pipeline_diagnostic(
         "playwright_rescue_trigger": playwright_rescue_trigger,
         "playwright_rescue_source": playwright_rescue_source,
         "playwright_rescue_result_count": playwright_rescue_result_count,
+        "rescue_roi_state": rescue_roi_state,
+        "rescue_skip_reason": rescue_skip_reason,
+        "rescue_latency_ms": round(rescue_latency_ms, 1),
+        "family_rescue_budget_used": family_rescue_budget_used,
         "official_entry_attempted": official_entry_attempted,
         "official_entry_hit": official_entry_hit,
         "official_entry_source_family": official_entry_source_family,
         "official_discovery_block_reason": official_discovery_block_reason,
+        "source_order_trace": source_order_trace[:8],
+        "priority_source_dropped_stage": priority_source_dropped_stage,
+        "final_source_selection_reason": final_source_selection_reason,
+        "final_executed_source_order": final_executed_source_order[:10],
+        "authority_pair_preserved": authority_pair_preserved,
+        "source_latency_profile": source_latency_profile,
+        "slow_source_cutoff": slow_source_cutoff[:5],
+        "claim_retrieve_stop_reason": claim_retrieve_stop_reason,
+        "retrieval_cost_review": retrieval_cost_review,
         "program_expected_failure_stage": str(evidence_need_program.get("expected_failure_stage") or ""),
         "program_anchor_buckets": list(decision_slots.get("anchor_buckets") or [])[:6] if isinstance(decision_slots, dict) else [],
         "program_direct_evidence_need": compact_claim_text(str(direct_need.get("must_answer") or ""), 120),
@@ -11113,6 +11162,7 @@ def insufficient_evidence_reason(
     source_budget_cutoff = dominant_row.get("source_budget_cutoff") if isinstance(dominant_row.get("source_budget_cutoff"), dict) else {}
     playwright_rescue_state = str(dominant_row.get("playwright_rescue_state") or "")
     playwright_rescue_trigger = str(dominant_row.get("playwright_rescue_trigger") or "")
+    rescue_skip_reason = str(dominant_row.get("rescue_skip_reason") or "")
     official_entry_attempted = normalize_bool(dominant_row.get("official_entry_attempted"), False)
     official_entry_hit = normalize_bool(dominant_row.get("official_entry_hit"), False)
     official_discovery_block_reason = str(dominant_row.get("official_discovery_block_reason") or "")
@@ -11182,6 +11232,8 @@ def insufficient_evidence_reason(
                     return f"当前主要卡在页面访问或正文读取受阻：已经触发过 Playwright 救援（{playwright_rescue_trigger}），但还是没把关键正文稳定读下来。"
                 return "当前主要卡在页面访问或正文读取受阻：已经尝试过 Playwright 救援，但还是没把关键正文稳定读下来。"
             if rescue_attempt_state == "playwright_rescue_skipped_by_policy":
+                if rescue_skip_reason:
+                    return f"当前页面访问有阻塞迹象，但本轮补救策略没有真正接手（{rescue_skip_reason}），关键正文仍没稳定拿下来。"
                 return "当前页面访问有阻塞迹象，但本轮补救策略没有真正接手，关键正文仍没稳定拿下来。"
             return "当前主要卡在页面访问或正文读取受阻：相关页出现过，但关键正文没有稳定读下来。"
         if access_path_state == "provider_recall_insufficient_after_probe":
