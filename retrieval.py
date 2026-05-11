@@ -7942,6 +7942,108 @@ def evidence_page_contract_features(
     }
 
 
+def page_role_contract_features(
+    item: Dict[str, Any],
+    source_intent: Dict[str, Any],
+    contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    evidence_mode = effective_evidence_mode(source_intent, str(source_intent.get("evidence_mode") or ""))
+    role = normalize_text(str(contract.get("evidence_contract_role") or "")).lower()
+    status = normalize_text(str(contract.get("evidence_contract_status") or "")).lower()
+    score = int(contract.get("evidence_contract_score") or 0)
+    risks = [normalize_text(str(value)) for value in (contract.get("evidence_contract_risks") or []) if str(value)]
+    source = normalize_text(str(item.get("source") or "")).lower()
+    source_type = normalize_text(str(item.get("source_type") or "")).lower()
+    detail_error = normalize_text(str(item.get("detail_error") or item.get("detail_error_type") or "")).lower()
+    page_type = normalize_text(str(item.get("page_utility_page_type") or "")).lower()
+    page_focus = normalize_text(str(item.get("page_utility_page_focus") or "")).lower()
+    title = normalize_text(str(item.get("title") or "")).lower()
+    snippet = normalize_text(str(item.get("snippet") or "")).lower()
+    url = normalize_text(str(item.get("url") or "")).lower()
+    surface = " ".join([title, snippet, url, page_type, page_focus])
+    structured_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    structured_best = item.get("structured_table_best_point") if isinstance(item.get("structured_table_best_point"), dict) else {}
+    homepage_like = official_homepage_like(item)
+    trusted_fact_source = source_type in {"official", "news", "finance", "sports", "encyclopedia"}
+    generic_surface = bool(re.search(r"(首页|主页|频道|栏目|列表|入口|话题|百科|评论|解读|analysis|commentary|topic|wiki|portal|homepage|index|search|list)", surface, flags=re.I))
+    fact_like_surface = False
+    if evidence_mode == "event_result":
+        fact_like_surface = bool(re.search(r"(战报|赛果|比分|结果|获胜|击败|轻取|大胜|result|score|won|beat|defeated|\d+\s*[-:：]\s*\d+)", surface, flags=re.I))
+    elif evidence_mode in {"numeric_fact", "numeric_count_detail"}:
+        fact_like_surface = bool(re.search(r"(开盘|收盘|涨幅|跌幅|报|报价|牌价|汇率|中间价|数据|点|%|％|quote|rate|price|points?)", surface, flags=re.I))
+    elif evidence_mode in {"date_fact", "schedule_fact"}:
+        fact_like_surface = bool(re.search(r"(公告|通知|日历|安排|休市|开市|发布|生效|日期|calendar|notice|schedule|holiday)", surface, flags=re.I))
+    elif evidence_mode == "route_fact":
+        fact_like_surface = bool(re.search(r"(路线|航线|通道|经过|途经|绕行|替代|route|corridor|bypass|alternative)", surface, flags=re.I))
+
+    role_name = "generic_page"
+    reason = "not_direct_evidence_shape"
+    contract_score = max(0, min(100, score))
+    evidence_ready = False
+    follow_required = False
+    generic_block_reason = ""
+
+    if detail_error and any(marker in detail_error for marker in ["403", "anti_bot", "blocked", "captcha", "login"]):
+        role_name = "blocked_page"
+        reason = "access_blocked_or_login_required"
+        contract_score = min(contract_score, 20)
+    elif status == "satisfied" and role in {"evidence_sentence_page", "structured_metric_table_page"}:
+        role_name = "evidence_page"
+        reason = "contract_satisfied_direct_page"
+        evidence_ready = True
+        contract_score = max(contract_score, 82)
+    elif structured_status == "satisfied" or (structured_best and role == "structured_metric_table_page"):
+        role_name = "evidence_page"
+        reason = "structured_table_point_ready"
+        evidence_ready = True
+        contract_score = max(contract_score, 84)
+    elif trusted_fact_source and fact_like_surface and not homepage_like and not generic_surface:
+        role_name = "evidence_page"
+        reason = "trusted_fact_like_page_shape"
+        evidence_ready = True
+        contract_score = max(contract_score, 74)
+    elif (
+        homepage_like
+        or "homepage_portal_not_direct_metric_record" in risks
+        or source in {"official_discovery", "domain_sitemap"}
+        or role in {"structured_metric_candidate_page"}
+        or page_type in {"landing_page", "search_page", "portal_page"}
+        or re.search(r"(首页|主页|频道|栏目|列表|查询|入口|portal|homepage|index|search|list)", surface, flags=re.I)
+    ):
+        role_name = "entry_page"
+        reason = "authority_or_portal_entry_requires_follow"
+        follow_required = source_type in {"official", "news", "finance", "sports", "encyclopedia"} or source in {"official_discovery", "domain_sitemap"}
+        if evidence_mode not in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}:
+            follow_required = False
+        contract_score = min(max(contract_score, 45), 70)
+    elif role in {"background_report", "related_page"} or status == "failed":
+        role_name = "generic_page"
+        reason = "contract_failed_or_related_only"
+        generic_block_reason = "related_but_not_decidable"
+        contract_score = min(contract_score, 45)
+    elif source_type in {"forum", "qa"} or re.search(r"(知乎|话题|百科|评论|解读|analysis|commentary|topic|wiki)", surface, flags=re.I):
+        role_name = "generic_page"
+        reason = "weak_or_background_source_shape"
+        generic_block_reason = "background_or_discussion_page"
+        contract_score = min(contract_score, 40)
+    else:
+        role_name = "generic_page"
+        generic_block_reason = "no_direct_decision_contract"
+
+    if role_name == "entry_page":
+        generic_block_reason = ""
+    elif role_name != "generic_page":
+        generic_block_reason = ""
+    return {
+        "page_role": role_name,
+        "page_role_reason": reason,
+        "page_role_contract_score": contract_score,
+        "entry_page_follow_required": follow_required,
+        "evidence_page_ready": evidence_ready,
+        "generic_page_block_reason": generic_block_reason,
+    }
+
+
 def page_utility_features(item: Dict[str, Any], source_intent: Dict[str, Any], query: str = "") -> Dict[str, Any]:
     evidence_mode = str(source_intent.get("evidence_mode") or "")
     mechanism_type = mechanism_type_from_intent(source_intent)
@@ -8163,6 +8265,7 @@ def page_utility_features(item: Dict[str, Any], source_intent: Dict[str, Any], q
         utility_components["metric_table_signal_count"] = len(metric_features_for_components.get("metric_table_signals", []))
         utility_components["metric_table_risk_count"] = len(metric_features_for_components.get("metric_table_risks", []))
     contract = evidence_page_contract_features(item, source_intent, route_profile, capability, utility_components, query)
+    page_role = page_role_contract_features(item, source_intent, contract)
     return {
         "page_utility_score": total_score,
         "page_utility_label": label,
@@ -8180,6 +8283,7 @@ def page_utility_features(item: Dict[str, Any], source_intent: Dict[str, Any], q
         "page_utility_route_signal_fields": route_profile.get("route_signal_fields", []) if isinstance(route_profile.get("route_signal_fields"), list) else [],
         "page_utility_capability": capability,
         **contract,
+        **page_role,
     }
 
 
@@ -10022,6 +10126,22 @@ def record_page_intent_stats(stats: Dict[str, Any], item: Dict[str, Any]) -> Non
     for risk in item.get("evidence_contract_risks", []) if isinstance(item.get("evidence_contract_risks"), list) else []:
         risks = stats.setdefault("evidence_contract_risks", {})
         risks[str(risk)] = int(risks.get(str(risk), 0) or 0) + 1
+    page_role = str(item.get("page_role") or "")
+    if page_role:
+        roles = stats.setdefault("page_roles", {})
+        roles[page_role] = int(roles.get(page_role, 0) or 0) + 1
+    page_role_reason = str(item.get("page_role_reason") or "")
+    if page_role_reason:
+        reasons = stats.setdefault("page_role_reasons", {})
+        reasons[page_role_reason] = int(reasons.get(page_role_reason, 0) or 0) + 1
+    generic_block = str(item.get("generic_page_block_reason") or "")
+    if generic_block:
+        blocks = stats.setdefault("generic_page_block_reasons", {})
+        blocks[generic_block] = int(blocks.get(generic_block, 0) or 0) + 1
+    entry_state = str(item.get("entry_follow_state") or "")
+    if entry_state:
+        states = stats.setdefault("entry_follow_states", {})
+        states[entry_state] = int(states.get(entry_state, 0) or 0) + 1
     if contract_role or contract_status:
         origin = normalize_text(str(item.get("query_origin") or "")) or "unknown"
         by_origin = stats.setdefault("evidence_contract_by_query_origin", {})
@@ -10543,6 +10663,15 @@ def add_filtered_sample(stats: Dict[str, Any], reason: str, item: Dict[str, Any]
             "evidence_contract_score": item.get("evidence_contract_score"),
             "evidence_contract_signals": item.get("evidence_contract_signals", []),
             "evidence_contract_risks": item.get("evidence_contract_risks", []),
+            "page_role": item.get("page_role"),
+            "page_role_reason": item.get("page_role_reason"),
+            "page_role_contract_score": item.get("page_role_contract_score"),
+            "entry_page_follow_required": item.get("entry_page_follow_required"),
+            "evidence_page_ready": item.get("evidence_page_ready"),
+            "generic_page_block_reason": item.get("generic_page_block_reason"),
+            "entry_follow_state": item.get("entry_follow_state"),
+            "entry_follow_trigger": item.get("entry_follow_trigger"),
+            "entry_follow_block_reason": item.get("entry_follow_block_reason"),
             "route_rerank_score": item.get("route_rerank_score"),
             "noise_penalty": item.get("noise_penalty"),
             "noise_reasons": item.get("noise_reasons", []),
@@ -10706,6 +10835,35 @@ def add_trusted_deepen_jobs(
     )
 
 
+ENTRY_FOLLOW_EVIDENCE_MODES = {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+
+
+def should_follow_entry_page(
+    item: Dict[str, Any],
+    source_intent: Dict[str, Any],
+    evidence_mode: str,
+) -> Tuple[bool, str]:
+    mode = effective_evidence_mode(source_intent, evidence_mode)
+    if mode not in ENTRY_FOLLOW_EVIDENCE_MODES:
+        return False, "mode_not_entry_follow_target"
+    source_type = normalize_text(str(item.get("source_type") or "")).lower()
+    source = normalize_text(str(item.get("source") or "")).lower()
+    if source_type != "official" and source not in {"official_discovery", "domain_sitemap", "official_inner_link"}:
+        return False, "not_authority_entry_source"
+    if bool(item.get("evidence_page_ready")):
+        return False, "already_evidence_page"
+    page_role = normalize_text(str(item.get("page_role") or "")).lower()
+    risks = item.get("evidence_contract_risks") if isinstance(item.get("evidence_contract_risks"), list) else []
+    if (
+        page_role == "entry_page"
+        or bool(item.get("entry_page_follow_required"))
+        or official_homepage_like(item)
+        or "homepage_portal_not_direct_metric_record" in {normalize_text(str(risk)) for risk in risks}
+    ):
+        return True, "entry_page_requires_inner_evidence"
+    return False, "not_entry_page"
+
+
 def expand_official_inner_link_candidates(
     claim_evidence: List[Dict[str, Any]],
     stats: Dict[str, Any],
@@ -10723,28 +10881,47 @@ def expand_official_inner_link_candidates(
 ) -> int:
     if OFFICIAL_INNER_LINK_MAX_PER_CLAIM <= 0:
         return detail_fetches
+    follow_started_at = time.perf_counter()
+    homepage_item["entry_follow_state"] = "entry_follow_skipped"
+    homepage_item["entry_follow_trigger"] = ""
+    homepage_item["entry_follow_block_reason"] = ""
     if str(homepage_item.get("source_type") or "") != "official":
+        homepage_item["entry_follow_block_reason"] = "not_official_source"
         return detail_fetches
-    if not official_homepage_like(homepage_item):
+    should_follow, follow_reason = should_follow_entry_page(homepage_item, source_intent, evidence_mode)
+    if not should_follow:
+        homepage_item["entry_follow_block_reason"] = follow_reason
         return detail_fetches
-    contract_risks = homepage_item.get("evidence_contract_risks") if isinstance(homepage_item.get("evidence_contract_risks"), list) else []
-    if "homepage_portal_not_direct_metric_record" not in contract_risks:
-        return detail_fetches
+    homepage_item["entry_follow_state"] = "entry_follow_attempted"
+    homepage_item["entry_follow_trigger"] = follow_reason
+    stats["entry_follow_state"] = "entry_follow_attempted"
+    stats.setdefault("entry_follow_triggers", {})[follow_reason] = int(stats.setdefault("entry_follow_triggers", {}).get(follow_reason, 0) or 0) + 1
     used = int(stats.get("official_inner_link_bridge_used", 0) or 0)
     if used >= OFFICIAL_INNER_LINK_MAX_PER_CLAIM:
+        homepage_item["entry_follow_state"] = "entry_follow_skipped"
+        homepage_item["entry_follow_block_reason"] = "entry_follow_budget_exhausted"
+        stats["entry_follow_block_reason"] = "entry_follow_budget_exhausted"
         return detail_fetches
     seen_domains = set(stats.get("official_inner_link_bridge_domains") or [])
     homepage_domain = normalize_domain(urlparse(str(homepage_item.get("url") or "")).netloc)
     if homepage_domain in seen_domains:
+        homepage_item["entry_follow_state"] = "entry_follow_skipped"
+        homepage_item["entry_follow_block_reason"] = "entry_domain_already_followed"
+        stats["entry_follow_block_reason"] = "entry_domain_already_followed"
         return detail_fetches
     bridge_candidates = official_inner_link_candidates(
         str(homepage_item.get("url") or ""),
         source_intent,
         preferred_domains=preferred_domains,
         timeout_sec=timeout_sec,
-        max_candidates=OFFICIAL_INNER_LINK_MAX_PER_CLAIM,
+        max_candidates=min(3, max(1, OFFICIAL_INNER_LINK_MAX_PER_CLAIM)),
     )
     if not bridge_candidates:
+        homepage_item["entry_follow_state"] = "entry_follow_failed"
+        homepage_item["entry_follow_block_reason"] = "no_inner_link_candidates"
+        stats["entry_follow_state"] = "entry_follow_failed"
+        stats["entry_follow_block_reason"] = "no_inner_link_candidates"
+        stats["entry_follow_latency_ms"] = round((time.perf_counter() - follow_started_at) * 1000.0, 1)
         return detail_fetches
     stats["official_inner_link_bridge_used"] = used + 1
     stats.setdefault("official_inner_link_bridge_domains", []).append(homepage_domain)
@@ -10755,7 +10932,17 @@ def expand_official_inner_link_candidates(
             "candidate_urls": [item.get("url") for item in bridge_candidates[:4]],
         }
     )
+    stats["entry_follow_candidates"] = [
+        {
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "snippet": str(item.get("snippet") or ""),
+        }
+        for item in bridge_candidates[:4]
+    ]
     existing_urls = {str(item.get("url") or "") for item in claim_evidence if isinstance(item, dict)}
+    kept_before = int(stats.get("official_inner_link_kept", 0) or 0)
+    kept_evidence_pages = 0
     for item in bridge_candidates:
         if sum(1 for ev in claim_evidence if ev.get("source_type") not in {"input_context", "computed"}) >= max_results_per_query:
             break
@@ -10765,6 +10952,8 @@ def expand_official_inner_link_candidates(
         item["query_goal"] = str(homepage_item.get("query_goal") or "find_metric_source_page")
         item["bridge_from_url"] = str(homepage_item.get("url") or "")
         item["bridge_type"] = "official_inner_link"
+        item["entry_follow_state"] = "entry_follow_child"
+        item["entry_follow_trigger"] = follow_reason
         item["relevance_score"] = evidence_relevance_score(source_query, item)
         item["entity_match_count"] = entity_match_count(source_query, item)
         item["temporal_score"] = evidence_temporal_score(source_query, item)
@@ -10842,11 +11031,31 @@ def expand_official_inner_link_candidates(
             claim_evidence.append(item)
             existing_urls.add(str(item.get("url") or ""))
             stats["official_inner_link_kept"] = int(stats.get("official_inner_link_kept", 0) or 0) + 1
+            if str(item.get("page_role") or "") == "evidence_page":
+                kept_evidence_pages += 1
         else:
             record_source_item_quality(stats, "official_inner_link", item, kept=False, filter_reason=filter_reason)
             stats["filtered_results"] = int(stats.get("filtered_results", 0) or 0) + 1
             add_filter_reason(stats, filter_reason)
             add_filtered_sample(stats, filter_reason, item)
+    kept_after = int(stats.get("official_inner_link_kept", 0) or 0)
+    if kept_evidence_pages > 0:
+        homepage_item["entry_follow_state"] = "entry_follow_succeeded"
+        stats["entry_follow_state"] = "entry_follow_succeeded"
+        stats["entry_follow_kept_evidence_pages"] = kept_evidence_pages
+    elif kept_after > kept_before:
+        homepage_item["entry_follow_state"] = "entry_follow_partial_entry_only"
+        homepage_item["entry_follow_block_reason"] = "inner_link_kept_but_not_evidence_page"
+        stats["entry_follow_state"] = "entry_follow_partial_entry_only"
+        stats["entry_follow_block_reason"] = "inner_link_kept_but_not_evidence_page"
+        stats["entry_follow_kept_evidence_pages"] = 0
+    else:
+        homepage_item["entry_follow_state"] = "entry_follow_failed"
+        homepage_item["entry_follow_block_reason"] = "inner_link_candidates_not_kept"
+        stats["entry_follow_state"] = "entry_follow_failed"
+        stats["entry_follow_block_reason"] = "inner_link_candidates_not_kept"
+        stats["entry_follow_kept_evidence_pages"] = 0
+    stats["entry_follow_latency_ms"] = round((time.perf_counter() - follow_started_at) * 1000.0, 1)
     return detail_fetches
 
 
@@ -12346,6 +12555,12 @@ def diagnose_claim_retrieval(
     direct_candidate_rescue_stages = count_item_field_values(web_items, "direct_candidate_rescue_stage")
     page_keep_review_state = count_item_field_values(web_items, "page_keep_review_state")
     page_keep_review_reason = count_item_field_values(web_items, "page_keep_review_reason")
+    page_roles = count_item_field_values(web_items, "page_role")
+    page_role_reasons = count_item_field_values(web_items, "page_role_reason")
+    generic_page_block_reasons = count_item_field_values(web_items, "generic_page_block_reason")
+    entry_follow_states = count_item_field_values(web_items, "entry_follow_state")
+    evidence_page_ready_count = sum(1 for item in web_items if isinstance(item, dict) and item.get("evidence_page_ready"))
+    entry_page_follow_required_count = sum(1 for item in web_items if isinstance(item, dict) and item.get("entry_page_follow_required"))
     kept_candidate_source_type = count_item_field_values(web_items, "kept_candidate_source_type")
     kept_progress_from_raw = sum(1 for item in web_items if isinstance(item, dict) and item.get("kept_progress_from_raw"))
     rescue_promoted_from_filter = sum(1 for item in web_items if isinstance(item, dict) and item.get("rescue_promoted_from_filter"))
@@ -12712,6 +12927,18 @@ def diagnose_claim_retrieval(
         "detail_fetch_paths": detail_fetch_paths,
         "page_keep_review_state": page_keep_review_state,
         "page_keep_review_reason": page_keep_review_reason,
+        "page_roles": page_roles,
+        "page_role_reasons": page_role_reasons,
+        "generic_page_block_reasons": generic_page_block_reasons,
+        "entry_follow_states": entry_follow_states,
+        "evidence_page_ready_count": evidence_page_ready_count,
+        "entry_page_follow_required_count": entry_page_follow_required_count,
+        "entry_follow_state": str(stats.get("entry_follow_state") or ""),
+        "entry_follow_trigger": next(iter((stats.get("entry_follow_triggers") or {}).keys()), "") if isinstance(stats.get("entry_follow_triggers"), dict) else "",
+        "entry_follow_candidates": stats.get("entry_follow_candidates", [])[:4] if isinstance(stats.get("entry_follow_candidates"), list) else [],
+        "entry_follow_kept_evidence_pages": int(stats.get("entry_follow_kept_evidence_pages", 0) or 0),
+        "entry_follow_block_reason": str(stats.get("entry_follow_block_reason") or ""),
+        "entry_follow_latency_ms": round(float(stats.get("entry_follow_latency_ms", 0.0) or 0.0), 1),
         "second_pass_keep_review_used": sum(1 for item in web_items if isinstance(item, dict) and item.get("second_pass_keep_review_used")),
         "second_pass_keep_review_reason": count_item_field_values(web_items, "second_pass_keep_review_reason"),
         "second_pass_keep_recovered_count": sum(1 for item in web_items if isinstance(item, dict) and int(item.get("second_pass_keep_recovered_count") or 0) > 0),
@@ -12778,6 +13005,10 @@ def diagnose_claim_retrieval(
         "evidence_contract_roles": stats.get("evidence_contract_roles", {}),
         "evidence_contract_statuses": stats.get("evidence_contract_statuses", {}),
         "evidence_contract_risks": stats.get("evidence_contract_risks", {}),
+        "raw_page_roles": stats.get("page_roles", {}),
+        "raw_page_role_reasons": stats.get("page_role_reasons", {}),
+        "raw_generic_page_block_reasons": stats.get("generic_page_block_reasons", {}),
+        "raw_entry_follow_states": stats.get("entry_follow_states", {}),
         "evidence_contract_by_query_origin": compact_evidence_contract_by_query_origin(stats),
         "source_pollution_stats": source_pollution_stats,
         "adaptive_source_fallback_used": int(stats.get("adaptive_source_fallback_used", 0) or 0),
@@ -13267,13 +13498,8 @@ def retrieve_evidence(
                 reason_counts[reason_item] = int(reason_counts.get(reason_item, 0) or 0) + 1
             if evidence_mode in {"numeric_fact", "date_fact", "schedule_fact"}:
                 item.update(structured_noise_features(f"{question} {claim_text}", item, evidence_mode))
-            bridge_risks = item.get("evidence_contract_risks") if isinstance(item.get("evidence_contract_risks"), list) else []
-            if (
-                str(item.get("source_type") or "") == "official"
-                and official_homepage_like(item)
-                and "homepage_portal_not_direct_metric_record" in bridge_risks
-                and not item.get("_bridge_expanded")
-            ):
+            should_entry_follow, _entry_follow_reason = should_follow_entry_page(item, source_intent, evidence_mode)
+            if should_entry_follow and not item.get("_bridge_expanded"):
                 item["_bridge_expanded"] = True
                 detail_fetches = expand_official_inner_link_candidates(
                     claim_evidence,

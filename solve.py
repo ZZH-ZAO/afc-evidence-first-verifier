@@ -7935,6 +7935,161 @@ def is_pseudo_evidence_candidate(candidate: Dict[str, Any]) -> bool:
     return False
 
 
+PAGE_ROLE_FIELDS = (
+    "page_role",
+    "page_role_reason",
+    "page_role_contract_score",
+    "entry_page_follow_required",
+    "evidence_page_ready",
+    "generic_page_block_reason",
+    "entry_follow_state",
+    "entry_follow_trigger",
+    "entry_follow_block_reason",
+    "structured_table_best_point",
+    "structured_point_contract_status",
+    "structured_point_contract_score",
+    "structured_point_contract_risks",
+    "evidence_contract_role",
+    "evidence_contract_status",
+    "evidence_contract_score",
+    "evidence_contract_risks",
+    "page_utility_page_type",
+    "page_utility_page_focus",
+    "page_utility_score",
+    "page_utility_label",
+)
+
+
+def evidence_lookup_key(url: str, title: str) -> str:
+    return f"{normalize_text(str(url or '')).lower()}|{normalize_text(str(title or '')).lower()}"
+
+
+def build_evidence_page_role_index(evidence_items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    for item in evidence_items:
+        if not isinstance(item, dict):
+            continue
+        key = evidence_lookup_key(str(item.get("url") or ""), str(item.get("title") or ""))
+        if key.strip("|"):
+            index[key] = item
+        url_key = evidence_lookup_key(str(item.get("url") or ""), "")
+        if url_key.strip("|"):
+            index.setdefault(url_key, item)
+    return index
+
+
+def attach_page_role_fields(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    for key in PAGE_ROLE_FIELDS:
+        if key in source and key not in target:
+            target[key] = source.get(key)
+
+
+def source_item_for_point(point: Dict[str, Any], index: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(point, dict):
+        return {}
+    key = evidence_lookup_key(str(point.get("url") or ""), str(point.get("title") or ""))
+    if key in index:
+        return index[key]
+    url_key = evidence_lookup_key(str(point.get("url") or ""), "")
+    return index.get(url_key, {})
+
+
+def direct_evidence_gate_result(point: Dict[str, Any]) -> str:
+    if is_pseudo_evidence_candidate(point):
+        return "blocked_pseudo_evidence"
+    page_role = normalize_text(str(point.get("page_role") or "")).lower()
+    contract_role = normalize_text(str(point.get("evidence_contract_role") or "")).lower()
+    contract_status = normalize_text(str(point.get("evidence_contract_status") or "")).lower()
+    structured_status = normalize_text(str(point.get("structured_point_contract_status") or point.get("point_contract_status") or "")).lower()
+    structured_risks = [
+        normalize_text(str(value))
+        for value in (
+            point.get("structured_point_contract_risks")
+            if isinstance(point.get("structured_point_contract_risks"), list)
+            else point.get("point_contract_risks")
+            if isinstance(point.get("point_contract_risks"), list)
+            else []
+        )
+        if str(value)
+    ]
+    if structured_status == "satisfied" and not any(risk in {"point_time_scope_mismatch", "missing_binding_time_scope"} for risk in structured_risks):
+        return "allowed_structured_table_point"
+    if page_role == "evidence_page" and normalize_bool(point.get("evidence_page_ready"), True):
+        return "allowed_evidence_page"
+    if not page_role and contract_status == "satisfied" and contract_role in {"evidence_sentence_page", "structured_metric_table_page"}:
+        return "allowed_contract_satisfied_legacy"
+    if page_role == "entry_page":
+        return "blocked_entry_page_requires_follow"
+    if page_role == "generic_page":
+        return "blocked_generic_page"
+    if page_role == "blocked_page":
+        return "blocked_access_page"
+    return "blocked_no_evidence_page_contract"
+
+
+def direct_evidence_gate_allows(point: Dict[str, Any]) -> bool:
+    return direct_evidence_gate_result(point).startswith("allowed_")
+
+
+def apply_page_role_consumption_gate(
+    evidence_bundle: Optional[Dict[str, Any]],
+    evidence_summary: Optional[Dict[str, Any]],
+    debug_bucket: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not isinstance(evidence_bundle, dict) or not isinstance(evidence_summary, dict):
+        return
+    evidence_by_claim = evidence_bundle.get("evidence_by_claim") if isinstance(evidence_bundle.get("evidence_by_claim"), dict) else {}
+    summaries = evidence_summary.get("claim_summaries") if isinstance(evidence_summary.get("claim_summaries"), dict) else {}
+    gate_debug: Dict[str, Any] = {}
+    for claim_id, summary in summaries.items():
+        if not isinstance(summary, dict):
+            continue
+        index = build_evidence_page_role_index([item for item in evidence_by_claim.get(claim_id, []) if isinstance(item, dict)])
+        blocked_counts: Dict[str, int] = {}
+        consumed_counts: Dict[str, int] = {}
+        for bucket in ("supporting_points", "refuting_points", "uncertain_points", "evidence_sentence_candidates", "answer_candidates"):
+            rows = summary.get(bucket) if isinstance(summary.get(bucket), list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                source_item = source_item_for_point(row, index)
+                attach_page_role_fields(row, source_item)
+                gate = direct_evidence_gate_result(row)
+                row["direct_evidence_gate_result"] = gate
+                row["page_role_consumed"] = direct_evidence_gate_allows(row)
+                row["evidence_page_consumption_state"] = "consumed" if row["page_role_consumed"] else "diagnostic_only"
+                page_role = normalize_text(str(row.get("page_role") or "unknown"))
+                if row["page_role_consumed"]:
+                    consumed_counts[page_role] = int(consumed_counts.get(page_role, 0) or 0) + 1
+                else:
+                    blocked_counts[gate] = int(blocked_counts.get(gate, 0) or 0) + 1
+                    if page_role == "entry_page":
+                        row["entry_page_not_consumed_reason"] = gate
+                    elif page_role == "generic_page":
+                        row["generic_page_not_consumed_reason"] = gate
+                    if row.get("direct_answer") == "direct":
+                        row["direct_answer_before_page_role_gate"] = "direct"
+                        row["direct_answer"] = "partial" if page_role == "entry_page" else "related_only"
+        point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+        top_candidate = (summary.get("evidence_sentence_candidates") or [{}])[0] if isinstance(summary.get("evidence_sentence_candidates"), list) and summary.get("evidence_sentence_candidates") else {}
+        if isinstance(top_candidate, dict):
+            point_conversion["direct_evidence_gate_result"] = str(top_candidate.get("direct_evidence_gate_result") or "")
+            point_conversion["page_role_consumed"] = bool(top_candidate.get("page_role_consumed"))
+            point_conversion["evidence_page_consumption_state"] = str(top_candidate.get("evidence_page_consumption_state") or "")
+            point_conversion["page_role"] = str(top_candidate.get("page_role") or "")
+            point_conversion["entry_page_not_consumed_reason"] = str(top_candidate.get("entry_page_not_consumed_reason") or "")
+            point_conversion["generic_page_not_consumed_reason"] = str(top_candidate.get("generic_page_not_consumed_reason") or "")
+            summary["point_conversion"] = point_conversion
+        gate_debug[str(claim_id)] = {
+            "consumed": consumed_counts,
+            "blocked": blocked_counts,
+        }
+    if isinstance(debug_bucket, dict):
+        debug_bucket["page_role_consumption_gate"] = gate_debug
+
+
 def candidate_decision_useful_score(
     claim: Dict[str, Any],
     summary: Dict[str, Any],
@@ -7988,11 +8143,23 @@ def candidate_decision_useful_score(
         score += 4
     if is_pseudo_evidence_candidate(candidate):
         score -= 40
+    gate = direct_evidence_gate_result(candidate)
+    candidate["direct_evidence_gate_result"] = gate
+    candidate["page_role_consumed"] = direct_evidence_gate_allows(candidate)
+    if not candidate["page_role_consumed"]:
+        score -= 34
+        page_role = normalize_text(str(candidate.get("page_role") or ""))
+        if page_role == "entry_page":
+            candidate["entry_page_not_consumed_reason"] = gate
+        elif page_role == "generic_page":
+            candidate["generic_page_not_consumed_reason"] = gate
     return score
 
 
 def decision_useful_hit_for_candidate(candidate: Dict[str, Any]) -> bool:
     if is_pseudo_evidence_candidate(candidate):
+        return False
+    if not direct_evidence_gate_allows(candidate):
         return False
     utility = int(candidate.get("candidate_utility_score") or 0)
     slot_count = int(((candidate.get("candidate_slot_coverage") or {}) if isinstance(candidate.get("candidate_slot_coverage"), dict) else {}).get("slot_count") or 0)
@@ -8074,6 +8241,12 @@ def apply_decision_useful_candidate_rerank(
         point_conversion["page_utility_profile"] = str(top_candidate.get("page_utility_profile") or "")
         point_conversion["decision_useful_hit"] = bool(top_candidate.get("decision_useful_hit"))
         point_conversion["candidate_utility_score"] = int(top_candidate.get("candidate_utility_score") or 0)
+        point_conversion["page_role"] = str(top_candidate.get("page_role") or "")
+        point_conversion["page_role_consumed"] = bool(top_candidate.get("page_role_consumed"))
+        point_conversion["direct_evidence_gate_result"] = str(top_candidate.get("direct_evidence_gate_result") or "")
+        point_conversion["evidence_page_consumption_state"] = str(top_candidate.get("evidence_page_consumption_state") or "")
+        point_conversion["entry_page_not_consumed_reason"] = str(top_candidate.get("entry_page_not_consumed_reason") or "")
+        point_conversion["generic_page_not_consumed_reason"] = str(top_candidate.get("generic_page_not_consumed_reason") or "")
         point_conversion["top_candidate_is_pseudo"] = bool(top_candidate.get("is_pseudo_evidence"))
         point_conversion["top_evidence_candidate_title"] = str(top_evidence_candidate.get("title") or "")
         point_conversion["top_evidence_candidate_profile"] = str(top_evidence_candidate.get("sentence_candidate_profile") or "")
@@ -8084,6 +8257,8 @@ def apply_decision_useful_candidate_rerank(
             "top_candidate_score": int(top_candidate.get("candidate_utility_score") or 0),
             "top_candidate_profile": str(top_candidate.get("sentence_candidate_profile") or ""),
             "top_page_profile": str(top_candidate.get("page_utility_profile") or ""),
+            "top_page_role": str(top_candidate.get("page_role") or ""),
+            "top_direct_evidence_gate_result": str(top_candidate.get("direct_evidence_gate_result") or ""),
             "top_candidate_is_pseudo": bool(top_candidate.get("is_pseudo_evidence")),
             "top_evidence_candidate_title": str(top_evidence_candidate.get("title") or ""),
         }
@@ -8102,6 +8277,9 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     partial_count = int(point_conversion.get("partial_count") or 0)
     stage = normalize_text(str(point_conversion.get("stage") or ""))
     page_profile = normalize_text(str(point_conversion.get("page_utility_profile") or ""))
+    direct_gate = normalize_text(str(point_conversion.get("direct_evidence_gate_result") or ""))
+    page_role = normalize_text(str(point_conversion.get("page_role") or ""))
+    page_role_consumed = normalize_bool(point_conversion.get("page_role_consumed"), False)
     directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
     decision_useful_hit = bool(point_conversion.get("decision_useful_hit"))
     top_candidate_is_pseudo = normalize_bool(point_conversion.get("top_candidate_is_pseudo"), False)
@@ -8117,6 +8295,14 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     comparable_direct_refute_count = int(comparability_profile.get("comparable_direct_refute_count") or 0)
     if comparable_direct_support_count > 0 or comparable_direct_refute_count > 0:
         return "stable_direct_point"
+    if direct_gate.startswith("blocked_") or (page_role in {"entry_page", "generic_page", "blocked_page"} and not page_role_consumed):
+        if page_role == "entry_page":
+            return "same_slot_review_blocked:entry_page_requires_follow"
+        if page_role == "generic_page":
+            return "same_slot_review_blocked:generic_page_not_decidable"
+        if page_role == "blocked_page":
+            return "same_slot_review_blocked:access_blocked_page"
+        return f"same_slot_review_blocked:{direct_gate or 'page_role_gate_blocked'}"
     if candidate_score >= 36 and slot_count >= 2 and block_reason in {
         "not_same_fact_slot",
         "date_role_mismatch",
@@ -12709,10 +12895,12 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
         debug.get("timing") if isinstance(debug.get("timing"), dict) else {},
     )
     evidence_summary = summarize_claim_evidence(claims, evidence_bundle.get("evidence_by_claim", {}) if isinstance(evidence_bundle, dict) else {})
+    apply_page_role_consumption_gate(evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     apply_decision_useful_candidate_rerank(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     attach_comparability_profiles(extracted, evidence_summary)
     refine_route_claim_points_with_llm(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     apply_llm_evidence_refiners(claims, evidence_summary, debug)
+    apply_page_role_consumption_gate(evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     apply_decision_useful_consumption_state(claims, evidence_summary)
     evidence_summary["_qa_evidence"] = build_qa_evidence(claims, evidence_summary)
     mark_timing("initial_summary")
