@@ -2756,7 +2756,7 @@ def summarize_claim_evidence(claims: List[Dict[str, Any]], evidence_by_claim: Di
             own_web = [item for item in evidence if item.get("source_type") not in {"input_context", "computed"}]
             if not own_web and numeric_evidence_pool:
                 evidence = evidence + numeric_evidence_pool
-            summaries[claim_id] = summarize_numeric_claim(claim_id, claim_text, evidence)
+            summaries[claim_id] = summarize_numeric_claim(claim_id, claim_text, evidence, source_intent, evidence_need_program)
         elif mode == "date_fact" or mode == "schedule_fact":
             summaries[claim_id] = summarize_date_claim(claim_id, claim_text, evidence, source_intent)
         elif mode == "event_result":
@@ -3106,8 +3106,272 @@ def numeric_alignment(claim: str, claim_value: str, evidence_sentence: str, evid
     }
 
 
-def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
-    claim_numbers = extract_numbers(claim)
+def _span_contains(outer: Tuple[int, int], inner: Tuple[int, int]) -> bool:
+    return outer[0] <= inner[0] and inner[1] <= outer[1]
+
+
+def date_or_time_spans(text: str) -> List[Tuple[int, int]]:
+    patterns = [
+        r"\b(?:19|20)\d{2}-\d{1,2}-\d{1,2}(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?)?\b",
+        r"(?:19|20)\d{2}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5",
+        r"\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5",
+        r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
+        r"\b(?:19|20)\d{2}\b",
+    ]
+    spans: List[Tuple[int, int]] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text or "", flags=re.I):
+            spans.append((match.start(), match.end()))
+    spans.sort()
+    return spans
+
+
+def numeric_date_number_exclusions(text: str) -> List[str]:
+    exclusions: List[str] = []
+    seen = set()
+    for start, end in date_or_time_spans(text):
+        for value in re.findall(r"\d+(?:\.\d+)?", (text or "")[start:end]):
+            normalized = value.lstrip("0") or "0"
+            if normalized not in seen:
+                seen.add(normalized)
+                exclusions.append(value)
+    return exclusions
+
+
+def numeric_raw_occurs_outside_spans(raw: str, text: str, spans: List[Tuple[int, int]]) -> bool:
+    if not raw or not text:
+        return False
+    for match in re.finditer(re.escape(raw), text, flags=re.I):
+        raw_span = (match.start(), match.end())
+        if not any(_span_contains(span, raw_span) for span in spans):
+            return True
+    return False
+
+
+def numeric_raw_is_date_or_time_fragment(raw: str, text: str, unit: str = "") -> bool:
+    if not raw:
+        return False
+    if "%" in raw:
+        return False
+    if unit == "year":
+        return True
+    spans = date_or_time_spans(text)
+    if not spans:
+        return False
+    if numeric_raw_occurs_outside_spans(raw, text, spans):
+        return False
+    raw_value = numeric_value(raw)
+    if raw_value is None:
+        return False
+    for start, end in spans:
+        for token in re.findall(r"\d+(?:\.\d+)?", (text or "")[start:end]):
+            token_value = numeric_value(token)
+            if token_value is not None and abs(token_value - raw_value) <= 1e-9:
+                return True
+    return False
+
+
+def extract_numbers_with_spans(text: str) -> List[Tuple[str, str, int, int]]:
+    patterns = [
+        r"(?:swedish kronor\s*)?\(?\s*(?:sek|swedish kronor|kronor)\s*\)?\s*\d+(?:\.\d+)?\s*(?:million|billion|trillion)?",
+        r"\d+(?:\.\d+)?\s*(?:million|billion|trillion)\s*(?:swedish kronor|kronor|sek|usd|dollars?)?",
+        r"(?:\u745e\u5178\u514b\u6717|\u514b\u6717|\u7f8e\u5143|\u4eba\u6c11\u5e01|\u6e2f\u5143|\u6b27\u5143|\u5143)\s*\d+(?:\.\d+)?\s*(?:\u4e07|\u4ebf|\u767e\u4e07|\u5343\u4e07)?",
+        r"\d+(?:\.\d+)?\s*(?:\u4e07|\u4ebf|\u767e\u4e07|\u5343\u4e07)?\s*(?:\u745e\u5178\u514b\u6717|\u514b\u6717|\u7f8e\u5143|\u4eba\u6c11\u5e01|\u6e2f\u5143|\u6b27\u5143|\u5143)",
+        r"\d+(?:\.\d+)?\s*(?:\u516c\u91cc|\u5343\u7c73|\u6d77\u91cc|\u82f1\u91cc|\u5206\u949f|\u5c0f\u65f6|\u5428|\u5347)",
+        r"\d+(?:\.\d+)?\s*%",
+        r"\b(?:19|20)\d{2}\b",
+        r"\d+(?:\.\d+)?",
+    ]
+    values: List[Tuple[str, str, int, int]] = []
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text or "", flags=re.I):
+            raw = normalize_text(match.group(0))
+            key = (raw, match.start(), match.end())
+            if not raw or key in seen:
+                continue
+            seen.add(key)
+            values.append((raw, numeric_unit_category(raw), match.start(), match.end()))
+    return values
+
+
+def non_date_numeric_values(text: str, values: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    date_spans = date_or_time_spans(text)
+    positioned = extract_numbers_with_spans(text)
+    if not positioned:
+        return [
+            (value, unit)
+            for value, unit in values
+            if not numeric_raw_is_date_or_time_fragment(value, text, unit)
+        ]
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for value, unit, start, end in positioned:
+        if any(_span_contains(span, (start, end)) for span in date_spans):
+            continue
+        key = (value, unit)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((value, unit))
+    return out
+
+
+def _iter_numeric_slot_texts(source_intent: Dict[str, Any], evidence_need_program: Dict[str, Any]) -> List[Tuple[str, str]]:
+    program = evidence_need_program if isinstance(evidence_need_program, dict) else {}
+    if not program and isinstance(source_intent.get("evidence_need_program"), dict):
+        program = source_intent.get("evidence_need_program") or {}
+    decision_slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
+    core_binding = source_intent.get("core_binding") if isinstance(source_intent.get("core_binding"), dict) else {}
+    source_strategy = source_intent.get("source_strategy") if isinstance(source_intent.get("source_strategy"), dict) else {}
+    direct_need = program.get("direct_evidence_need") if isinstance(program.get("direct_evidence_need"), dict) else {}
+    if not direct_need and isinstance(source_intent.get("direct_evidence_need"), dict):
+        direct_need = source_intent.get("direct_evidence_need") or {}
+    for key, label in (
+        ("object", "decision_slot_object"),
+        ("status_or_result", "decision_slot_status_or_result"),
+        ("metric_or_relation", "decision_slot_metric_or_relation"),
+    ):
+        value = normalize_text(str(decision_slots.get(key) or ""))
+        if value:
+            yield label, value
+    for key, label in (
+        ("object_entity", "core_binding_object_entity"),
+        ("relation_or_metric", "core_binding_relation_or_metric"),
+    ):
+        value = normalize_text(str(core_binding.get(key) or ""))
+        if value:
+            yield label, value
+    for label, values in (
+        ("direct_evidence_need_must_include", direct_need.get("must_include") if isinstance(direct_need.get("must_include"), list) else []),
+        ("source_strategy_must_have", source_strategy.get("must_have") if isinstance(source_strategy.get("must_have"), list) else []),
+    ):
+        for value in values:
+            text = normalize_text(str(value or ""))
+            if text:
+                yield label, text
+
+
+def build_numeric_target_slots(
+    claim: str,
+    source_intent: Optional[Dict[str, Any]] = None,
+    evidence_need_program: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    source_intent = source_intent if isinstance(source_intent, dict) else {}
+    evidence_need_program = evidence_need_program if isinstance(evidence_need_program, dict) else {}
+    slots: List[Dict[str, Any]] = []
+    excluded: List[str] = []
+    seen = set()
+    for source, text in _iter_numeric_slot_texts(source_intent, evidence_need_program):
+        excluded.extend(numeric_date_number_exclusions(text))
+        values = non_date_numeric_values(text, extract_numbers(text))
+        for value, unit in values:
+            key = (value, unit, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            slots.append({"value": value, "unit": unit, "source": source, "slot_text": text})
+    if slots:
+        return slots, list(dict.fromkeys(excluded))
+    excluded.extend(numeric_date_number_exclusions(claim))
+    claim_values = non_date_numeric_values(claim, extract_numbers(claim))
+    for value, unit in claim_values:
+        if unit == "year":
+            excluded.append(value)
+            continue
+        key = (value, unit, "claim_text_fallback")
+        if key in seen:
+            continue
+        seen.add(key)
+        slots.append({"value": value, "unit": unit, "source": "claim_text_fallback", "slot_text": claim})
+    return slots, list(dict.fromkeys(excluded))
+
+
+def choose_numeric_value_for_targets(
+    text: str,
+    values: List[Tuple[str, str]],
+    claim: str,
+    target_slots: List[Dict[str, Any]],
+) -> str:
+    if not values:
+        return ""
+    for slot in target_slots:
+        target_value = str(slot.get("value") or "")
+        for value, _unit in values:
+            if numeric_match_for_claim(claim, value, target_value):
+                return value
+    return choose_numeric_value(text, values, claim)
+
+
+def _numeric_slot_false_friend_block(claim: str, sentence: str, target_slots: List[Dict[str, Any]]) -> str:
+    combined = normalize_text(" ".join([claim, sentence] + [str(slot.get("slot_text") or "") for slot in target_slots])).lower()
+    sentence_lower = normalize_text(sentence).lower()
+    middle_rate_claim = bool(re.search(r"(\u4e2d\u95f4\u4ef7|\u4e2d\u95f4\s*\u4ef7|central parity|central rate)", combined, flags=re.I))
+    if middle_rate_claim:
+        if re.search(r"(\u5728\u5cb8|\u79bb\u5cb8|\u9694\u5929|\u6b21\u65e5|\u9884\u6d4b|forecast|offshore|onshore)", sentence_lower, flags=re.I) and not re.search(r"(\u4e2d\u95f4\u4ef7|central parity|central rate)", sentence_lower, flags=re.I):
+            return "false_friend_metric"
+    return ""
+
+
+def numeric_slot_grounding(
+    claim: str,
+    sentence: str,
+    evidence_value: str,
+    target_slots: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    sentence_values = non_date_numeric_values(sentence, extract_numbers(sentence))
+    evidence_values = non_date_numeric_values(evidence_value, extract_numbers(evidence_value))
+    all_values = sentence_values + [pair for pair in evidence_values if pair not in sentence_values]
+    target_hits: List[Dict[str, Any]] = []
+    for slot in target_slots:
+        target_value = str(slot.get("value") or "")
+        if not target_value:
+            continue
+        if any(numeric_match_for_claim(claim, value, target_value) for value, _unit in all_values):
+            target_hits.append(slot)
+    false_friend = _numeric_slot_false_friend_block(claim, sentence, target_slots)
+    if false_friend:
+        return {
+            "state": "blocked",
+            "target_hits": target_hits,
+            "block_reason": false_friend,
+            "evidence_numeric_values": [value for value, _unit in all_values[:8]],
+        }
+    if target_slots and not target_hits:
+        return {
+            "state": "blocked",
+            "target_hits": [],
+            "block_reason": "numeric_target_not_found",
+            "evidence_numeric_values": [value for value, _unit in all_values[:8]],
+        }
+    return {
+        "state": "passed" if target_hits or not target_slots else "not_applicable",
+        "target_hits": target_hits,
+        "block_reason": "",
+        "evidence_numeric_values": [value for value, _unit in all_values[:8]],
+    }
+
+
+def attach_numeric_slot_debug(point: Dict[str, Any], target_slots: List[Dict[str, Any]], claim_value_source: str, excluded: List[str], grounding: Dict[str, Any]) -> Dict[str, Any]:
+    point["numeric_target_slots"] = target_slots[:6]
+    point["numeric_claim_value_source"] = claim_value_source
+    point["numeric_date_number_excluded"] = excluded[:8]
+    point["numeric_slot_grounding_result"] = grounding
+    if grounding.get("block_reason"):
+        point["numeric_point_block_reason"] = grounding.get("block_reason")
+    return point
+
+
+def summarize_numeric_claim(
+    claim_id: str,
+    claim: str,
+    evidence: List[Dict[str, Any]],
+    source_intent: Optional[Dict[str, Any]] = None,
+    evidence_need_program: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    target_slots, excluded_numbers = build_numeric_target_slots(claim, source_intent, evidence_need_program)
+    claim_numbers = [(str(slot.get("value") or ""), str(slot.get("unit") or "")) for slot in target_slots if slot.get("value")]
+    claim_value_source = str(target_slots[0].get("source") or "") if target_slots else ""
     supporting_points: List[Dict[str, Any]] = []
     refuting_points: List[Dict[str, Any]] = []
     uncertain_points: List[Dict[str, Any]] = []
@@ -3117,22 +3381,24 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
         text = evidence_text(item)
         if not str(item.get("detail") or "").strip() and re.fullmatch(r"\s*sitemap match score=\d+\s*", str(item.get("snippet") or ""), flags=re.I):
             continue
-        values = extract_numbers(text)
+        values = non_date_numeric_values(text, extract_numbers(text))
         if not values:
             continue
         best_candidate = best_mode_answer_candidate(item, claim, EVIDENCE_MODE_NUMERIC, limit=5)
         if not claim_numbers:
             if best_candidate:
                 sentence = normalize_text(str(best_candidate.get("sentence") or ""))
-                sentence_values = extract_numbers(sentence)
-                evidence_value = choose_numeric_value(sentence, sentence_values, claim) if sentence_values else ""
+                sentence_values = non_date_numeric_values(sentence, extract_numbers(sentence))
+                evidence_value = choose_numeric_value_for_targets(sentence, sentence_values, claim, target_slots) if sentence_values else ""
             else:
                 evidence_value, sentence = _best_numeric_sentence(text, values, claim)
+            grounding = numeric_slot_grounding(claim, sentence, evidence_value, target_slots)
             point = apply_candidate_features_to_point(point_with_source(
                 item,
                 {"type": "numeric_reference", "claim_value": "", "evidence_value": evidence_value, "evidence_sentence": sentence},
                 required_hits=1,
             ), best_candidate)
+            attach_numeric_slot_debug(point, target_slots, claim_value_source, excluded_numbers, grounding)
             uncertain_points.append(point)
             continue
         claim_value, claim_unit = pick_claim_number(claim_numbers)
@@ -3141,6 +3407,7 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
         structured_value, structured_sentence, _structured_time = structured_best_point_evidence(item)
         if structured_status == "satisfied" and structured_value:
             alignment = numeric_alignment(claim, claim_value, structured_sentence or structured_value, structured_value)
+            grounding = numeric_slot_grounding(claim, structured_sentence or structured_value, structured_value, target_slots)
             point = point_with_source(
                 item,
                 {
@@ -3153,9 +3420,14 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
                 },
                 required_hits=1,
             )
+            attach_numeric_slot_debug(point, target_slots, claim_value_source, excluded_numbers, grounding)
             point["point_contract_status"] = "satisfied"
             point["point_contract_risks"] = list(structured_contract.get("risks", []) or [])
             point["direct_answer"] = "direct"
+            if grounding.get("block_reason"):
+                point["type"] = "numeric_reference"
+                uncertain_points.append(point)
+                continue
             if numeric_point_lacks_time_scope_binding(claim, structured_sentence or structured_value, item, structured_value):
                 point["type"] = "numeric_reference"
                 point["numeric_contract_note"] = "time_scope_mismatch"
@@ -3180,36 +3452,41 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
             continue
         if best_candidate:
             sentence = normalize_text(str(best_candidate.get("sentence") or ""))
-            sentence_values = extract_numbers(sentence)
+            sentence_values = non_date_numeric_values(sentence, extract_numbers(sentence))
             sentence_same_unit_values = [(value, unit) for value, unit in sentence_values if unit == claim_unit and unit != "year"]
             if not sentence_same_unit_values and claim_unit == "amount":
                 sentence_same_unit_values = [(value, unit) for value, unit in sentence_values if unit not in {"year", "number"}]
             if sentence_same_unit_values:
-                evidence_value = choose_numeric_value(sentence, sentence_same_unit_values, claim)
+                evidence_value = choose_numeric_value_for_targets(sentence, sentence_same_unit_values, claim, target_slots)
             else:
                 evidence_value, sentence = _best_numeric_sentence(text, same_unit_values, claim)
         else:
             evidence_value, sentence = _best_numeric_sentence(text, same_unit_values, claim)
         alignment = numeric_alignment(claim, claim_value, sentence, evidence_value)
+        grounding = numeric_slot_grounding(claim, sentence, evidence_value, target_slots)
         if not alignment["comparable"]:
-            uncertain_points.append(
-                apply_candidate_features_to_point(
-                    point_with_source(
-                        item,
-                        {
-                            "type": "numeric_reference",
-                            "claim_value": claim_value,
-                            "evidence_value": evidence_value,
-                            "evidence_sentence": sentence,
-                            "numeric_alignment": alignment,
-                        },
-                        required_hits=1,
-                    ),
-                    best_candidate,
-                )
+            point = apply_candidate_features_to_point(
+                point_with_source(
+                    item,
+                    {
+                        "type": "numeric_reference",
+                        "claim_value": claim_value,
+                        "evidence_value": evidence_value,
+                        "evidence_sentence": sentence,
+                        "numeric_alignment": alignment,
+                    },
+                    required_hits=1,
+                ),
+                best_candidate,
             )
+            attach_numeric_slot_debug(point, target_slots, claim_value_source, excluded_numbers, grounding)
+            uncertain_points.append(point)
             continue
-        exact_match = any(numeric_match_for_claim(claim, value, claim_value) for value, _unit in same_unit_values)
+        exact_match = any(
+            numeric_match_for_claim(claim, value, str(slot.get("value") or claim_value))
+            for slot in (target_slots or [{"value": claim_value}])
+            for value, _unit in same_unit_values
+        )
         point = apply_candidate_features_to_point(point_with_source(
             item,
             {
@@ -3221,12 +3498,16 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
             },
             required_hits=1,
         ), best_candidate)
+        attach_numeric_slot_debug(point, target_slots, claim_value_source, excluded_numbers, grounding)
         if item.get("source_type") in {"official", "news", "encyclopedia"} and numeric_sentence_score(sentence, claim) >= 3:
             point["direct_answer"] = "direct"
         blocking_risks = item_structured_point_blocking_risks(item)
         if blocking_risks:
             point["type"] = "numeric_reference"
             point["point_contract_blocking_risks"] = blocking_risks
+            uncertain_points.append(point)
+        elif grounding.get("block_reason"):
+            point["type"] = "numeric_reference"
             uncertain_points.append(point)
         elif numeric_point_lacks_time_scope_binding(claim, sentence, item, evidence_value):
             point["type"] = "numeric_reference"
@@ -3244,6 +3525,9 @@ def summarize_numeric_claim(claim_id: str, claim: str, evidence: List[Dict[str, 
         "refuting_points": unique_points(refuting_points)[:3],
         "uncertain_points": unique_points(uncertain_points)[:3],
         "evidence_sentence_candidates": collect_evidence_sentence_candidates(evidence, claim, mode="numeric_fact", limit=6),
+        "numeric_target_slots": target_slots[:8],
+        "numeric_date_number_excluded": excluded_numbers[:12],
+        "numeric_claim_value_source": claim_value_source,
     }
 
 # ROUTE_RUNTIME_OVERRIDE_ANCHOR
