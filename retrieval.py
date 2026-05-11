@@ -4882,7 +4882,7 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
                 merge_fetch_trace(
                     trace,
                     playwright_rescue_skipped_by_policy=True,
-                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
                     environment_block_reason="requests_blocked_playwright_failed",
                 )
                 raise exc
@@ -4954,7 +4954,7 @@ def fetch_page_text(url: str, max_chars: int = 800, timeout_sec: int = 10, trace
                 merge_fetch_trace(
                     trace,
                     playwright_rescue_skipped_by_policy=True,
-                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
                     environment_block_reason="requests_blocked_playwright_failed",
                 )
                 raise exc
@@ -5022,7 +5022,7 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
                 merge_fetch_trace(
                     trace,
                     playwright_rescue_skipped_by_policy=True,
-                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
                     environment_block_reason="requests_blocked_playwright_failed",
                 )
                 raise exc
@@ -5078,7 +5078,7 @@ def fetch_page_html(url: str, timeout_sec: int = 10, trace: Optional[Dict[str, A
                 merge_fetch_trace(
                     trace,
                     playwright_rescue_skipped_by_policy=True,
-                    rescue_skip_reason="detail_rescue_budget_exhausted",
+                    rescue_skip_reason=str((trace or {}).get("rescue_skip_reason") or "detail_rescue_budget_exhausted"),
                     environment_block_reason="requests_blocked_playwright_failed",
                 )
                 raise exc
@@ -8844,6 +8844,161 @@ def fact_like_keep_review_allowed(claim_item: Optional[Dict[str, Any]], evidence
     return centrality == "supporting" and str(evidence_mode or "") in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}
 
 
+CORE_SECOND_PASS_ALLOWED_MODES = {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+CORE_SECOND_PASS_ALLOWED_PAGE_TYPES = {
+    "result_page",
+    "event_detail",
+    "calendar_page",
+    "quote_page",
+    "historical_table",
+    "official_notice",
+    "current_status_page",
+    "mixed_page",
+}
+DETAIL_RESCUE_ALLOWED_PAGE_TYPES = {
+    "official_notice",
+    "calendar_page",
+    "historical_table",
+    "result_page",
+    "event_detail",
+    "current_status_page",
+}
+
+
+def core_second_pass_keep_review_allowed(
+    claim_item: Optional[Dict[str, Any]],
+    evidence_mode: str,
+    raw_results_so_far: int,
+    kept_web_so_far: int,
+) -> bool:
+    if str(evidence_mode or "") not in CORE_SECOND_PASS_ALLOWED_MODES:
+        return False
+    if not isinstance(claim_item, dict):
+        return False
+    if str(claim_item.get("centrality") or "") != "core":
+        return False
+    if str(claim_item.get("_claim_budget_priority") or "") != "core_critical":
+        return False
+    return raw_results_so_far > 0 and kept_web_so_far <= 0
+
+
+def maybe_promote_core_second_pass_keep_review(
+    query: str,
+    item: Dict[str, Any],
+    filter_reason: str,
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]],
+    raw_results_so_far: int,
+    kept_web_so_far: int,
+) -> tuple[bool, str]:
+    if not core_second_pass_keep_review_allowed(claim_item, evidence_mode, raw_results_so_far, kept_web_so_far):
+        return False, filter_reason
+    item["second_pass_keep_review_used"] = True
+    item["second_pass_keep_review_reason"] = filter_reason
+    source_type = str(item.get("source_type") or "")
+    if source_type not in {"official", "news", "encyclopedia", "unknown"}:
+        item["core_keep_review_block_reason"] = "source_type_not_allowed"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    if filter_reason in FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS or not claim_aligned_page_shape_ok(item):
+        item["core_keep_review_block_reason"] = "page_shape_hard_drop"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    if str(item.get("page_utility_llm_decision") or "") == "drop":
+        item["core_keep_review_block_reason"] = "utility_drop_decision"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type not in CORE_SECOND_PASS_ALLOWED_PAGE_TYPES:
+        item["core_keep_review_block_reason"] = "page_type_not_decision_useful"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    anchor_hits = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    anchor_hit_set = {str(hit) for hit in anchor_hits if str(hit)}
+    subject_like = bool(anchor_hit_set & {"subject", "entity", "actor"})
+    time_like = bool(anchor_hit_set & {"time", "time_scope"})
+    fact_like = bool(anchor_hit_set & {"event", "status", "metric", "metric_or_relation", "status_or_result"})
+    if len(anchor_hits) < 2 or not ((subject_like and time_like) or (subject_like and fact_like) or (time_like and fact_like)):
+        item["core_keep_review_block_reason"] = "anchor_slots_not_closed"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    page_retention_score = int(item.get("page_retention_score") or 0)
+    page_utility_score = int(item.get("page_utility_score") or 0)
+    directness = int(item.get("directness_score") or 0)
+    relevance = int(item.get("relevance_score") or 0)
+    entity_hits = int(item.get("entity_match_count") or 0)
+    answer_quality = int(item.get("answer_candidate_quality_score") or 0)
+    evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
+    structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    promotable_signal = (
+        directness >= 2
+        or answer_quality >= 5
+        or evidence_contract_status in {"partial", "satisfied"}
+        or structured_point_status in {"partial", "satisfied"}
+    )
+    if page_retention_score < 34 or page_utility_score < 34 or (relevance < 1 and entity_hits < 1):
+        item["core_keep_review_block_reason"] = "page_signal_too_weak"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    if not promotable_signal:
+        item["core_keep_review_block_reason"] = "candidate_signal_too_weak"
+        item["page_keep_review_state"] = "core_near_miss_still_rejected"
+        return False, filter_reason
+    item["page_keep_review_state"] = "core_near_miss_kept"
+    item["page_keep_review_reason"] = filter_reason
+    item["kept_progress_from_raw"] = True
+    item["kept_candidate_source_type"] = source_type
+    item["second_pass_keep_recovered_count"] = 1
+    item["program_used_for_retention"] = True
+    item["soft_keep_anchor_buckets"] = anchor_hits
+    item["program_anchor_buckets"] = list(anchor_hits or [])[:6]
+    item["program_false_friend_hits"] = program_false_friend_hits_for_item(item, claim_item)
+    return True, "core_second_pass_keep_review"
+
+
+def should_allow_playwright_detail_rescue(
+    item: Dict[str, Any],
+    claim_item: Optional[Dict[str, Any]],
+    evidence_mode: str,
+    used_playwright_detail_rescues: int,
+) -> tuple[bool, str]:
+    if used_playwright_detail_rescues >= 1:
+        return False, "detail_rescue_budget_exhausted"
+    centrality = str((claim_item or {}).get("centrality") or "supporting")
+    source_intent = (claim_item or {}).get("source_intent") if isinstance((claim_item or {}).get("source_intent"), dict) else {}
+    if not playwright_rescue_mode_allowed(evidence_mode, centrality, source_intent):
+        return False, "detail_rescue_policy_not_allowed"
+    if not claim_aligned_page_shape_ok(item):
+        return False, "detail_rescue_page_shape_not_allowed"
+    if str(item.get("source_quality_label") or "") == "bad":
+        return False, "detail_rescue_bad_source_quality"
+    page_type = str(item.get("page_utility_page_type") or "")
+    if page_type not in DETAIL_RESCUE_ALLOWED_PAGE_TYPES:
+        return False, "detail_rescue_page_type_not_allowed"
+    return True, ""
+
+
+def finalize_detail_rescue_effect(stats: Dict[str, Any], item: Dict[str, Any], keep_item: bool) -> None:
+    if not item.get("_detail_rescue_playwright_used"):
+        return
+    candidate_gain = len(item.get("answer_candidates") or []) if isinstance(item.get("answer_candidates"), list) else 0
+    page_type = str(item.get("page_utility_page_type") or "") or "detail_page"
+    stats["detail_rescue_target_page_type"] = page_type
+    if candidate_gain > 0:
+        stats["detail_rescue_roi_state"] = "detail_candidates_recovered"
+        stats["detail_rescue_effect_delta"] = {"candidate_gain": candidate_gain, "kept_gain": 1 if keep_item else 0}
+        stats["rescue_success_gate"] = "detail_candidates_recovered"
+        stats["rescue_progress_delta"] = {"raw_delta": 0, "kept_delta": 1 if keep_item else 0, "stage": "detail_candidates_recovered"}
+        stats["rescue_roi_state"] = "detail_candidates_recovered"
+        return
+    if keep_item:
+        stats["detail_rescue_roi_state"] = "detail_page_kept_after_rescue"
+        stats["detail_rescue_effect_delta"] = {"candidate_gain": 0, "kept_gain": 1}
+        stats["rescue_roi_state"] = "detail_page_kept_after_rescue"
+        return
+    stats["detail_rescue_failure_reason"] = "detail_rescue_content_loaded_but_not_extractable"
+
+
 def claim_needs_opening_slot(claim_item: Optional[Dict[str, Any]], evidence_mode: str, query: str = "") -> bool:
     if str(evidence_mode or "") != "numeric_fact":
         return False
@@ -12054,6 +12209,10 @@ def diagnose_claim_retrieval(
     rescue_success_gate = str(stats.get("rescue_success_gate") or "")
     rescue_target_page_type = str(stats.get("rescue_target_page_type") or "")
     rescue_non_roi_reason = str(stats.get("rescue_non_roi_reason") or "")
+    detail_rescue_roi_state = str(stats.get("detail_rescue_roi_state") or "")
+    detail_rescue_target_page_type = str(stats.get("detail_rescue_target_page_type") or "")
+    detail_rescue_effect_delta = stats.get("detail_rescue_effect_delta") if isinstance(stats.get("detail_rescue_effect_delta"), dict) else {}
+    detail_rescue_failure_reason = str(stats.get("detail_rescue_failure_reason") or "")
     family_rescue_budget_used = stats.get("family_rescue_budget_used") if isinstance(stats.get("family_rescue_budget_used"), dict) else {}
     claim_retrieve_stop_reason = str(stats.get("claim_retrieve_stop_reason") or "")
     retrieval_cost_review = {
@@ -12301,6 +12460,10 @@ def diagnose_claim_retrieval(
         "rescue_success_gate": rescue_success_gate,
         "rescue_target_page_type": rescue_target_page_type,
         "rescue_non_roi_reason": rescue_non_roi_reason,
+        "detail_rescue_roi_state": detail_rescue_roi_state,
+        "detail_rescue_target_page_type": detail_rescue_target_page_type,
+        "detail_rescue_effect_delta": detail_rescue_effect_delta,
+        "detail_rescue_failure_reason": detail_rescue_failure_reason,
         "family_rescue_budget_used": family_rescue_budget_used,
         "official_entry_attempted": official_entry_attempted,
         "official_entry_hit": official_entry_hit,
@@ -12312,6 +12475,10 @@ def diagnose_claim_retrieval(
         "detail_fetch_paths": detail_fetch_paths,
         "page_keep_review_state": page_keep_review_state,
         "page_keep_review_reason": page_keep_review_reason,
+        "second_pass_keep_review_used": sum(1 for item in web_items if isinstance(item, dict) and item.get("second_pass_keep_review_used")),
+        "second_pass_keep_review_reason": count_item_field_values(web_items, "second_pass_keep_review_reason"),
+        "second_pass_keep_recovered_count": sum(1 for item in web_items if isinstance(item, dict) and int(item.get("second_pass_keep_recovered_count") or 0) > 0),
+        "core_keep_review_block_reason": stats.get("core_keep_review_block_reason", {}),
         "kept_candidate_source_type": kept_candidate_source_type,
         "kept_progress_from_raw": kept_progress_from_raw,
         "direct_candidate_rescue_used": direct_candidate_rescue_used,
@@ -12784,10 +12951,18 @@ def retrieve_evidence(
                 "official_discovery_score": candidate.get("score", 0),
                 "official_discovery_reasons": candidate.get("reasons", []),
             }
+            item.update(page_intent_features(item, source_intent, f"{question} {claim_text}", stats))
             if fetch_details > 0 and item.get("url") and detail_fetches < FETCH_DETAILS_PER_CLAIM:
                 stats["detail_attempts"] = int(stats.get("detail_attempts", 0) or 0) + 1
+                allow_detail_rescue, detail_rescue_skip_reason = should_allow_playwright_detail_rescue(
+                    item,
+                    claim_item,
+                    evidence_mode,
+                    used_playwright_detail_rescues,
+                )
                 detail_trace: Dict[str, Any] = {
-                    "allow_playwright_detail_rescue": used_playwright_detail_rescues < 1,
+                    "allow_playwright_detail_rescue": allow_detail_rescue,
+                    "rescue_skip_reason": detail_rescue_skip_reason,
                 }
                 try:
                     detail_started = time.perf_counter()
@@ -12801,6 +12976,7 @@ def retrieve_evidence(
                     apply_detail_fetch_trace(stats, item, detail_trace, "official_discovery")
                     if detail_trace.get("playwright_rescued"):
                         used_playwright_detail_rescues += 1
+                        item["_detail_rescue_playwright_used"] = True
                         stats["rescue_progress_delta"] = {
                             "raw_delta": 0,
                             "kept_delta": 0,
@@ -12808,6 +12984,8 @@ def retrieve_evidence(
                         }
                         stats["rescue_success_gate"] = "detail_content_recovered"
                         stats["rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
+                        stats["detail_rescue_roi_state"] = "detail_content_recovered"
+                        stats["detail_rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
                         record_rescue_budget_event(
                             stats,
                             "detail",
@@ -12831,6 +13009,10 @@ def retrieve_evidence(
                             latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
                             skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
                         )
+                        if detail_trace.get("playwright_used"):
+                            stats["detail_rescue_failure_reason"] = "detail_rescue_page_open_failed"
+                        else:
+                            stats["detail_rescue_failure_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                         if not detail_trace.get("playwright_used"):
                             stats["rescue_non_roi_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                     record_detail_fetch_failure(stats, item, exc)
@@ -12901,6 +13083,20 @@ def retrieve_evidence(
                     claim_item,
                 )
             if not keep_item:
+                keep_item, filter_reason = maybe_promote_core_second_pass_keep_review(
+                    f"{question} {claim_text}",
+                    item,
+                    filter_reason,
+                    evidence_mode,
+                    claim_item,
+                    int(stats.get("raw_results") or 0) + 1,
+                    sum(
+                        1
+                        for kept_item in claim_evidence
+                        if isinstance(kept_item, dict) and kept_item.get("source_type") not in {"input_context", "computed"}
+                    ),
+                )
+            if not keep_item:
                 keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
                     f"{question} {claim_text}",
                     item,
@@ -12911,10 +13107,14 @@ def retrieve_evidence(
             stats["raw_results"] += 1
             if keep_item:
                 record_fact_filter_diagnostic(stats, item, True, filter_reason)
+                if item.get("second_pass_keep_review_used"):
+                    stats["second_pass_keep_recovered_count"] = int(stats.get("second_pass_keep_recovered_count", 0) or 0) + int(item.get("second_pass_keep_recovered_count") or 1)
+                    increment_named_counter(stats, "second_pass_keep_review_reason", str(item.get("second_pass_keep_review_reason") or filter_reason))
                 if item.get("readiness_promotion_used"):
                     stats["readiness_promotion_used"] = int(stats.get("readiness_promotion_used", 0) or 0) + 1
                     increment_named_counter(stats, "readiness_promotion_source", normalize_text(str(item.get("readiness_promotion_source") or "fact_page_keep_review")) or "fact_page_keep_review")
                     stats.setdefault("candidate_strength_before_keep_scores", []).append(int(item.get("candidate_strength_before_keep") or 0))
+                finalize_detail_rescue_effect(stats, item, keep_item)
                 finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
                 claim_evidence.append(item)
                 if not item.get("_bridge_expanded"):
@@ -12934,6 +13134,9 @@ def retrieve_evidence(
                         max_results_per_query,
                     )
             else:
+                if item.get("core_keep_review_block_reason"):
+                    increment_named_counter(stats, "core_keep_review_block_reason", str(item.get("core_keep_review_block_reason") or "blocked"))
+                finalize_detail_rescue_effect(stats, item, keep_item)
                 record_fact_filter_diagnostic(stats, item, False, filter_reason)
                 stats["filtered_results"] += 1
                 add_filter_reason(stats, filter_reason)
@@ -13258,9 +13461,15 @@ def retrieve_evidence(
                         stats["source_quality_detail_skipped"] = int(stats.get("source_quality_detail_skipped", 0) or 0) + 1
                     if should_fetch_detail:
                         stats["detail_attempts"] = int(stats.get("detail_attempts", 0) or 0) + 1
-                        allow_detail_rescue = used_playwright_detail_rescues < 1
+                        allow_detail_rescue, detail_rescue_skip_reason = should_allow_playwright_detail_rescue(
+                            item,
+                            claim_item,
+                            evidence_mode,
+                            used_playwright_detail_rescues,
+                        )
                         detail_trace: Dict[str, Any] = {
                             "allow_playwright_detail_rescue": allow_detail_rescue,
+                            "rescue_skip_reason": detail_rescue_skip_reason,
                         }
                         try:
                             detail_started = time.perf_counter()
@@ -13272,6 +13481,7 @@ def retrieve_evidence(
                             apply_detail_fetch_trace(stats, item, detail_trace, source_name)
                             if detail_trace.get("playwright_rescued"):
                                 used_playwright_detail_rescues += 1
+                                item["_detail_rescue_playwright_used"] = True
                                 stats["rescue_progress_delta"] = {
                                     "raw_delta": 0,
                                     "kept_delta": 0,
@@ -13279,6 +13489,8 @@ def retrieve_evidence(
                                 }
                                 stats["rescue_success_gate"] = "detail_content_recovered"
                                 stats["rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
+                                stats["detail_rescue_roi_state"] = "detail_content_recovered"
+                                stats["detail_rescue_target_page_type"] = str(item.get("page_utility_page_type") or "") or "detail_page"
                                 record_rescue_budget_event(
                                     stats,
                                     "detail",
@@ -13311,6 +13523,10 @@ def retrieve_evidence(
                                     latency_ms=(time.perf_counter() - detail_started) * 1000.0 if "detail_started" in locals() else 0.0,
                                     skip_reason=str(detail_trace.get("rescue_skip_reason") or ""),
                                 )
+                                if detail_trace.get("playwright_used"):
+                                    stats["detail_rescue_failure_reason"] = "detail_rescue_page_open_failed"
+                                else:
+                                    stats["detail_rescue_failure_reason"] = str(detail_trace.get("rescue_skip_reason") or "detail_rescue_skipped")
                                 if detail_trace.get("playwright_used"):
                                     failed_rescue_families.add(source_family_name(source_name))
                                     stats["rescue_roi_state"] = "detail_rescue_failed"
@@ -13415,6 +13631,20 @@ def retrieve_evidence(
                             claim_item,
                         )
                     if not keep_item:
+                        keep_item, filter_reason = maybe_promote_core_second_pass_keep_review(
+                            source_query,
+                            item,
+                            filter_reason,
+                            evidence_mode,
+                            claim_item,
+                            int(stats.get("raw_results") or 0) + 1,
+                            sum(
+                                1
+                                for kept_item in claim_evidence
+                                if isinstance(kept_item, dict) and kept_item.get("source_type") not in {"input_context", "computed"}
+                            ),
+                        )
+                    if not keep_item:
                         keep_item, filter_reason = maybe_promote_prefilter_candidate_rescue(
                             source_query,
                             item,
@@ -13423,6 +13653,9 @@ def retrieve_evidence(
                             claim_item,
                         )
                     if not keep_item:
+                        if item.get("core_keep_review_block_reason"):
+                            increment_named_counter(stats, "core_keep_review_block_reason", str(item.get("core_keep_review_block_reason") or "blocked"))
+                        finalize_detail_rescue_effect(stats, item, keep_item)
                         record_fact_filter_diagnostic(stats, item, False, filter_reason)
                         add_trusted_deepen_jobs(stats, source_jobs, item, filter_reason, source_query)
                         record_source_item_quality(stats, source_name, item, kept=False, filter_reason=filter_reason)
@@ -13431,10 +13664,14 @@ def retrieve_evidence(
                         add_filtered_sample(stats, filter_reason, item)
                         continue
                     record_fact_filter_diagnostic(stats, item, True, filter_reason)
+                    if item.get("second_pass_keep_review_used"):
+                        stats["second_pass_keep_recovered_count"] = int(stats.get("second_pass_keep_recovered_count", 0) or 0) + int(item.get("second_pass_keep_recovered_count") or 1)
+                        increment_named_counter(stats, "second_pass_keep_review_reason", str(item.get("second_pass_keep_review_reason") or filter_reason))
                     if item.get("readiness_promotion_used"):
                         stats["readiness_promotion_used"] = int(stats.get("readiness_promotion_used", 0) or 0) + 1
                         increment_named_counter(stats, "readiness_promotion_source", normalize_text(str(item.get("readiness_promotion_source") or "fact_page_keep_review")) or "fact_page_keep_review")
                         stats.setdefault("candidate_strength_before_keep_scores", []).append(int(item.get("candidate_strength_before_keep") or 0))
+                    finalize_detail_rescue_effect(stats, item, keep_item)
                     finalize_direct_candidate_rescue_progress(item, default_stage="post_keep")
                     record_source_item_quality(stats, source_name, item, kept=True)
                     claim_evidence.append(item)

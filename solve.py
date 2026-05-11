@@ -2625,6 +2625,10 @@ def claim_pipeline_diagnostic(
     retrieval_cost_review = diagnostic.get("retrieval_cost_review") if isinstance(diagnostic.get("retrieval_cost_review"), dict) else {}
     page_keep_review_state = diagnostic.get("page_keep_review_state") if isinstance(diagnostic.get("page_keep_review_state"), dict) else {}
     page_keep_review_reason = diagnostic.get("page_keep_review_reason") if isinstance(diagnostic.get("page_keep_review_reason"), dict) else {}
+    second_pass_keep_review_used = int(diagnostic.get("second_pass_keep_review_used") or 0)
+    second_pass_keep_review_reason = diagnostic.get("second_pass_keep_review_reason") if isinstance(diagnostic.get("second_pass_keep_review_reason"), dict) else {}
+    second_pass_keep_recovered_count = int(diagnostic.get("second_pass_keep_recovered_count") or 0)
+    core_keep_review_block_reason = diagnostic.get("core_keep_review_block_reason") if isinstance(diagnostic.get("core_keep_review_block_reason"), dict) else {}
     kept_candidate_source_type = diagnostic.get("kept_candidate_source_type") if isinstance(diagnostic.get("kept_candidate_source_type"), dict) else {}
     kept_progress_from_raw = int(diagnostic.get("kept_progress_from_raw") or 0)
     rescue_progress_delta = diagnostic.get("rescue_progress_delta") if isinstance(diagnostic.get("rescue_progress_delta"), dict) else {}
@@ -2858,6 +2862,10 @@ def claim_pipeline_diagnostic(
         "retrieval_cost_review": retrieval_cost_review,
         "page_keep_review_state": page_keep_review_state,
         "page_keep_review_reason": page_keep_review_reason,
+        "second_pass_keep_review_used": second_pass_keep_review_used,
+        "second_pass_keep_review_reason": second_pass_keep_review_reason,
+        "second_pass_keep_recovered_count": second_pass_keep_recovered_count,
+        "core_keep_review_block_reason": core_keep_review_block_reason,
         "kept_candidate_source_type": kept_candidate_source_type,
         "kept_progress_from_raw": kept_progress_from_raw,
         "rescue_progress_delta": rescue_progress_delta,
@@ -2926,10 +2934,24 @@ def build_claim_pipeline_diagnostics(
         stage = str(row.get("pipeline_stage") or "unknown")
         layer_counts[layer] = layer_counts.get(layer, 0) + 1
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    retrieval_effect_review = {
+        "claim_count": len(items),
+        "raw_positive_claims": sum(1 for row in items if int(row.get("raw_results") or 0) > 0),
+        "kept_positive_claims": sum(1 for row in items if int(row.get("kept_web") or 0) > 0),
+        "kept_progress_claims": sum(1 for row in items if int(row.get("kept_progress_from_raw") or 0) > 0),
+        "authority_hit_claims": sum(1 for row in items if normalize_bool(row.get("official_entry_hit"), False)),
+        "anti_bot_or_access_blocked_claims": sum(
+            1
+            for row in items
+            if str(row.get("access_path_state") or "") in {"access_blocked_but_rescuable", "access_blocked_and_unresolved"}
+            or str(row.get("official_discovery_block_reason") or "") == "anti_bot_blocked"
+        ),
+    }
     return {
         "items": items,
         "layer_counts": layer_counts,
         "stage_counts": stage_counts,
+        "retrieval_effect_review": retrieval_effect_review,
     }
 
 
@@ -3186,9 +3208,11 @@ def rubric_trigger_gate(
     evidence_summary: Optional[Dict[str, Any]],
     fallback_risk_features: Optional[Dict[str, Any]],
     evidence_non_decidable_state: Optional[Dict[str, Any]] = None,
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     fallback_risk_features = fallback_risk_features if isinstance(fallback_risk_features, dict) else {}
     evidence_non_decidable_state = evidence_non_decidable_state if isinstance(evidence_non_decidable_state, dict) else {}
+    claim_pipeline_diagnostics = claim_pipeline_diagnostics if isinstance(claim_pipeline_diagnostics, dict) else {}
     unsupported_signals = fallback_risk_features.get("unsupported_signals") if isinstance(fallback_risk_features.get("unsupported_signals"), dict) else {}
     incomparable_signals = fallback_risk_features.get("incomparable_signals") if isinstance(fallback_risk_features.get("incomparable_signals"), dict) else {}
     fictional_signals = fallback_risk_features.get("fictional_contamination_signals") if isinstance(fallback_risk_features.get("fictional_contamination_signals"), dict) else {}
@@ -3211,6 +3235,24 @@ def rubric_trigger_gate(
         and not fictional_risk
     )
     non_decidable_state = str(evidence_non_decidable_state.get("state") or "")
+    dominant_row = dominant_pipeline_row(claim_pipeline_diagnostics, evidence_non_decidable_state)
+    retrieval_effect_review = (
+        claim_pipeline_diagnostics.get("retrieval_effect_review")
+        if isinstance(claim_pipeline_diagnostics.get("retrieval_effect_review"), dict)
+        else {}
+    )
+    access_path_state = str(dominant_row.get("access_path_state") or "")
+    critical_claim_blocking_state = str(dominant_row.get("critical_claim_blocking_state") or "")
+    official_entry_hit = normalize_bool(dominant_row.get("official_entry_hit"), False)
+    kept_web = int(dominant_row.get("kept_web") or 0)
+    raw_results = int(dominant_row.get("raw_results") or 0)
+    answer_candidate_total = int(dominant_row.get("answer_candidate_total") or 0)
+    decision_gate_primary_block = (
+        critical_claim_blocking_state
+        or access_path_state
+        or str(dominant_row.get("pipeline_stage") or "")
+        or non_decidable_state
+    )
     gate = {
         "allow": False,
         "reason": "",
@@ -3226,6 +3268,9 @@ def rubric_trigger_gate(
         "fictional_reality_contamination_risk": fictional_risk,
         "route_guard_blocked": route_guard_blocked,
         "certainty_profile_hint": certainty_profile,
+        "decision_gate_consumed_diagnostics": bool(dominant_row or retrieval_effect_review),
+        "decision_gate_primary_block": decision_gate_primary_block,
+        "reason_source_layer": "diagnostic_gate" if (dominant_row or retrieval_effect_review) else "fallback_risk_only",
     }
     if has_direct_refuting_evidence(evidence_summary):
         gate["reason"] = "direct_refuting_evidence_exists"
@@ -3237,6 +3282,39 @@ def rubric_trigger_gate(
         return gate
     if non_decidable_state == "direct_decidable":
         gate["reason"] = "direct_decision_available"
+        return gate
+    if critical_claim_blocking_state in {
+        "access_blocked_but_rescuable",
+        "access_blocked_and_unresolved",
+        "official_discovery_failed",
+    }:
+        gate["reason"] = "access_blocked_not_evidence_absence"
+        return gate
+    if critical_claim_blocking_state in {
+        "raw_hit_but_page_not_retained",
+        "raw_hit_but_page_not_retained_after_review",
+    }:
+        gate["reason"] = "raw_hit_but_page_not_retained"
+        return gate
+    if official_entry_hit and raw_results > 0 and kept_web <= 0:
+        gate["reason"] = "authority_hit_but_not_retained"
+        return gate
+    if critical_claim_blocking_state == "candidate_present_but_not_decidable" or (kept_web > 0 and answer_candidate_total > 0):
+        gate["reason"] = "candidate_present_but_not_decidable"
+        return gate
+    if (
+        non_decidable_state == "unsupported"
+        and int(retrieval_effect_review.get("authority_hit_claims") or 0) > 0
+        and int(retrieval_effect_review.get("kept_positive_claims") or 0) <= 0
+    ):
+        gate["reason"] = "authority_hit_but_not_retained"
+        return gate
+    if (
+        non_decidable_state == "unsupported"
+        and int(retrieval_effect_review.get("kept_progress_claims") or 0) > 0
+        and int(retrieval_effect_review.get("kept_positive_claims") or 0) > 0
+    ):
+        gate["reason"] = "retained_progress_but_not_decidable"
         return gate
     if route_guard_blocked and non_decidable_state == "unsupported" and not high_risk_feature and unsupported_core_claim_count > 0:
         gate["reason"] = "open_route_summary_guard_blocked"
@@ -3291,8 +3369,16 @@ def rubric_fallback_decide(
     fallback_risk_features: Optional[Dict[str, Any]],
     evidence_non_decidable_state: Optional[Dict[str, Any]],
     legacy_preview: Dict[str, Any],
+    claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    gate = rubric_trigger_gate(item, extracted, evidence_summary, fallback_risk_features, evidence_non_decidable_state)
+    gate = rubric_trigger_gate(
+        item,
+        extracted,
+        evidence_summary,
+        fallback_risk_features,
+        evidence_non_decidable_state,
+        claim_pipeline_diagnostics,
+    )
     if not gate.get("allow"):
         return {
             "attempted": False,
@@ -11305,10 +11391,17 @@ def insufficient_evidence_reason(
     claim_pipeline_diagnostics: Optional[Dict[str, Any]],
     evidence_non_decidable_state: Optional[Dict[str, Any]],
 ) -> str:
+    claim_pipeline_diagnostics = claim_pipeline_diagnostics if isinstance(claim_pipeline_diagnostics, dict) else {}
     non_decidable_state = evidence_non_decidable_state if isinstance(evidence_non_decidable_state, dict) else {}
     state = str(non_decidable_state.get("state") or "")
     dominant_row = dominant_pipeline_row(claim_pipeline_diagnostics, non_decidable_state)
+    retrieval_effect_review = (
+        claim_pipeline_diagnostics.get("retrieval_effect_review")
+        if isinstance(claim_pipeline_diagnostics.get("retrieval_effect_review"), dict)
+        else {}
+    )
     stage = str(dominant_row.get("pipeline_stage") or "")
+    critical_claim_blocking_state = str(dominant_row.get("critical_claim_blocking_state") or "")
     program_need = compact_claim_text(str(dominant_row.get("program_direct_evidence_need") or ""), 120)
     false_friend = compact_claim_text(
         str(((dominant_row.get("program_false_friend_evidence") or [""])[0] if isinstance(dominant_row.get("program_false_friend_evidence"), list) else "")),
@@ -11402,6 +11495,28 @@ def insufficient_evidence_reason(
             return "已有一部分结果是靠关键证据页复核才保下来的，说明入口并非全空，而是原先的页级保留偏严。"
         if page_keep_review_state:
             return "已有一部分结果是靠关键证据页复核才保下来的，说明问题已经从纯召回转到页级保留与消费。"
+        return ""
+
+    def critical_block_clause() -> str:
+        if critical_claim_blocking_state in {"raw_hit_but_page_not_retained", "raw_hit_but_page_not_retained_after_review"}:
+            if official_entry_hit:
+                return "当前已经命中过 authority/official 入口，也拿回过原始结果，但关键页还没有稳定保住。"
+            return "当前已经拿回过原始结果，但关键页还没有稳定保住。"
+        if critical_claim_blocking_state == "candidate_present_but_not_decidable":
+            return "当前关键页和候选句都已经出现，但还没闭合成可直接裁决的证据点。"
+        return ""
+
+    def retrieval_review_clause() -> str:
+        authority_hit_claims = int(retrieval_effect_review.get("authority_hit_claims") or 0)
+        kept_positive_claims = int(retrieval_effect_review.get("kept_positive_claims") or 0)
+        kept_progress_claims = int(retrieval_effect_review.get("kept_progress_claims") or 0)
+        anti_bot_claims = int(retrieval_effect_review.get("anti_bot_or_access_blocked_claims") or 0)
+        if authority_hit_claims > 0 and kept_positive_claims <= 0:
+            return "本轮其实已经碰到过权威入口，但命中的页还没有稳定保留下来。"
+        if kept_progress_claims > 0 and kept_positive_claims > 0:
+            return "本轮已经有页级保留进展，主阻塞不再是纯 recall，而是 kept page 到 candidate/point 的消费没有闭合。"
+        if anti_bot_claims > 0:
+            return "本轮主阻塞里已经包含明显的访问受阻或反爬因素，不是单纯没有相关网页。"
         return ""
 
     def rescue_success_clause() -> str:
@@ -11547,6 +11662,10 @@ def insufficient_evidence_reason(
                 return f"当前主要卡在检索召回：关键 claim 还没有拿到足够可用的原始材料，尤其缺少能直接回答“{program_need}”的证据，因此暂不判定为事实错误。"
             return "当前主要卡在检索召回，关键 claim 还没有拿到足够可用的原始材料，因此暂不判定为事实错误。"
         if stage == "retrieval_filter":
+            if critical_block_clause():
+                return critical_block_clause() + " 因此当前先把主阻塞记在页保留层，不把它混成黑盒“没证据”。"
+            if retrieval_review_clause():
+                return retrieval_review_clause() + " 因此当前主要还停在页面保留阶段，暂不判定为事实错误。"
             if access_prefix and access_path_state in {"page_access_or_read_blocked", "access_blocked_and_unresolved"}:
                 return access_prefix + " 因此当前主要还停在页面保留阶段，可用材料没有稳定留下。"
             if env_prefix:
@@ -11565,6 +11684,10 @@ def insufficient_evidence_reason(
                 return f"当前主要卡在页面保留阶段：搜到过相关结果，但没有稳定留下能直接回答“{program_need}”的页面材料，因此暂不判定为事实错误。"
             return "当前主要卡在页面保留阶段：搜到过相关结果，但可用材料没有稳定留下，因此暂不判定为事实错误。"
         if stage == "retrieval_readiness":
+            if critical_block_clause() and int(dominant_row.get("answer_candidate_total") or 0) > 0:
+                return critical_block_clause() + " 当前已经不是搜不到，而是 candidate/point 还没有闭合，因此暂不判定为事实错误。"
+            if retrieval_review_clause() and not env_prefix:
+                return retrieval_review_clause() + " 当前已经不是纯召回问题，但还没整理出稳定可直裁的证据句，因此暂不判定为事实错误。"
             if env_prefix:
                 return env_prefix + " 因此当前还没整理出可直接比对的候选句，先不判定为事实错误。"
             if missing_required_slots:
@@ -12300,7 +12423,15 @@ def aggregate_by_confidence(
         result["_fallback_risk_features"] = fallback_risk_features
         legacy_preview = legacy_fallback_preview(final_label, extracted, evidence_summary, item)
         result["_legacy_fallback_preview"] = legacy_preview
-        rubric_decision = rubric_fallback_decide(item or {}, extracted, evidence_summary, fallback_risk_features, evidence_non_decidable_state, legacy_preview) if item else {
+        rubric_decision = rubric_fallback_decide(
+            item or {},
+            extracted,
+            evidence_summary,
+            fallback_risk_features,
+            evidence_non_decidable_state,
+            legacy_preview,
+            claim_pipeline_diagnostics,
+        ) if item else {
             "attempted": False,
             "valid": False,
             "skip_reason": "missing_item_context",
@@ -12310,6 +12441,10 @@ def aggregate_by_confidence(
         if isinstance(rubric_decision, dict):
             result["_rubric_skip_reason"] = str(rubric_decision.get("skip_reason") or "")
             result["_rubric_trigger_gate"] = rubric_decision.get("trigger_gate") or {}
+            trigger_gate = result["_rubric_trigger_gate"] if isinstance(result.get("_rubric_trigger_gate"), dict) else {}
+            result["decision_gate_consumed_diagnostics"] = normalize_bool(trigger_gate.get("decision_gate_consumed_diagnostics"), False)
+            result["decision_gate_primary_block"] = str(trigger_gate.get("decision_gate_primary_block") or "")
+            result["reason_source_layer"] = str(trigger_gate.get("reason_source_layer") or "")
             if rubric_decision.get("elapsed_ms") is not None:
                 result["_rubric_elapsed_ms"] = float(rubric_decision.get("elapsed_ms") or 0.0)
             result["_rubric_prior_raw"] = rubric_decision.get("raw") or ""
@@ -12339,6 +12474,17 @@ def aggregate_by_confidence(
                     evidence_non_decidable_state,
                 )
                 result["analyse"] = result["_aggregation_analyse"]
+    if not result.get("decision_gate_consumed_diagnostics"):
+        result["decision_gate_consumed_diagnostics"] = False
+    if not result.get("decision_gate_primary_block"):
+        result["decision_gate_primary_block"] = ""
+    if not result.get("reason_source_layer"):
+        if result.get("_evidence_first_locked"):
+            result["reason_source_layer"] = "evidence_first"
+        elif result.get("_rubric_fallback_policy"):
+            result["reason_source_layer"] = "rubric_fallback"
+        else:
+            result["reason_source_layer"] = "insufficient_reason"
     result["final_label"] = final_label
     if (
         final_label == LABEL_2
@@ -12690,6 +12836,9 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
             "_label_source_channel": verify_obj.get("_label_source_channel") or "",
             "_decision_basis": verify_obj.get("_decision_basis") or "",
             "_decision_policy": verify_obj.get("_decision_policy") or "",
+            "decision_gate_consumed_diagnostics": bool(verify_obj.get("decision_gate_consumed_diagnostics")),
+            "decision_gate_primary_block": verify_obj.get("decision_gate_primary_block") or "",
+            "reason_source_layer": verify_obj.get("reason_source_layer") or "",
         }
     )
     debug.update({"stage": "done", "final_result": debug_final_result})
