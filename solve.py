@@ -2170,6 +2170,43 @@ def infer_rescue_attempt_state(
     return ""
 
 
+def build_retrieval_effect_review(
+    evidence_bundle: Optional[Dict[str, Any]],
+    timing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    diagnostics = (
+        evidence_bundle.get("diagnostics_by_claim")
+        if isinstance(evidence_bundle, dict) and isinstance(evidence_bundle.get("diagnostics_by_claim"), dict)
+        else {}
+    )
+    rows = [row for row in diagnostics.values() if isinstance(row, dict)]
+    authority_hits = sum(1 for row in rows if normalize_bool(row.get("official_entry_hit"), False))
+    raw_positive = sum(1 for row in rows if int(row.get("raw_results") or 0) > 0)
+    kept_positive = sum(1 for row in rows if int(row.get("kept_web") or 0) > 0)
+    anti_bot_like = sum(
+        1
+        for row in rows
+        if str(row.get("access_path_state") or "") in {"access_blocked_but_rescuable", "access_blocked_and_unresolved"}
+        or str(row.get("official_discovery_block_reason") or "") == "anti_bot_blocked"
+    )
+    rescue_states: Dict[str, int] = {}
+    for row in rows:
+        state = str(row.get("playwright_rescue_state") or "")
+        if not state:
+            continue
+        rescue_states[state] = int(rescue_states.get(state, 0) or 0) + 1
+    return {
+        "claim_count": len(rows),
+        "raw_positive_claims": raw_positive,
+        "kept_positive_claims": kept_positive,
+        "authority_hit_claims": authority_hits,
+        "anti_bot_or_access_blocked_claims": anti_bot_like,
+        "playwright_rescue_states": rescue_states,
+        "retrieve_seconds": round(float((timing or {}).get("retrieve") or 0.0), 3),
+        "total_so_far_seconds": round(float((timing or {}).get("total_so_far") or 0.0), 3),
+    }
+
+
 DECISION_CHANNEL_DIRECT_WEB = "direct_web_evidence"
 DECISION_CHANNEL_CLOSURE = "closure_refutation"
 DECISION_CHANNEL_UNRESOLVED = "insufficient_or_unresolved"
@@ -2497,6 +2534,10 @@ def claim_pipeline_diagnostic(
     source_budget_cutoff = diagnostic.get("source_budget_cutoff") if isinstance(diagnostic.get("source_budget_cutoff"), dict) else {}
     provider_health_snapshot = diagnostic.get("provider_health_snapshot") if isinstance(diagnostic.get("provider_health_snapshot"), list) else []
     effective_source_plan = diagnostic.get("effective_source_plan") if isinstance(diagnostic.get("effective_source_plan"), list) else []
+    search_request = diagnostic.get("search_request") if isinstance(diagnostic.get("search_request"), dict) else {}
+    search_policy = diagnostic.get("search_policy") if isinstance(diagnostic.get("search_policy"), dict) else {}
+    search_execution_trace = diagnostic.get("search_execution_trace") if isinstance(diagnostic.get("search_execution_trace"), dict) else {}
+    search_outcome = diagnostic.get("search_outcome") if isinstance(diagnostic.get("search_outcome"), dict) else {}
     playwright_rescue_state = str(diagnostic.get("playwright_rescue_state") or "")
     playwright_rescue_trigger = str(diagnostic.get("playwright_rescue_trigger") or "")
     playwright_rescue_source = str(diagnostic.get("playwright_rescue_source") or "")
@@ -2687,6 +2728,10 @@ def claim_pipeline_diagnostic(
         "source_budget_cutoff": source_budget_cutoff,
         "provider_health_snapshot": provider_health_snapshot[:5],
         "effective_source_plan": effective_source_plan[:10],
+        "search_request": search_request,
+        "search_policy": search_policy,
+        "search_execution_trace": search_execution_trace,
+        "search_outcome": search_outcome,
         "playwright_rescue_state": playwright_rescue_state,
         "playwright_rescue_trigger": playwright_rescue_trigger,
         "playwright_rescue_source": playwright_rescue_source,
@@ -9370,6 +9415,9 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
             and evidence_shape in {"authoritative_notice", "structured_historical_data"}
             and binding_strength >= 3
         )
+        authority_first_ready = (
+            preferred_domains and mode in {"numeric_fact", "date_fact", "schedule_fact", "route_fact", "event_result"}
+        ) or structured_authority_ready
         if centrality == "core":
             query_limits[claim_id] = 2
             if (
@@ -9378,7 +9426,7 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
                 query_limits[claim_id] = 3
             if mechanism_type in {"structured_numeric_authority", "date_authority", "event_result_page", "current_status_update"}:
                 query_limits[claim_id] = max(query_limits[claim_id], 2)
-            source_limits[claim_id] = 2
+            source_limits[claim_id] = 3 if authority_first_ready or mode in {"route_fact", "event_result"} else 2
         elif priority_label in {"critical", "high"}:
             query_limits[claim_id] = 2 if mode in {"numeric_fact", "date_fact", "schedule_fact", "event_result", "route_fact"} else 1
             if (
@@ -9387,7 +9435,7 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
                 query_limits[claim_id] = max(query_limits[claim_id], 3)
             if mechanism_type in {"structured_numeric_authority", "date_authority", "event_result_page", "relation_sentence", "current_status_update"}:
                 query_limits[claim_id] = max(query_limits[claim_id], 2)
-            source_limits[claim_id] = 2
+            source_limits[claim_id] = 3 if authority_first_ready or mode in {"route_fact", "event_result"} else 2
         elif mode in {"numeric_fact", "date_fact", "schedule_fact", "event_result"}:
             target = str(source_intent.get("evidence_target") or "")
             query_limits[claim_id] = 2 if mode == "numeric_fact" and target in {"prize_amount", "market_price"} else 1
@@ -9398,13 +9446,13 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
                     query_limits[claim_id] = max(query_limits[claim_id], 3)
                 else:
                     query_limits[claim_id] = max(query_limits[claim_id], 2)
-                source_limits[claim_id] = max(source_limits.get(claim_id, 0), 2)
-            source_limits[claim_id] = max(source_limits.get(claim_id, 0), 1)
+                source_limits[claim_id] = max(source_limits.get(claim_id, 0), 3 if authority_first_ready else 2)
+            source_limits[claim_id] = max(source_limits.get(claim_id, 0), 2 if authority_first_ready else 1)
         elif mechanism_type in {"structured_numeric_authority", "date_authority", "event_result_page", "current_status_update"}:
             query_limits[claim_id] = max(query_limits.get(claim_id, 0), 1 if centrality != "core" else 2)
             if preferred_domains or binding_strength >= 3:
                 query_limits[claim_id] = max(query_limits[claim_id], 2)
-            source_limits[claim_id] = max(source_limits.get(claim_id, 0), 1)
+            source_limits[claim_id] = max(source_limits.get(claim_id, 0), 2 if authority_first_ready else 1)
         elif mechanism_type == "relation_sentence":
             query_limits[claim_id] = max(query_limits.get(claim_id, 0), 1)
             if binding_strength >= 3 or priority_label in {"critical", "high"}:
@@ -9418,7 +9466,7 @@ def retrieval_budget_for_initial(item: Dict[str, Any], extracted: Dict[str, Any]
             source_limits[claim_id] = max(source_limits.get(claim_id, 0), 1)
         elif mode == "route_fact" and str(source_intent.get("evidence_target") or "") == "route_relation":
             query_limits[claim_id] = max(query_limits.get(claim_id, 0), 1)
-            source_limits[claim_id] = max(source_limits.get(claim_id, 0), 2)
+            source_limits[claim_id] = max(source_limits.get(claim_id, 0), 3)
         else:
             query_limits[claim_id] = 0
             skipped.append({"claim_id": claim_id, "reason": "supporting_non_structured_low_value"})
@@ -12134,6 +12182,10 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
     )
     mark_timing("retrieve")
     debug["evidence_bundle"] = evidence_bundle
+    debug["retrieval_effect_review"] = build_retrieval_effect_review(
+        evidence_bundle if isinstance(evidence_bundle, dict) else {},
+        debug.get("timing") if isinstance(debug.get("timing"), dict) else {},
+    )
     evidence_summary = summarize_claim_evidence(claims, evidence_bundle.get("evidence_by_claim", {}) if isinstance(evidence_bundle, dict) else {})
     apply_decision_useful_candidate_rerank(claims, evidence_bundle if isinstance(evidence_bundle, dict) else {}, evidence_summary, debug)
     attach_comparability_profiles(extracted, evidence_summary)
