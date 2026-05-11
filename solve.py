@@ -2625,6 +2625,10 @@ def claim_pipeline_diagnostic(
     retrieval_cost_review = diagnostic.get("retrieval_cost_review") if isinstance(diagnostic.get("retrieval_cost_review"), dict) else {}
     page_keep_review_state = diagnostic.get("page_keep_review_state") if isinstance(diagnostic.get("page_keep_review_state"), dict) else {}
     page_keep_review_reason = diagnostic.get("page_keep_review_reason") if isinstance(diagnostic.get("page_keep_review_reason"), dict) else {}
+    filtered_rescue_pool_state = str(diagnostic.get("filtered_rescue_pool_state") or "")
+    filtered_rescue_pool_reason = str(diagnostic.get("filtered_rescue_pool_reason") or "")
+    filtered_rescue_pool_score = int(diagnostic.get("filtered_rescue_pool_score") or 0)
+    filtered_rescue_pool_promoted = int(diagnostic.get("filtered_rescue_pool_promoted") or 0)
     second_pass_keep_review_used = int(diagnostic.get("second_pass_keep_review_used") or 0)
     second_pass_keep_review_reason = diagnostic.get("second_pass_keep_review_reason") if isinstance(diagnostic.get("second_pass_keep_review_reason"), dict) else {}
     second_pass_keep_recovered_count = int(diagnostic.get("second_pass_keep_recovered_count") or 0)
@@ -2862,6 +2866,10 @@ def claim_pipeline_diagnostic(
         "retrieval_cost_review": retrieval_cost_review,
         "page_keep_review_state": page_keep_review_state,
         "page_keep_review_reason": page_keep_review_reason,
+        "filtered_rescue_pool_state": filtered_rescue_pool_state,
+        "filtered_rescue_pool_reason": filtered_rescue_pool_reason,
+        "filtered_rescue_pool_score": filtered_rescue_pool_score,
+        "filtered_rescue_pool_promoted": filtered_rescue_pool_promoted,
         "second_pass_keep_review_used": second_pass_keep_review_used,
         "second_pass_keep_review_reason": second_pass_keep_review_reason,
         "second_pass_keep_recovered_count": second_pass_keep_recovered_count,
