@@ -7936,10 +7936,23 @@ def candidate_decision_useful_score(
     sentence_profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
     gap_reason = normalize_text(str(candidate.get("direct_candidate_gap_reason") or ""))
     directness = normalize_text(str(candidate.get("sentence_directness") or ""))
+    page_profile = candidate_page_utility_profile(claim_family, query_role, candidate)
+    subject_slot_hit = bool(coverage.get("subject"))
+    time_slot_hit = bool(coverage.get("time_scope") or coverage.get("time"))
+    fact_slot_hit = bool(coverage.get("metric_or_relation") or coverage.get("status_or_result"))
     score = sentence_utility_score
     score += min(20, directness_rank * 4)
     score += min(16, slot_count * 4)
     score += candidate_page_utility_score(claim_family, query_role, candidate)
+    if subject_slot_hit and (time_slot_hit or fact_slot_hit):
+        score += 6
+    if page_profile in {
+        "official_calendar_or_notice",
+        "alternative_route_or_route_analysis",
+        "result_or_score_page",
+        "table_or_data_page",
+    } and slot_count >= 2:
+        score += 6
     if sentence_profile == "direct_candidate":
         score += 20
     elif sentence_profile == "slot_hit_but_indirect":
@@ -7958,6 +7971,8 @@ def candidate_decision_useful_score(
         score -= 4
     elif gap_reason in {"date_role_mismatch", "result_granularity_mismatch", "opening_slot_mismatch"}:
         score += 2
+    elif gap_reason in {"candidate_not_direct", "related_but_not_assertive"} and slot_count >= 2 and directness_rank >= 2:
+        score += 4
     return score
 
 
@@ -7965,7 +7980,20 @@ def decision_useful_hit_for_candidate(candidate: Dict[str, Any]) -> bool:
     utility = int(candidate.get("candidate_utility_score") or 0)
     slot_count = int(((candidate.get("candidate_slot_coverage") or {}) if isinstance(candidate.get("candidate_slot_coverage"), dict) else {}).get("slot_count") or 0)
     profile = normalize_text(str(candidate.get("sentence_candidate_profile") or ""))
-    return utility >= 36 and slot_count >= 2 and profile != "background_commentary"
+    page_profile = normalize_text(str(candidate.get("page_utility_profile") or ""))
+    if utility >= 36 and slot_count >= 2 and profile != "background_commentary":
+        return True
+    return (
+        utility >= 34
+        and slot_count >= 2
+        and profile not in {"background_commentary", ""}
+        and page_profile in {
+            "official_calendar_or_notice",
+            "alternative_route_or_route_analysis",
+            "result_or_score_page",
+            "table_or_data_page",
+        }
+    )
 
 
 def apply_decision_useful_candidate_rerank(
@@ -8037,10 +8065,22 @@ def apply_decision_useful_candidate_rerank(
 
 def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
     point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
-    block_reason = normalize_text(str(point_conversion.get("block_reason") or ""))
+    block_reason = normalize_text(str(point_conversion.get("block_reason") or "")) or normalize_text(str(point_conversion.get("llm_refined_gap_reason") or "")) or normalize_text(str(point_conversion.get("direct_candidate_gap_reason") or ""))
     candidate_score = int(point_conversion.get("candidate_utility_score") or 0)
     slot_coverage = point_conversion.get("candidate_slot_coverage") if isinstance(point_conversion.get("candidate_slot_coverage"), dict) else {}
     slot_count = int(slot_coverage.get("slot_count") or 0)
+    candidate_sentence_count = int(point_conversion.get("candidate_sentence_count") or 0)
+    partial_count = int(point_conversion.get("partial_count") or 0)
+    stage = normalize_text(str(point_conversion.get("stage") or ""))
+    page_profile = normalize_text(str(point_conversion.get("page_utility_profile") or ""))
+    directness_rank = int(point_conversion.get("candidate_directness_rank") or 0)
+    decision_useful_hit = bool(point_conversion.get("decision_useful_hit"))
+    strong_page_profile = page_profile in {
+        "official_calendar_or_notice",
+        "alternative_route_or_route_analysis",
+        "result_or_score_page",
+        "table_or_data_page",
+    }
     if claim_direct_refuting_points(summary) or claim_direct_supporting_points(summary):
         return "stable_direct_point"
     if candidate_score >= 36 and slot_count >= 2 and block_reason in {
@@ -8050,8 +8090,16 @@ def infer_slot_review_outcome(summary: Dict[str, Any]) -> str:
         "numeric_not_normalizable",
     }:
         return f"same_slot_review_blocked:{block_reason}"
+    if candidate_score >= 30 and slot_count >= 2 and block_reason in {"candidate_not_direct", "related_but_not_assertive"}:
+        if strong_page_profile or directness_rank >= 3 or decision_useful_hit:
+            return f"same_slot_review_blocked:{block_reason}"
     if candidate_score >= 28 and block_reason in {"candidate_not_direct", "related_but_not_assertive"}:
         return "same_slot_review_not_direct"
+    if candidate_score >= 34 and slot_count >= 2 and stage in {"direct_to_uncertain_only", "no_direct_candidate"}:
+        if directness_rank >= 3 or decision_useful_hit or partial_count > 0:
+            return "same_slot_review_not_direct"
+    if candidate_sentence_count > 0 or partial_count > 0:
+        return "weak_candidate_retained"
     if int(summary.get("answer_candidate_total") or 0) > 0:
         return "weak_candidate_retained"
     return "unresolved"

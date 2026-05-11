@@ -8854,7 +8854,24 @@ CORE_SECOND_PASS_ALLOWED_PAGE_TYPES = {
     "official_notice",
     "current_status_page",
     "mixed_page",
+    "route_analysis_page",
+    "route_passage_page",
 }
+CORE_SECOND_PASS_STRONG_PAGE_TYPES = {
+    "result_page",
+    "event_detail",
+    "calendar_page",
+    "quote_page",
+    "historical_table",
+    "official_notice",
+}
+CORE_SECOND_PASS_ROUTE_PAGE_TYPES = {
+    "route_analysis_page",
+    "route_passage_page",
+    "mixed_page",
+}
+CORE_SECOND_PASS_ALLOWED_SOURCE_TYPES = {"official", "news", "encyclopedia", "unknown"}
+CORE_SECOND_PASS_STRUCTURED_SOURCE_TYPES = CORE_SECOND_PASS_ALLOWED_SOURCE_TYPES | {"finance"}
 DETAIL_RESCUE_ALLOWED_PAGE_TYPES = {
     "official_notice",
     "calendar_page",
@@ -8875,11 +8892,64 @@ def core_second_pass_keep_review_allowed(
         return False
     if not isinstance(claim_item, dict):
         return False
-    if str(claim_item.get("centrality") or "") != "core":
-        return False
-    if str(claim_item.get("_claim_budget_priority") or "") != "core_critical":
+    centrality = str(claim_item.get("centrality") or "")
+    priority = str(claim_item.get("_claim_budget_priority") or "")
+    mode = policy_mode_label(evidence_mode)
+    allowed = centrality == "core" and priority == "core_critical"
+    if not allowed and mode == "route_fact":
+        allowed = centrality == "supporting" and priority == "supporting_high_risk"
+    if not allowed:
         return False
     return raw_results_so_far > 0 and kept_web_so_far <= 0
+
+
+def core_second_pass_source_type_allowed(source_type: str, evidence_mode: str) -> bool:
+    mode = policy_mode_label(evidence_mode)
+    if mode in {"numeric_fact", "date_fact", "schedule_fact"}:
+        return source_type in CORE_SECOND_PASS_STRUCTURED_SOURCE_TYPES
+    return source_type in CORE_SECOND_PASS_ALLOWED_SOURCE_TYPES
+
+
+def core_second_pass_signal_summary(
+    query: str,
+    item: Dict[str, Any],
+    evidence_mode: str,
+    claim_item: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    signal = fact_slot_signal_summary(query, item, evidence_mode, claim_item)
+    page_type = str(item.get("page_utility_page_type") or "")
+    route_sentence = item.get("route_sentence") if isinstance(item.get("route_sentence"), dict) else {}
+    page_components = item.get("page_utility_components") if isinstance(item.get("page_utility_components"), dict) else {}
+    relation_evidence = int(page_components.get("relation_evidence") or 0)
+    answerability = int(page_components.get("answerability") or 0)
+    entity_grounding = int(page_components.get("entity_grounding") or 0)
+    structural_extractability = int(page_components.get("structural_extractability") or 0)
+    has_answer_candidates = bool(item.get("answer_candidates")) and isinstance(item.get("answer_candidates"), list)
+    route_signal = (
+        page_type in CORE_SECOND_PASS_ROUTE_PAGE_TYPES
+        and (
+            relation_evidence >= 1
+            or answerability >= 1
+            or bool(route_sentence.get("direct_sentence"))
+            or bool(route_sentence.get("has_relation_marker"))
+            or bool(route_sentence.get("has_route_object_marker"))
+        )
+        and entity_grounding >= 1
+        and structural_extractability >= 1
+    )
+    signal.update(
+        {
+            "page_type": page_type,
+            "strong_page_type": page_type in CORE_SECOND_PASS_STRONG_PAGE_TYPES,
+            "route_signal": route_signal,
+            "route_relation_evidence": relation_evidence,
+            "route_answerability": answerability,
+            "route_entity_grounding": entity_grounding,
+            "route_structural_extractability": structural_extractability,
+            "has_answer_candidates": has_answer_candidates,
+        }
+    )
+    return signal
 
 
 def maybe_promote_core_second_pass_keep_review(
@@ -8895,12 +8965,26 @@ def maybe_promote_core_second_pass_keep_review(
         return False, filter_reason
     item["second_pass_keep_review_used"] = True
     item["second_pass_keep_review_reason"] = filter_reason
+    mode = policy_mode_label(evidence_mode)
     source_type = str(item.get("source_type") or "")
-    if source_type not in {"official", "news", "encyclopedia", "unknown"}:
+    signal = core_second_pass_signal_summary(query, item, mode, claim_item)
+    if not core_second_pass_source_type_allowed(source_type, mode):
         item["core_keep_review_block_reason"] = "source_type_not_allowed"
         item["page_keep_review_state"] = "core_near_miss_still_rejected"
         return False, filter_reason
-    if filter_reason in FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS or not claim_aligned_page_shape_ok(item):
+    allow_structured_noise_exception = (
+        filter_reason == "structured_noise_high_penalty"
+        and mode in {"numeric_fact", "date_fact", "schedule_fact"}
+        and bool(signal.get("strong_page_type"))
+        and bool(signal.get("subject_time_hit"))
+        and bool(signal.get("metric_or_status_hit"))
+        and (
+            bool(signal.get("has_answer_candidates"))
+            or int(signal.get("answer_quality") or 0) >= 4
+            or int(signal.get("directness") or 0) >= 2
+        )
+    )
+    if ((filter_reason in FACT_PAGE_KEEP_REVIEW_HARD_DROP_REASONS) and not allow_structured_noise_exception) or not claim_aligned_page_shape_ok(item):
         item["core_keep_review_block_reason"] = "page_shape_hard_drop"
         item["page_keep_review_state"] = "core_near_miss_still_rejected"
         return False, filter_reason
@@ -8913,30 +8997,48 @@ def maybe_promote_core_second_pass_keep_review(
         item["core_keep_review_block_reason"] = "page_type_not_decision_useful"
         item["page_keep_review_state"] = "core_near_miss_still_rejected"
         return False, filter_reason
-    anchor_hits = claim_anchor_bucket_hits(query, item, evidence_mode, claim_item)
+    anchor_hits = signal.get("anchor_hits") if isinstance(signal.get("anchor_hits"), list) else claim_anchor_bucket_hits(query, item, mode, claim_item)
     anchor_hit_set = {str(hit) for hit in anchor_hits if str(hit)}
     subject_like = bool(anchor_hit_set & {"subject", "entity", "actor"})
     time_like = bool(anchor_hit_set & {"time", "time_scope"})
     fact_like = bool(anchor_hit_set & {"event", "status", "metric", "metric_or_relation", "status_or_result"})
-    if len(anchor_hits) < 2 or not ((subject_like and time_like) or (subject_like and fact_like) or (time_like and fact_like)):
+    route_mode = is_route_like_mode(mode)
+    if route_mode:
+        if not subject_like or not bool(signal.get("route_signal")):
+            item["core_keep_review_block_reason"] = "anchor_slots_not_closed"
+            item["page_keep_review_state"] = "core_near_miss_still_rejected"
+            return False, filter_reason
+    elif len(anchor_hits) < 2 or not ((subject_like and time_like) or (subject_like and fact_like) or (time_like and fact_like)):
         item["core_keep_review_block_reason"] = "anchor_slots_not_closed"
         item["page_keep_review_state"] = "core_near_miss_still_rejected"
         return False, filter_reason
-    page_retention_score = int(item.get("page_retention_score") or 0)
-    page_utility_score = int(item.get("page_utility_score") or 0)
-    directness = int(item.get("directness_score") or 0)
+    page_retention_score = int(signal.get("page_retention_score") or item.get("page_retention_score") or 0)
+    page_utility_score = int(signal.get("page_utility_score") or item.get("page_utility_score") or 0)
+    directness = int(signal.get("directness") or item.get("directness_score") or 0)
     relevance = int(item.get("relevance_score") or 0)
     entity_hits = int(item.get("entity_match_count") or 0)
-    answer_quality = int(item.get("answer_candidate_quality_score") or 0)
+    answer_quality = int(signal.get("answer_quality") or item.get("answer_candidate_quality_score") or 0)
     evidence_contract_status = normalize_text(str(item.get("evidence_contract_status") or "")).lower()
     structured_point_status = normalize_text(str(item.get("structured_point_contract_status") or "")).lower()
+    strong_page_type = bool(signal.get("strong_page_type"))
+    has_answer_candidates = bool(signal.get("has_answer_candidates"))
     promotable_signal = (
-        directness >= 2
-        or answer_quality >= 5
+        directness >= (1 if strong_page_type else 2)
+        or answer_quality >= (4 if strong_page_type else 5)
         or evidence_contract_status in {"partial", "satisfied"}
         or structured_point_status in {"partial", "satisfied"}
+        or (has_answer_candidates and strong_page_type and answer_quality >= 3)
+        or (route_mode and bool(signal.get("route_signal")))
     )
-    if page_retention_score < 34 or page_utility_score < 34 or (relevance < 1 and entity_hits < 1):
+    min_retention_score = 34
+    min_utility_score = 34
+    if strong_page_type:
+        min_retention_score = 30
+        min_utility_score = 30
+    if route_mode and bool(signal.get("route_signal")):
+        min_retention_score = 32
+        min_utility_score = 30
+    if page_retention_score < min_retention_score or page_utility_score < min_utility_score or (relevance < 1 and entity_hits < 1):
         item["core_keep_review_block_reason"] = "page_signal_too_weak"
         item["page_keep_review_state"] = "core_near_miss_still_rejected"
         return False, filter_reason
@@ -8946,6 +9048,11 @@ def maybe_promote_core_second_pass_keep_review(
         return False, filter_reason
     item["page_keep_review_state"] = "core_near_miss_kept"
     item["page_keep_review_reason"] = filter_reason
+    item["core_keep_review_profile"] = (
+        "route_relation_near_miss"
+        if route_mode
+        else ("strong_fact_page_near_miss" if strong_page_type else "general_fact_page_near_miss")
+    )
     item["kept_progress_from_raw"] = True
     item["kept_candidate_source_type"] = source_type
     item["second_pass_keep_recovered_count"] = 1
