@@ -15711,6 +15711,16 @@ def aggregate_by_confidence(
     if isinstance(evidence_summary, dict):
         if isinstance(evidence_summary.get("decision_state_debug"), dict):
             result["_decision_state_debug"] = evidence_summary.get("decision_state_debug")
+        try:
+            from decision_policy import build_decision_policy_debug
+
+            result["_decision_policy_debug"] = build_decision_policy_debug(result.get("_decision_state_debug"))
+        except Exception as exc:
+            result["_decision_policy_debug"] = {
+                "policy_route": "insufficient",
+                "allow_rubric_fallback": False,
+                "error": f"decision_policy_debug_failed:{type(exc).__name__}",
+            }
         if isinstance(evidence_summary.get("_core_assertion_audit"), dict):
             result["_core_assertion_audit"] = evidence_summary.get("_core_assertion_audit")
         if isinstance(evidence_summary.get("_cross_claim_consistency"), dict):
@@ -15820,24 +15830,40 @@ def aggregate_by_confidence(
         result["_fallback_risk_features"] = fallback_risk_features
         legacy_preview = legacy_fallback_preview(final_label, extracted, evidence_summary, item)
         result["_legacy_fallback_preview"] = legacy_preview
-        if legacy_preview_is_actionable_calibration(legacy_preview):
+        decision_policy_debug = result.get("_decision_policy_debug") if isinstance(result.get("_decision_policy_debug"), dict) else {}
+        allow_policy_fallback = normalize_bool(decision_policy_debug.get("allow_rubric_fallback"), False)
+        result["_decision_policy_route"] = str(decision_policy_debug.get("policy_route") or "")
+        result["_decision_permission_gate"] = "fallback_allowed" if allow_policy_fallback else "fallback_blocked"
+        if legacy_preview_is_actionable_calibration(legacy_preview) and allow_policy_fallback:
             final_label = apply_risk_calibration_result(result, legacy_preview, evidence_summary)
             result["_rubric_prior_attempted"] = False
         else:
-            rubric_decision = rubric_fallback_decide(
-                item or {},
-                extracted,
-                evidence_summary,
-                fallback_risk_features,
-                evidence_non_decidable_state,
-                legacy_preview,
-                claim_pipeline_diagnostics,
-            ) if item else {
-                "attempted": False,
-                "valid": False,
-                "skip_reason": "missing_item_context",
-                "trigger_gate": {"allow": False, "reason": "missing_item_context"},
-            }
+            if not allow_policy_fallback:
+                rubric_decision = {
+                    "attempted": False,
+                    "valid": False,
+                    "skip_reason": "decision_policy_no_fallback_permission",
+                    "trigger_gate": {
+                        "allow": False,
+                        "reason": "decision_policy_no_fallback_permission",
+                        "policy_route": str(decision_policy_debug.get("policy_route") or ""),
+                    },
+                }
+            else:
+                rubric_decision = rubric_fallback_decide(
+                    item or {},
+                    extracted,
+                    evidence_summary,
+                    fallback_risk_features,
+                    evidence_non_decidable_state,
+                    legacy_preview,
+                    claim_pipeline_diagnostics,
+                ) if item else {
+                    "attempted": False,
+                    "valid": False,
+                    "skip_reason": "missing_item_context",
+                    "trigger_gate": {"allow": False, "reason": "missing_item_context"},
+                }
             result["_rubric_prior_attempted"] = bool(rubric_decision.get("attempted")) if isinstance(rubric_decision, dict) else False
             if isinstance(rubric_decision, dict):
                 result["_rubric_skip_reason"] = str(rubric_decision.get("skip_reason") or "")
