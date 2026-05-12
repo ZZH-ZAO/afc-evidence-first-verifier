@@ -3216,7 +3216,54 @@ def summarize_claim_evidence(claims: List[Dict[str, Any]], evidence_by_claim: Di
         )
         summaries[claim_id]["evidence_events"] = evidence_event_summary(summaries[claim_id], coverage[claim_id])
         summaries[claim_id]["reason_hint"] = build_reason_hint_v2(claim_text, mode, summaries[claim_id], coverage[claim_id])
-    return {"claim_summaries": summaries, "claim_coverage": coverage}
+    try:
+        from evidence_event import build_evidence_events, build_phase_graph_summary, flatten_event_debug
+        from decision_state import build_decision_state_debug
+
+        evidence_events: Dict[str, List[Dict[str, Any]]] = {}
+        phase_graph: Dict[str, Dict[str, Any]] = {}
+        for claim_item in claims:
+            if not isinstance(claim_item, dict):
+                continue
+            claim_id = str(claim_item.get("claim_id") or claim_item.get("id") or "")
+            if not claim_id:
+                continue
+            summary = summaries.get(claim_id) if isinstance(summaries.get(claim_id), dict) else {}
+            claim_events = build_evidence_events(
+                claim_item,
+                evidence_by_claim.get(claim_id) or [],
+                summary,
+                coverage.get(claim_id) if isinstance(coverage.get(claim_id), dict) else {},
+            )
+            evidence_events[claim_id] = claim_events
+            phase_graph[claim_id] = build_phase_graph_summary(
+                claim_item,
+                claim_events,
+                summary,
+                coverage.get(claim_id) if isinstance(coverage.get(claim_id), dict) else {},
+            )
+            if isinstance(summary, dict):
+                summary["evidence_events"] = claim_events
+                summary["phase_graph"] = phase_graph[claim_id]
+        decision_state_debug = build_decision_state_debug(claims, summaries, phase_graph)
+        evidence_event_debug = flatten_event_debug(evidence_events)
+    except Exception as exc:
+        evidence_events = {}
+        phase_graph = {}
+        decision_state_debug = {
+            "claim_state_rows": [],
+            "sample_state_summary": {},
+            "error": f"evidence_event_debug_failed:{type(exc).__name__}",
+        }
+        evidence_event_debug = []
+    return {
+        "claim_summaries": summaries,
+        "claim_coverage": coverage,
+        "evidence_events": evidence_events,
+        "evidence_event_debug": evidence_event_debug,
+        "phase_graph": phase_graph,
+        "decision_state_debug": decision_state_debug,
+    }
 
 
 # v3.3 evidence-first overrides

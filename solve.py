@@ -3291,6 +3291,44 @@ def legacy_preview_targets_rubric(preview: Dict[str, Any]) -> bool:
     return basis in RUBRIC_TARGET_DECISION_BASES
 
 
+def legacy_preview_is_actionable_calibration(preview: Dict[str, Any]) -> bool:
+    if not isinstance(preview, dict):
+        return False
+    source = str(preview.get("source") or "")
+    policy = str(preview.get("policy") or "")
+    if source != "regression_label_calibration":
+        return False
+    if not policy or policy == "unsupported_claims_are_not_fact_errors":
+        return False
+    return pick_label(preview.get("label")) in VALID_LABELS
+
+
+def apply_risk_calibration_result(
+    result: Dict[str, Any],
+    legacy_preview: Dict[str, Any],
+    evidence_summary: Optional[Dict[str, Any]],
+) -> str:
+    final_label = pick_label(legacy_preview.get("label")) or LABEL_2
+    calibration_policy = str(legacy_preview.get("policy") or "")
+    result["_calibration_override"] = calibration_policy
+    result["_calibration_source"] = str(legacy_preview.get("source") or "")
+    result["_decision_basis"] = "risk_calibration"
+    result["_decision_policy"] = calibration_policy
+    result["_decision_policy_explanation"] = policy_reason(final_label, calibration_policy)
+    result["_aggregation_analyse"] = policy_reason(final_label, calibration_policy)
+    result["analyse"] = result["_aggregation_analyse"]
+    result["_rubric_prior_attempted"] = False
+    result["_rubric_skip_reason"] = "risk_calibration_precedes_rubric"
+    result["_rubric_trigger_gate"] = {
+        "allow": False,
+        "reason": "risk_calibration_precedes_rubric",
+    }
+    result["decision_gate_consumed_diagnostics"] = False
+    result["decision_gate_primary_block"] = ""
+    result["reason_source_layer"] = "risk_calibration"
+    return final_label
+
+
 def rubric_trigger_gate(
     item: Dict[str, Any],
     extracted: Dict[str, Any],
@@ -3317,6 +3355,7 @@ def rubric_trigger_gate(
     forecast_as_fact = normalize_bool(fallback_risk_features.get("forecast_as_fact_present"), False)
     route_uniqueness_overclaim = normalize_bool(fallback_risk_features.get("route_uniqueness_overclaim"), False)
     explicit_core_risk = route_uniqueness_overclaim or forecast_as_fact or fictional_risk
+    fallback_risk_gate_override = explicit_core_risk or supporting_structured_detail_risk or time_role_conflict_risk
     route_guard_blocked = (
         has_core_route_like_claim(extracted, evidence_summary)
         and not normalize_bool(fallback_risk_features.get("absolute_claim_present"), False)
@@ -3355,6 +3394,7 @@ def rubric_trigger_gate(
         "supporting_structured_detail_risk": supporting_structured_detail_risk,
         "time_role_conflict_risk": time_role_conflict_risk,
         "fictional_reality_contamination_risk": fictional_risk,
+        "fallback_risk_gate_override": fallback_risk_gate_override,
         "route_guard_blocked": route_guard_blocked,
         "certainty_profile_hint": certainty_profile,
         "decision_gate_consumed_diagnostics": bool(dominant_row or retrieval_effect_review),
@@ -3382,19 +3422,23 @@ def rubric_trigger_gate(
     if critical_claim_blocking_state in {
         "raw_hit_but_page_not_retained",
         "raw_hit_but_page_not_retained_after_review",
-    }:
+    } and not fallback_risk_gate_override:
         gate["reason"] = "raw_hit_but_page_not_retained"
         return gate
-    if official_entry_hit and raw_results > 0 and kept_web <= 0:
+    if official_entry_hit and raw_results > 0 and kept_web <= 0 and not fallback_risk_gate_override:
         gate["reason"] = "authority_hit_but_not_retained"
         return gate
-    if critical_claim_blocking_state == "candidate_present_but_not_decidable" or (kept_web > 0 and answer_candidate_total > 0):
+    if (
+        critical_claim_blocking_state == "candidate_present_but_not_decidable"
+        or (kept_web > 0 and answer_candidate_total > 0)
+    ) and not fallback_risk_gate_override:
         gate["reason"] = "candidate_present_but_not_decidable"
         return gate
     if (
         non_decidable_state == "unsupported"
         and int(retrieval_effect_review.get("authority_hit_claims") or 0) > 0
         and int(retrieval_effect_review.get("kept_positive_claims") or 0) <= 0
+        and not fallback_risk_gate_override
     ):
         gate["reason"] = "authority_hit_but_not_retained"
         return gate
@@ -3402,6 +3446,7 @@ def rubric_trigger_gate(
         non_decidable_state == "unsupported"
         and int(retrieval_effect_review.get("kept_progress_claims") or 0) > 0
         and int(retrieval_effect_review.get("kept_positive_claims") or 0) > 0
+        and not fallback_risk_gate_override
     ):
         gate["reason"] = "retained_progress_but_not_decidable"
         return gate
@@ -3419,6 +3464,12 @@ def rubric_trigger_gate(
     if non_decidable_state == "unsupported" and explicit_core_risk:
         gate["allow"] = True
         gate["reason"] = "unsupported_plus_explicit_core_risk"
+        return gate
+    if non_decidable_state in {"unsupported", "partial_but_incomparable", "abstain_no_judge"} and (
+        supporting_structured_detail_risk or time_role_conflict_risk
+    ):
+        gate["allow"] = True
+        gate["reason"] = "non_decidable_plus_detail_risk_signal"
         return gate
     if non_decidable_state == "abstain_no_judge" and (fictional_risk or explicit_core_risk):
         gate["allow"] = True
@@ -10367,6 +10418,8 @@ def should_run_semantic_audit(
         return False
     if verify_obj.get("_evidence_first_locked"):
         return False
+    if str(verify_obj.get("_decision_basis") or "") == "risk_calibration":
+        return False
     if has_new_scheme_decidable_evidence(extracted, evidence_summary):
         return False
     if verify_obj.get("_evidence_override") and pick_label(verify_obj.get("final_label")) in {LABEL_0, LABEL_1}:
@@ -10375,19 +10428,6 @@ def should_run_semantic_audit(
         pick_label(verify_obj.get("final_label")) in {LABEL_0, LABEL_1}
         and has_new_scheme_core_refuting_evidence(extracted, evidence_summary)
     ):
-        return False
-    if verify_obj.get("_calibration_override") in {
-        "sports_result_has_multiple_unsupported_core_result_claims",
-        "sports_result_has_unsupported_core_result_claim",
-        "distance_position_core_numeric_distance_lacks_support",
-        "fictional_scenario_contaminates_current_need",
-        "schedule_time_core_date_lacks_direct_evidence",
-        "market_movement_has_unsupported_time_detail",
-        "geopolitical_supporting_absolute_detail_lacks_support",
-        "geopolitical_core_high_assertion_lacks_support",
-        "geopolitical_core_policy_intent_lacks_support",
-        "secondary_detail_direct_refutation",
-    }:
         return False
     return True
 
@@ -12023,7 +12063,8 @@ def regression_label_calibration(
     unsupported_negative_route_core = False
     unsupported_negative_route_support = False
     unsupported_absolute_support = False
-    unsupported_absolute_route_premise = False
+    unsupported_absolute_route_core = False
+    unsupported_absolute_route_support = False
     geopolitical_strong_secondary_claim = False
     unsupported_distance_numeric_core = False
     sports_unsupported_core_results = 0
@@ -12122,7 +12163,7 @@ def regression_label_calibration(
                         or re.search(r"(没有实质性影响|不需要经过|无需经过|完全绕开|根本不需要)", claim_text)
                     )
                 ):
-                    unsupported_absolute_route_premise = True
+                    unsupported_absolute_route_core = True
                 if distance_need and re.search(r"(公里|千米|海里|英里|km|mile|nautical)", str(claim.get("claim") or ""), re.I):
                     unsupported_distance_numeric_core = True
                 if mode == "date_fact":
@@ -12164,7 +12205,7 @@ def regression_label_calibration(
                 and has_absolute_boundary
                 and re.search(r"(根本不需要|不需要经过|无需经过|完全绕开|不经由)", claim_text)
             ):
-                unsupported_absolute_route_premise = True
+                unsupported_absolute_route_support = True
             if (
                 centrality == "supporting"
                 and (
@@ -12210,7 +12251,7 @@ def regression_label_calibration(
     if current_geopolitical_need and fictional_current_status_contamination and not evidence_decidable:
         return LABEL_0, "fictional_scenario_contaminates_current_need"
     if geopolitical_need and unsupported_negative_route_core and not evidence_decidable:
-        if has_absolute_boundary or unsupported_absolute_route_premise:
+        if has_absolute_boundary or unsupported_absolute_route_core:
             return LABEL_0, "geopolitical_negative_route_core_lacks_support"
         return LABEL_1, "geopolitical_claims_have_insufficient_direct_support"
     if (
@@ -12239,9 +12280,9 @@ def regression_label_calibration(
         ]
     ):
         return LABEL_1, "geopolitical_core_policy_intent_lacks_support"
-    if geopolitical_family_need and unsupported_absolute_route_premise and not evidence_decidable:
+    if geopolitical_family_need and unsupported_absolute_route_core and not evidence_decidable:
         return LABEL_0, "geopolitical_absolute_route_premise_lacks_support"
-    if geopolitical_family_need and unsupported_absolute_support and not evidence_decidable:
+    if geopolitical_family_need and (unsupported_absolute_route_support or unsupported_absolute_support) and not evidence_decidable:
         return LABEL_1, "geopolitical_supporting_absolute_detail_lacks_support"
     if geopolitical_need and geopolitical_strong_secondary_claim and not strong_core_refuted and not evidence_decidable:
         return LABEL_1, "geopolitical_supporting_absolute_detail_lacks_support"
@@ -13178,6 +13219,17 @@ def normalize_reason_by_decision_basis(reason: str, label: str, decision_basis: 
         return reason
     if decision_basis == "evidence_support":
         return reason
+    if decision_basis == "risk_calibration":
+        prefix = "本次判断来自风险校准："
+        if reason.startswith(prefix):
+            return reason
+        if label == LABEL_0 and "主需" not in reason:
+            return prefix + reason
+        if label == LABEL_1 and "次需" not in reason:
+            return prefix + reason
+        if label == LABEL_2 and "不判定" not in reason and "未发现" not in reason:
+            return prefix + reason
+        return reason
     if decision_basis in {"rubric_fallback", "rubric_fallback_with_partial_evidence"}:
         prefix = "本次判断来自判标先验兜底："
         if reason.startswith(prefix):
@@ -13226,6 +13278,8 @@ def should_refine_final_reason(verify_obj: Dict[str, Any], reason: str, extracte
     evidence_summary = verify_obj.get("_evidence_summary_for_reason") if isinstance(verify_obj.get("_evidence_summary_for_reason"), dict) else None
     has_conflict = bool(final_reason_conflict_issues(reason, label, decision_basis, evidence_summary))
     if not ENABLE_FINAL_REASON_REFINE and not has_conflict:
+        return False
+    if decision_basis == "risk_calibration":
         return False
     need_type = normalize_need_type(extracted.get("need_type"))
     if need_type in {"geopolitical_claim"} and not has_conflict:
@@ -14986,7 +15040,20 @@ def build_evidence_ledger(
         "fallback_scope": "evidence_gate_first",
         "final_label_reason": "",
         "claim_rows": [],
+        "evidence_events": {},
+        "evidence_event_debug": [],
+        "phase_graph": {},
+        "decision_state_debug": {},
     }
+    if isinstance(evidence_summary, dict):
+        if isinstance(evidence_summary.get("evidence_events"), dict):
+            ledger["evidence_events"] = evidence_summary.get("evidence_events")
+        if isinstance(evidence_summary.get("evidence_event_debug"), list):
+            ledger["evidence_event_debug"] = evidence_summary.get("evidence_event_debug")[:24]
+        if isinstance(evidence_summary.get("phase_graph"), dict):
+            ledger["phase_graph"] = evidence_summary.get("phase_graph")
+        if isinstance(evidence_summary.get("decision_state_debug"), dict):
+            ledger["decision_state_debug"] = evidence_summary.get("decision_state_debug")
     atomic_claims = extracted.get("atomic_claims") if isinstance(extracted.get("atomic_claims"), list) else []
     high_risk_atomic_claims = (
         extracted.get("high_risk_atomic_claims")
@@ -15689,57 +15756,61 @@ def aggregate_by_confidence(
         result["_fallback_risk_features"] = fallback_risk_features
         legacy_preview = legacy_fallback_preview(final_label, extracted, evidence_summary, item)
         result["_legacy_fallback_preview"] = legacy_preview
-        rubric_decision = rubric_fallback_decide(
-            item or {},
-            extracted,
-            evidence_summary,
-            fallback_risk_features,
-            evidence_non_decidable_state,
-            legacy_preview,
-            claim_pipeline_diagnostics,
-        ) if item else {
-            "attempted": False,
-            "valid": False,
-            "skip_reason": "missing_item_context",
-            "trigger_gate": {"allow": False, "reason": "missing_item_context"},
-        }
-        result["_rubric_prior_attempted"] = bool(rubric_decision.get("attempted")) if isinstance(rubric_decision, dict) else False
-        if isinstance(rubric_decision, dict):
-            result["_rubric_skip_reason"] = str(rubric_decision.get("skip_reason") or "")
-            result["_rubric_trigger_gate"] = rubric_decision.get("trigger_gate") or {}
-            trigger_gate = result["_rubric_trigger_gate"] if isinstance(result.get("_rubric_trigger_gate"), dict) else {}
-            result["decision_gate_consumed_diagnostics"] = normalize_bool(trigger_gate.get("decision_gate_consumed_diagnostics"), False)
-            result["decision_gate_primary_block"] = str(trigger_gate.get("decision_gate_primary_block") or "")
-            result["reason_source_layer"] = str(trigger_gate.get("reason_source_layer") or "")
-            if rubric_decision.get("elapsed_ms") is not None:
-                result["_rubric_elapsed_ms"] = float(rubric_decision.get("elapsed_ms") or 0.0)
-            result["_rubric_prior_raw"] = rubric_decision.get("raw") or ""
-            if rubric_decision.get("valid"):
-                final_label = rubric_decision.get("label") or final_label
-                result["_rubric_prior"] = rubric_decision.get("prior") or {}
-                result["_rubric_fallback_policy"] = rubric_decision.get("policy") or ""
-                result["_replaced_legacy_policy"] = rubric_decision.get("replaced_legacy_policy") or ""
-                result["_replaced_legacy_basis"] = rubric_decision.get("replaced_legacy_basis") or ""
-                result["_replaced_legacy_source"] = rubric_decision.get("replaced_legacy_source") or ""
-                result["_decision_basis"] = rubric_decision.get("decision_basis") or "rubric_fallback"
-                result["_decision_policy"] = rubric_decision.get("policy") or ""
-                result["_decision_policy_explanation"] = policy_reason(final_label, str(result.get("_decision_policy") or ""))
-                result["_aggregation_analyse"] = str(rubric_decision.get("reason") or "")
-                result["analyse"] = result["_aggregation_analyse"]
-            else:
-                final_label = LABEL_2
-                result["_decision_basis"] = "insufficient_evidence"
-                result["_decision_policy"] = "unsupported_claims_are_not_fact_errors"
-                result["_decision_policy_explanation"] = policy_reason(final_label, "unsupported_claims_are_not_fact_errors")
-                result["_aggregation_analyse"] = evidence_reason(
-                    final_label,
-                    "unsupported_claims_are_not_fact_errors",
-                    extracted,
-                    evidence_summary,
-                    claim_pipeline_diagnostics,
-                    evidence_non_decidable_state,
-                )
-                result["analyse"] = result["_aggregation_analyse"]
+        if legacy_preview_is_actionable_calibration(legacy_preview):
+            final_label = apply_risk_calibration_result(result, legacy_preview, evidence_summary)
+            result["_rubric_prior_attempted"] = False
+        else:
+            rubric_decision = rubric_fallback_decide(
+                item or {},
+                extracted,
+                evidence_summary,
+                fallback_risk_features,
+                evidence_non_decidable_state,
+                legacy_preview,
+                claim_pipeline_diagnostics,
+            ) if item else {
+                "attempted": False,
+                "valid": False,
+                "skip_reason": "missing_item_context",
+                "trigger_gate": {"allow": False, "reason": "missing_item_context"},
+            }
+            result["_rubric_prior_attempted"] = bool(rubric_decision.get("attempted")) if isinstance(rubric_decision, dict) else False
+            if isinstance(rubric_decision, dict):
+                result["_rubric_skip_reason"] = str(rubric_decision.get("skip_reason") or "")
+                result["_rubric_trigger_gate"] = rubric_decision.get("trigger_gate") or {}
+                trigger_gate = result["_rubric_trigger_gate"] if isinstance(result.get("_rubric_trigger_gate"), dict) else {}
+                result["decision_gate_consumed_diagnostics"] = normalize_bool(trigger_gate.get("decision_gate_consumed_diagnostics"), False)
+                result["decision_gate_primary_block"] = str(trigger_gate.get("decision_gate_primary_block") or "")
+                result["reason_source_layer"] = str(trigger_gate.get("reason_source_layer") or "")
+                if rubric_decision.get("elapsed_ms") is not None:
+                    result["_rubric_elapsed_ms"] = float(rubric_decision.get("elapsed_ms") or 0.0)
+                result["_rubric_prior_raw"] = rubric_decision.get("raw") or ""
+                if rubric_decision.get("valid"):
+                    final_label = rubric_decision.get("label") or final_label
+                    result["_rubric_prior"] = rubric_decision.get("prior") or {}
+                    result["_rubric_fallback_policy"] = rubric_decision.get("policy") or ""
+                    result["_replaced_legacy_policy"] = rubric_decision.get("replaced_legacy_policy") or ""
+                    result["_replaced_legacy_basis"] = rubric_decision.get("replaced_legacy_basis") or ""
+                    result["_replaced_legacy_source"] = rubric_decision.get("replaced_legacy_source") or ""
+                    result["_decision_basis"] = rubric_decision.get("decision_basis") or "rubric_fallback"
+                    result["_decision_policy"] = rubric_decision.get("policy") or ""
+                    result["_decision_policy_explanation"] = policy_reason(final_label, str(result.get("_decision_policy") or ""))
+                    result["_aggregation_analyse"] = str(rubric_decision.get("reason") or "")
+                    result["analyse"] = result["_aggregation_analyse"]
+                else:
+                    final_label = LABEL_2
+                    result["_decision_basis"] = "insufficient_evidence"
+                    result["_decision_policy"] = "unsupported_claims_are_not_fact_errors"
+                    result["_decision_policy_explanation"] = policy_reason(final_label, "unsupported_claims_are_not_fact_errors")
+                    result["_aggregation_analyse"] = evidence_reason(
+                        final_label,
+                        "unsupported_claims_are_not_fact_errors",
+                        extracted,
+                        evidence_summary,
+                        claim_pipeline_diagnostics,
+                        evidence_non_decidable_state,
+                    )
+                    result["analyse"] = result["_aggregation_analyse"]
     if not result.get("decision_gate_consumed_diagnostics"):
         result["decision_gate_consumed_diagnostics"] = False
     if not result.get("decision_gate_primary_block"):
