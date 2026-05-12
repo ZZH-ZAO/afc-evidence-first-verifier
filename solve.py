@@ -15544,6 +15544,15 @@ def decision_state_reason_candidate(label: str, evidence_summary: Optional[Dict[
     if not isinstance(evidence_summary, dict):
         return ""
     debug = evidence_summary.get("decision_state_debug") if isinstance(evidence_summary.get("decision_state_debug"), dict) else {}
+    policy_debug = evidence_summary.get("decision_policy_debug") if isinstance(evidence_summary.get("decision_policy_debug"), dict) else {}
+    try:
+        from reason_builder import build_decision_state_reason
+
+        natural_reason = build_decision_state_reason(label, debug, policy_debug)
+        if natural_reason:
+            return natural_reason
+    except Exception:
+        pass
     rows = debug.get("claim_state_rows") if isinstance(debug.get("claim_state_rows"), list) else []
     if not rows:
         return ""
@@ -15715,12 +15724,14 @@ def aggregate_by_confidence(
             from decision_policy import build_decision_policy_debug
 
             result["_decision_policy_debug"] = build_decision_policy_debug(result.get("_decision_state_debug"))
+            evidence_summary["decision_policy_debug"] = result["_decision_policy_debug"]
         except Exception as exc:
             result["_decision_policy_debug"] = {
                 "policy_route": "insufficient",
                 "allow_rubric_fallback": False,
                 "error": f"decision_policy_debug_failed:{type(exc).__name__}",
             }
+            evidence_summary["decision_policy_debug"] = result["_decision_policy_debug"]
         if isinstance(evidence_summary.get("_core_assertion_audit"), dict):
             result["_core_assertion_audit"] = evidence_summary.get("_core_assertion_audit")
         if isinstance(evidence_summary.get("_cross_claim_consistency"), dict):
