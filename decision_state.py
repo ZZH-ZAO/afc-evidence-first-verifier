@@ -105,6 +105,8 @@ def _infer_risk_shape(claim: Dict[str, Any], summary: Dict[str, Any], phase_grap
 
 
 def _infer_permission(scope: str, evidence_state: str, risk_shape: List[str]) -> str:
+    if evidence_state == "date_only_guarded_refutation":
+        return "insufficient_until_fact_binding"
     if evidence_state == "direct_refuted":
         return "evidence_decide"
     if evidence_state == "direct_supported":
@@ -150,6 +152,9 @@ def build_decision_state_debug(
         scope = _infer_scope(claim)
         evidence_state = _infer_evidence_state(summary)
         slot_state = _infer_slot_state(summary)
+        if evidence_state == "direct_refuted" and int(phase_row.get("date_only_guard_block_count") or 0) > 0:
+            evidence_state = "date_only_guarded_refutation"
+            slot_state = "date_only_guarded"
         risk_shape = _infer_risk_shape(claim, summary, phase_row)
         permission = _infer_permission(scope, evidence_state, risk_shape)
         rows.append(

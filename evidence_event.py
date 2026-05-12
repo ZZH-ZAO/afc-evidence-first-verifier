@@ -83,12 +83,16 @@ def _date_only_guard(event: Dict[str, Any]) -> Dict[str, Any]:
         "publish_time",
         "page_publish_time",
         "published_at",
-    }
+    } or "date" in predicate or "time" in predicate
     page_date_role = event_role in {"page_publish_time", "dated_fact"} and not any(
         token in event_role for token in ["current", "phase", "result", "status"]
     )
-    has_fact_binding = bool(subject or object_value or predicate not in {"", "date", "time", "publish_time"})
-    blocked = bool((date_only_predicate or page_date_role) and date_like and not has_fact_binding)
+    has_fact_binding = bool(
+        subject
+        or object_value
+        or predicate not in {"", "date", "time", "publish_time", "page_publish_time", "published_at"}
+    )
+    blocked = bool((date_only_predicate or page_date_role) and (not has_fact_binding or (not subject and not object_value)))
     return {
         "blocked": blocked,
         "reason": "date_without_subject_or_fact_binding" if blocked else "",
