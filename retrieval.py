@@ -698,7 +698,7 @@ def budgeted_source_jobs(
     post_role_priority_order = [str(item) for item in (query_item.get("_post_role_priority_order") or []) if str(item)]
     query_family_role = normalize_text(str(query_item.get("query_family_role") or ""))
     high_value_query = (
-        query_goal in {"verification_question", "find_page_intent_page", "find_route_page", "find_metric_source_page"}
+        query_goal in {"verification_question", "find_page_intent_page", "find_route_page", "find_metric_source_page", "find_atomic_refutation"}
         or query_family_role in {"closure", "distinguish", "refute"}
     )
     authority_pair_needed = query_needs_authority_pair(query_goal, query_family_role, source_intent)
@@ -1113,8 +1113,8 @@ def passage_focus_terms(query: str, title: str = "") -> List[str]:
         terms.extend(["withdraw", "withdrew", "retired", "walkover", "退赛", "弃权", "不战而胜"])
     if any(token in text for token in ["trading day", "market holiday", "休市", "交易日", "节假日"]):
         terms.extend(["trading day", "market holiday", "closed", "休市", "交易日", "节假日"])
-    if any(token in text for token in ["census", "phase", "人口普查", "阶段"]):
-        terms.extend(["census", "phase", "enumeration", "results", "人口普查", "阶段", "结果", "公布"])
+    if any(token in text for token in ["census", "phase", "阶段"]):
+        terms.extend(["census", "phase", "enumeration", "results", "阶段", "结果", "公布"])
     if any(token in text for token in ["location", "distance", "位置", "距离"]):
         terms.extend(["location", "position", "distance", "位置", "距离", "公里"])
     return dedupe_keep_order(terms)[:16]
@@ -4217,6 +4217,19 @@ ATOMIC_CLAIM_QUERY_HINTS = {
 }
 
 
+def atomic_query_primary_score(value: str) -> str:
+    match = re.search(r"\b\d{1,3}\s*[-:：]\s*\d{1,3}\b", normalize_text(str(value or "")))
+    return normalize_text(match.group(0)) if match else normalize_text(str(value or ""))
+
+
+def atomic_query_event_entity(value: str) -> str:
+    text = normalize_text(str(value or ""))
+    text = re.sub(r"[\(（][^)）]{1,20}[\)）]", " ", text)
+    text = re.sub(r"[✅✔️❌✖️]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any]:
     """Planned-only query hook for CI atomic claims; callers decide whether to execute it."""
     if not isinstance(atomic_claim, dict):
@@ -4238,6 +4251,83 @@ def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any
                 "公告",
             ]
         )
+    elif risk_type == "event_result_status":
+        status_text = normalize_text(str(slots.get("status_or_result") or ""))
+        status_mentions_withdrawal = bool(re.search(r"(退赛|弃权|不战而胜|walkover|withdraw|withdrew|retired)", status_text, flags=re.I))
+        status_mentions_score = bool(re.search(r"\d{1,3}\s*[-:：]\s*\d{1,3}", status_text))
+        contrast_terms = ["赛果", "比分", "结果"] if status_mentions_withdrawal else ["退赛", "不战而胜", "弃权", "walkover", "withdrawal", "赛果"]
+        if not status_mentions_score and not status_mentions_withdrawal:
+            contrast_terms = ["赛果", "比分", "结果", "退赛", "不战而胜"]
+        terms = dedupe_keep_order(
+            [
+                atomic_query_event_entity(str(slots.get("subject") or "")),
+                atomic_query_event_entity(str(slots.get("object") or "")),
+                normalize_text(str(slots.get("time_scope") or "")),
+            ]
+            + contrast_terms
+        )
+    elif risk_type == "phase_boundary_time":
+        time_role = normalize_text(str(slots.get("time_role") or ""))
+        time_scope = normalize_text(str(slots.get("time_scope") or ""))
+        stripped_time_scope = normalize_text(re.sub(r"(之后|以前|之前|后|前)$", "", time_scope))
+        claim_text = normalize_text(str(atomic_claim.get("text") or ""))
+        if not time_role:
+            if re.search(r"(结果|数据|公布|发布|出炉|release|published|complete|完成|结束)", claim_text, flags=re.I):
+                time_role = "result_release"
+            elif re.search(r"(结束|完成|完结|截止)", claim_text, flags=re.I):
+                time_role = "whole_event_end"
+            elif re.search(r"(第一阶段|第二阶段|第三阶段|阶段)", claim_text) and re.search(r"(开始|开启|启动|开展|进行|start|begin|commence)", claim_text, flags=re.I):
+                time_role = "phase_start"
+        subject_text = normalize_text(str(slots.get("subject") or ""))
+        time_surface = " ".join([time_scope, stripped_time_scope]).strip() or claim_text
+        month_terms = dedupe_keep_order(
+            re.findall(r"20\d{2}\s*年\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?", time_surface)
+            + re.findall(
+                r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2}\b",
+                time_surface,
+                flags=re.I,
+            )
+            + re.findall(r"\b20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", time_surface)
+        )
+        if not month_terms:
+            month_terms = dedupe_keep_order(
+                re.findall(r"20\d{2}\s*年\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?", claim_text)
+                + re.findall(
+                    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2}\b",
+                    claim_text,
+                    flags=re.I,
+                )
+                + re.findall(r"\b20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", claim_text)
+            )
+        if time_role in {"result_release", "whole_event_end", "phase_end"}:
+            role_terms = [
+                "阶段",
+                "下一阶段",
+                "第二阶段",
+                "后续阶段",
+                "开始",
+                "启动",
+                "start",
+                "schedule",
+                "dates",
+                "结果",
+                "公布",
+                "release",
+            ]
+        elif time_role == "phase_start":
+            role_terms = ["阶段", "开始", "启动", "schedule", "dates", "官方"]
+        else:
+            role_terms = ["阶段", "日程", "开始", "结束", "公布", "官方"]
+        terms = dedupe_keep_order(
+            [
+                subject_text,
+                normalize_text(str(slots.get("object") or "")),
+                stripped_time_scope or time_scope,
+            ]
+            + month_terms
+            + role_terms
+            + [normalize_text(str(term)) for term in target_terms[:2]]
+        )
     else:
         terms = dedupe_keep_order(
             [
@@ -4252,12 +4342,17 @@ def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any
         )
     query_text = compact_text_for_query(" ".join(term for term in terms if term), 96)
     priority = int(atomic_claim.get("search_priority") or 0)
+    atomic_source_preference = (
+        ["news", "html"]
+        if risk_type in {"exclusive_or_only_path", "event_result_status", "phase_boundary_time", "reality_vs_fiction_status"}
+        else ["official", "news", "html"]
+    )
     return {
         "state": "planned_only" if query_text else "insufficient_slots",
         "risk_type": risk_type,
         "priority": priority,
         "query": query_text,
-        "source_preference": ["official", "news", "html"],
+        "source_preference": atomic_source_preference,
         "do_not_execute_without_budget": True,
     }
 
