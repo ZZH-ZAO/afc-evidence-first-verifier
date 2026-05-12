@@ -15073,6 +15073,9 @@ def build_evidence_ledger(
         "evidence_event_debug": [],
         "phase_graph": {},
         "decision_state_debug": {},
+        "decision_policy_debug": {},
+        "decision_policy_route": "",
+        "decision_permission_gate": "",
     }
     if isinstance(evidence_summary, dict):
         if isinstance(evidence_summary.get("evidence_events"), dict):
@@ -15083,6 +15086,8 @@ def build_evidence_ledger(
             ledger["phase_graph"] = evidence_summary.get("phase_graph")
         if isinstance(evidence_summary.get("decision_state_debug"), dict):
             ledger["decision_state_debug"] = evidence_summary.get("decision_state_debug")
+        if isinstance(evidence_summary.get("decision_policy_debug"), dict):
+            ledger["decision_policy_debug"] = evidence_summary.get("decision_policy_debug")
     atomic_claims = extracted.get("atomic_claims") if isinstance(extracted.get("atomic_claims"), list) else []
     high_risk_atomic_claims = (
         extracted.get("high_risk_atomic_claims")
@@ -16298,6 +16303,13 @@ def run_one(item: Dict[str, Any]) -> Dict[str, Any]:
         reason = "未发现明确事实错误"
     if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("_evidence_ledger"), dict):
         evidence_summary["_evidence_ledger"]["final_label_reason"] = reason
+        policy_debug = verify_obj.get("_decision_policy_debug") if isinstance(verify_obj.get("_decision_policy_debug"), dict) else {}
+        if policy_debug:
+            evidence_summary["_evidence_ledger"]["decision_policy_debug"] = policy_debug
+        evidence_summary["_evidence_ledger"]["decision_policy_route"] = str(
+            verify_obj.get("_decision_policy_route") or policy_debug.get("policy_route") or ""
+        )
+        evidence_summary["_evidence_ledger"]["decision_permission_gate"] = str(verify_obj.get("_decision_permission_gate") or "")
         debug["evidence_ledger"] = evidence_summary["_evidence_ledger"]
     result = {"id": item.get("id"), "label": label, "reason": reason}
     debug_final_result = dict(result)
