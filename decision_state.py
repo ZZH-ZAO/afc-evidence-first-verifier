@@ -59,16 +59,24 @@ def _infer_evidence_state(summary: Dict[str, Any]) -> str:
 
 def _infer_slot_state(summary: Dict[str, Any]) -> str:
     point_conversion = _as_dict(summary.get("point_conversion"))
+    phase_graph = _as_dict(summary.get("phase_graph"))
+    claim_role = _text(phase_graph.get("claim_role"))
     if point_conversion.get("same_slot_conflict_ready"):
         return "same_slot_conflict"
     if point_conversion.get("same_slot_ready"):
         return "same_slot"
     missing = _as_list(point_conversion.get("slot_missing"))
     mismatch = _as_list(point_conversion.get("slot_mismatch"))
+    if claim_role in {"phase_start", "phase_end", "current_status", "whole_event_end_or_result_release"} and (
+        int(phase_graph.get("date_only_guard_block_count") or 0) > 0 or mismatch
+    ):
+        return "phase_boundary_conflict"
     if mismatch:
         return "slot_mismatch"
     if missing:
         return "missing_slot"
+    if claim_role in {"phase_start", "phase_end", "current_status", "whole_event_end_or_result_release"}:
+        return "phase_boundary_candidate"
     if _text(point_conversion.get("conflict_slot")):
         return "conflict_slot_candidate"
     return "unknown"
@@ -88,6 +96,9 @@ def _infer_risk_shape(claim: Dict[str, Any], summary: Dict[str, Any], phase_grap
         shapes.append("absolute_or_resolved_claim")
     if any(token in claim_text for token in ["第一阶段", "第二阶段", "开始", "结束", "发布时间", "什么时候出"]):
         shapes.append("phase_boundary_time")
+    phase_claim_role = _text(phase_graph.get("claim_role"))
+    if phase_claim_role in {"phase_start", "phase_end", "current_status", "whole_event_end_or_result_release"}:
+        shapes.append(f"phase_graph:{phase_claim_role}")
     if int(phase_graph.get("date_only_guard_block_count") or 0) > 0:
         shapes.append("date_only_conflict_guarded")
     return list(dict.fromkeys([shape for shape in shapes if shape]))
@@ -98,6 +109,8 @@ def _infer_permission(scope: str, evidence_state: str, risk_shape: List[str]) ->
         return "evidence_decide"
     if evidence_state == "direct_supported":
         return "evidence_decide"
+    if any(shape.startswith("phase_graph:") for shape in risk_shape):
+        return "risk_calibrate" if scope == "core" else "rubric_fallback"
     if "date_only_conflict_guarded" in risk_shape:
         return "insufficient_until_fact_binding"
     if evidence_state in {"same_slot_conflict_candidate", "candidate_unconverted", "partial_incomparable"}:
