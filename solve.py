@@ -15540,6 +15540,36 @@ def evidence_ledger_reason(label: str, evidence_summary: Optional[Dict[str, Any]
     return ""
 
 
+def decision_state_reason_candidate(label: str, evidence_summary: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(evidence_summary, dict):
+        return ""
+    debug = evidence_summary.get("decision_state_debug") if isinstance(evidence_summary.get("decision_state_debug"), dict) else {}
+    rows = debug.get("claim_state_rows") if isinstance(debug.get("claim_state_rows"), list) else []
+    if not rows:
+        return ""
+    ranked_rows = sorted(
+        [row for row in rows if isinstance(row, dict)],
+        key=lambda row: (
+            0 if str(row.get("scope") or "") == "core" else 1,
+            0 if str(row.get("label_candidate") or "") == label else 1,
+        ),
+    )
+    for row in ranked_rows:
+        permission = str(row.get("decision_permission") or "")
+        candidate = str(row.get("label_candidate") or "")
+        basis = normalize_text(str(row.get("reason_basis") or ""))
+        scope = str(row.get("scope") or "")
+        evidence_state = str(row.get("evidence_state") or "")
+        slot_state = str(row.get("slot_state") or "")
+        if not basis:
+            continue
+        if label == LABEL_2 and permission.startswith("insufficient"):
+            return f"裁决状态显示当前 {scope} claim 停在 {evidence_state}/{slot_state}，原因是：{basis}。因此不把未闭合证据包装成事实错误。"
+        if label in {LABEL_0, LABEL_1} and candidate == label and permission in {"risk_calibrate", "rubric_fallback"}:
+            return f"裁决状态显示当前 {scope} claim 不能由直接证据闭合，但存在可授权补判的风险形态：{basis}。"
+    return ""
+
+
 def choose_final_reason(
     verify_obj: Dict[str, Any],
     label: str,
@@ -15587,6 +15617,9 @@ def choose_final_reason(
     consistency_based = cross_claim_consistency_reason(label, evidence_summary)
     if consistency_based:
         candidates.insert(0, ("cross_claim_consistency_reason", consistency_based))
+    state_based = decision_state_reason_candidate(label, evidence_summary)
+    if state_based and not allow_evidence_reason:
+        candidates.insert(0, ("decision_state_reason", state_based))
     for source, value in candidates:
         reason = normalize_reason_by_decision_basis(str(value or ""), label, decision_basis)
         if llm_reason_is_safe(reason, label, decision_basis, evidence_summary):
@@ -15676,6 +15709,8 @@ def aggregate_by_confidence(
     result["_pre_aggregation_analyse"] = str(result.get("analyse") or "")
     result["_evidence_first_audit"] = evidence_first_audit(extracted, evidence_summary)
     if isinstance(evidence_summary, dict):
+        if isinstance(evidence_summary.get("decision_state_debug"), dict):
+            result["_decision_state_debug"] = evidence_summary.get("decision_state_debug")
         if isinstance(evidence_summary.get("_core_assertion_audit"), dict):
             result["_core_assertion_audit"] = evidence_summary.get("_core_assertion_audit")
         if isinstance(evidence_summary.get("_cross_claim_consistency"), dict):
