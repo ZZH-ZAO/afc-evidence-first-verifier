@@ -11669,6 +11669,8 @@ def claim_has_new_scheme_strong_refutation(
     direct_refuting = claim_direct_refuting_points(summary)
     if not direct_refuting:
         return False
+    if direct_refutation_blocked_by_date_only_guard(summary, mode):
+        return False
     strong_direct = [point for point in direct_refuting if point_is_strong_refutation(point, need_type, claim, summary)]
     if mode == "date_fact" and any(
         point.get("type") == "date_mismatch" and point.get("source_type") == "official"
@@ -11778,6 +11780,33 @@ def claim_has_new_scheme_decidable_evidence(
         claim_has_new_scheme_strong_refutation(claim, summary, need_type)
         or claim_has_new_scheme_strong_support(claim, summary, need_type)
     )
+
+
+def direct_refutation_blocked_by_date_only_guard(summary: Dict[str, Any], mode: str) -> bool:
+    if mode in {"date_fact", "schedule_fact"}:
+        return False
+    phase_graph = summary.get("phase_graph") if isinstance(summary.get("phase_graph"), dict) else {}
+    if int(phase_graph.get("date_only_guard_block_count") or 0) <= 0:
+        return False
+    direct_refuting = claim_direct_refuting_points(summary)
+    if not direct_refuting:
+        return False
+    date_like_count = 0
+    for point in direct_refuting:
+        if not isinstance(point, dict):
+            continue
+        point_type = normalize_text(str(point.get("type") or point.get("conflict_type") or "")).lower()
+        conflict_slot = normalize_text(str(point.get("conflict_slot") or "")).lower()
+        direct_gate = normalize_text(str(point.get("direct_evidence_gate_result") or "")).lower()
+        if (
+            "date" in point_type
+            or "time" in point_type
+            or "date" in conflict_slot
+            or "time" in conflict_slot
+            or direct_gate in {"date_mismatch", "time_mismatch"}
+        ):
+            date_like_count += 1
+    return date_like_count > 0 and date_like_count == len(direct_refuting)
 
 
 def atomic_refutation_decision_signal(
