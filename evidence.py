@@ -293,35 +293,21 @@ def sentence_is_non_announcement_event(sentence: str, item: Dict[str, Any]) -> b
     return bool(re.search(r"\d+\s*[-:：比]\s*\d+|退赛|弃权|不战而胜|战胜|击败|获胜|winner|beat|defeat|score|result", combined, flags=re.I))
 
 
-# Keep these markers ASCII-safe via unicode escapes so state-slot extraction
-# stays stable even if the editor or terminal display encoding is noisy.
-MARKET_CALENDAR_CLAIM_MARKERS = [
-    "\u4f11\u5e02", "\u505c\u5e02", "\u8282\u5047\u65e5", "\u5047\u671f", "\u4ea4\u6613\u65e5",
-    "\u5f00\u76d8", "\u958b\u76e4", "\u6536\u76d8", "\u9ad8\u5f00", "\u9ad8\u958b", "\u4f4e\u5f00", "\u4f4e\u958b",
-    "\u4ea4\u6613\u516c\u5f00\u4fe1\u606f", "\u4ea4\u6613\u516c\u958b\u4fe1\u606f",
-    "market holiday", "market closed", "trading day", "opened", "open", "closed",
-]
-
-
 def is_market_calendar_state_claim(text: str) -> bool:
     normalized = normalize_text(text).lower()
-    return bool(normalized) and any(marker in normalized for marker in MARKET_CALENDAR_CLAIM_MARKERS)
+    if not normalized:
+        return False
+    has_market_subject = bool(re.search(r"(a股|港股|沪深|上证|深证|创业板|恒生|美股|纳指|道指|交易所|exchange|market)", normalized, flags=re.I))
+    has_calendar_state = bool(re.search(r"(休市|停市|节假日|假期|交易日|开盘|开市|收盘|高开|低开|market holiday|market closed|trading day|opened|open for trading|closed)", normalized, flags=re.I))
+    return has_market_subject and has_calendar_state
 
 
 def market_calendar_state_slot(text: str) -> str:
     normalized = normalize_text(text).lower()
     if not normalized:
         return ""
-    closed_markers = [
-        "\u4f11\u5e02", "\u505c\u5e02", "market holiday", "market closed", "closed for holiday", "holiday closure",
-    ]
-    open_markers = [
-        "\u9ad8\u5f00", "\u9ad8\u958b", "\u4f4e\u5f00", "\u4f4e\u958b", "\u5f00\u76d8", "\u958b\u76e4",
-        "\u4ea4\u6613\u516c\u5f00\u4fe1\u606f", "\u4ea4\u6613\u516c\u958b\u4fe1\u606f",
-        "\u4ea4\u6613\u63d0\u793a", "\u6b63\u5e38\u4ea4\u6613", "trading information", "trading day", "opened", "open for trading",
-    ]
-    has_closed = any(marker in normalized for marker in closed_markers)
-    has_open = any(marker in normalized for marker in open_markers)
+    has_closed = bool(re.search(r"(休市|停市|market holiday|market closed|closed for holiday|holiday closure)", normalized, flags=re.I))
+    has_open = bool(re.search(r"(高开|低开|开盘|开市|正常交易|trading information|trading day|opened|open for trading)", normalized, flags=re.I))
     if has_closed and not has_open:
         return "closed"
     if has_open and not has_closed:
