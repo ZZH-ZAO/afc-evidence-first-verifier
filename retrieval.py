@@ -6982,30 +6982,6 @@ def route_analysis_units(item: Dict[str, Any]) -> List[str]:
     return deduped[:30]
 
 
-ANSWER_MARKER_GROUPS = {
-    "event_result": ["won", "beat", "defeated", "lost", "retired", "withdraw", "walkover", "胜", "负", "战胜", "击败", "退赛", "弃权", "不战而胜"],
-    "date_fact": ["announced", "award", "published", "confirmed", "closed", "公布", "宣布", "发布", "确认", "休市"],
-    "numeric_fact": ["price", "amount", "rate", "score", "distance", "奖金", "价格", "汇率", "比分", "距离"],
-    "route_fact": ["located", "distance", "route", "airspace", "via", "through", "位于", "距离", "路线", "领空", "经过"],
-}
-
-
-def answer_marker_candidates(query: str) -> List[str]:
-    features = detect_claim_features(query, query)
-    markers: List[str] = []
-    if features.get("has_score"):
-        markers.extend(ANSWER_MARKER_GROUPS["event_result"])
-    if features.get("has_time_event") or features.get("has_date"):
-        markers.extend(ANSWER_MARKER_GROUPS["date_fact"])
-    if features.get("has_amount") or features.get("has_number"):
-        markers.extend(ANSWER_MARKER_GROUPS["numeric_fact"])
-    if features.get("has_route"):
-        markers.extend(ANSWER_MARKER_GROUPS["route_fact"])
-    if not markers:
-        markers.extend(["announced", "confirmed", "won", "beat", "located", "公布", "确认", "获奖", "位于"])
-    return dedupe_keep_order(markers)
-
-
 def evidence_sentence_units(item: Dict[str, Any]) -> List[Dict[str, str]]:
     units: List[Dict[str, str]] = []
     for field in ("title", "snippet", "detail"):
@@ -7259,7 +7235,6 @@ def answer_candidate_sentence_score(query: str, sentence: str, field: str) -> Di
     token_hits = [token for token in tokens if token and token in lower]
     numeric_hits = [marker for marker in query_numeric_markers(query) if marker and marker in lower]
     time_hits = [marker for marker in extract_temporal_markers(query) if marker and marker in lower]
-    answer_markers = [marker for marker in answer_marker_candidates(query) if marker in lower or marker in sentence]
     route_hits = []
     if any(route_marker_present(query, marker) for marker in ROUTE_RELATION_MARKERS):
         route_hits = [marker for marker in ROUTE_RELATION_MARKERS if route_marker_present(sentence, marker)]
@@ -7281,10 +7256,6 @@ def answer_candidate_sentence_score(query: str, sentence: str, field: str) -> Di
     if re.search(r"\d+\s*[-:：比]\s*\d+|\b\d+-\d+\b", sentence):
         score += 4
         reasons.append("score_pattern")
-    if answer_markers:
-        score += min(6, len(answer_markers))
-        reasons.append("answer_marker")
-
     query_needs_open = bool(re.search(r"(开盘|开市|opening|opened)", query, flags=re.I))
     sentence_has_open = bool(re.search(r"(开盘|开市|高开|opening|opened|open price|open gain)", sentence, flags=re.I))
     sentence_has_intraday = bool(re.search(r"(盘中|一度|曾|瞬时|最高|新高|intraday|at one point|session high|hit as high as)", sentence, flags=re.I))

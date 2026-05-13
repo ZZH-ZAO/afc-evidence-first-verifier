@@ -580,10 +580,6 @@ def sentence_overlap_score(sentence: str, claim: str) -> int:
             score += 2 if len(token) >= 3 else 1
     if re.search(r"\d+\s*[-:：比]\s*\d+|\b\d+-\d+\b", sentence):
         score += 3
-    if any(marker in lower or marker in sentence for marker in ["retired", "withdraw", "walkover", "bye", "??", "????", "w/o"]):
-        score += 4
-    if any(marker in lower or marker in sentence for marker in ["defeated", "beat", "lost", "won", "?", "?", "??", "??"]):
-        score += 2
     return score
 
 
@@ -2058,20 +2054,24 @@ def entity_sentence_has_relation_support(claim: str, sentence: str, answer_score
     sentence_text = normalize_text(sentence)
     if not claim_text or not sentence_text:
         return False
-    claim_markers = [marker for marker in ENTITY_RELATION_SUPPORT_MARKERS if marker in claim_text]
-    if claim_markers:
-        return any(marker in sentence_text for marker in claim_markers)
     claim_tokens = qa_text_tokens(claim_text)
     entity_tokens = set(claim_entities(claim_text))
+    sentence_lower = sentence_text.lower()
+    entity_hits = sum(1 for entity in entity_tokens if entity_matches_text(entity, sentence_lower))
     relation_tokens = [
         token for token in claim_tokens
         if token not in entity_tokens and len(token) >= 2 and not re.fullmatch(r"\d+(?:-\d+)?", token)
     ]
+    relation_tokens = [
+        token for token in relation_tokens
+        if token.lower() not in {"official", "result", "score", "match", "game", "today", "today's"}
+    ]
     if relation_tokens:
-        relation_hits = sum(1 for token in relation_tokens if token.lower() in sentence_text.lower())
-        if relation_hits >= 2:
+        relation_hits = sum(1 for token in relation_tokens if token.lower() in sentence_lower)
+        required_entity_hits = 1 if entity_tokens else 0
+        if relation_hits >= 2 and entity_hits >= required_entity_hits:
             return True
-    return answer_score >= 16 and len(claim_entities(claim_text)) >= 3 and len(sentence_text) <= 160
+    return answer_score >= 16 and entity_hits >= 2 and len(sentence_text) <= 160
 
 
 def route_support_slots(
