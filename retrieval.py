@@ -4206,17 +4206,6 @@ def contrastive_query_items(claim_item: Dict[str, Any], claim: str, evidence_mod
     ]
 
 
-ATOMIC_CLAIM_QUERY_HINTS = {
-    "market_calendar_status": ["官方", "公告", "交易日历", "休市", "开市"],
-    "exclusive_or_only_path": ["替代通道", "管道", "港口", "绕开", "说明"],
-    "event_result_status": ["赛果", "比分", "退赛", "不战而胜", "官方"],
-    "current_position_distance": ["current position", "distance", "as of", "location"],
-    "phase_boundary_time": ["官方", "日程", "阶段", "开始", "结束", "公布"],
-    "reality_vs_fiction_status": ["现实", "虚构", "辟谣", "fact check", "current status"],
-    "numeric_quote_or_metric": ["官方", "历史数据", "表格", "牌价", "中间价"],
-}
-
-
 def atomic_query_primary_score(value: str) -> str:
     match = re.search(r"\b\d{1,3}\s*[-:：]\s*\d{1,3}\b", normalize_text(str(value or "")))
     return normalize_text(match.group(0)) if match else normalize_text(str(value or ""))
@@ -4253,18 +4242,14 @@ def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any
         )
     elif risk_type == "event_result_status":
         status_text = normalize_text(str(slots.get("status_or_result") or ""))
-        status_mentions_withdrawal = bool(re.search(r"(退赛|弃权|不战而胜|walkover|withdraw|withdrew|retired)", status_text, flags=re.I))
-        status_mentions_score = bool(re.search(r"\d{1,3}\s*[-:：]\s*\d{1,3}", status_text))
-        contrast_terms = ["赛果", "比分", "结果"] if status_mentions_withdrawal else ["退赛", "不战而胜", "弃权", "walkover", "withdrawal", "赛果"]
-        if not status_mentions_score and not status_mentions_withdrawal:
-            contrast_terms = ["赛果", "比分", "结果", "退赛", "不战而胜"]
+        score_text = atomic_query_primary_score(str(slots.get("metric_or_relation") or ""))
         terms = dedupe_keep_order(
             [
                 atomic_query_event_entity(str(slots.get("subject") or "")),
                 atomic_query_event_entity(str(slots.get("object") or "")),
                 normalize_text(str(slots.get("time_scope") or "")),
+                score_text if not str(slots.get("subject") or "").strip() and not str(slots.get("object") or "").strip() else "",
             ]
-            + contrast_terms
         )
     elif risk_type == "phase_boundary_time":
         time_role = normalize_text(str(slots.get("time_role") or ""))
@@ -4338,7 +4323,6 @@ def build_atomic_claim_query_plan(atomic_claim: Dict[str, Any]) -> Dict[str, Any
                 normalize_text(str(slots.get("status_or_result") or "")),
             ]
             + [normalize_text(str(term)) for term in target_terms[:4]]
-            + ATOMIC_CLAIM_QUERY_HINTS.get(risk_type, ["官方", "实际", "结果"])[:4]
         )
     query_text = compact_text_for_query(" ".join(term for term in terms if term), 96)
     priority = int(atomic_claim.get("search_priority") or 0)

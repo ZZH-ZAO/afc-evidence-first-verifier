@@ -51,6 +51,16 @@ def build_decision_policy_debug(decision_state_debug: Optional[Dict[str, Any]]) 
         _text(row.get("decision_permission")) in {"risk_calibrate", "rubric_fallback"}
         for row in rows
     )
+    if not allow_rubric_fallback:
+        allow_rubric_fallback = any(
+            _text(row.get("scope")) == "core"
+            and _text(row.get("decision_permission")) == "insufficient_until_fact_binding"
+            and any(
+                token in " ".join(_text(value) for value in _as_list(row.get("risk_shape")))
+                for token in ("numeric_fact", "detail_numeric", "date_fact", "schedule_fact", "current_position_distance")
+            )
+            for row in rows
+        )
     if any(_text(row.get("decision_permission")) == "evidence_decide" for row in rows):
         policy_route = "evidence_decide"
     elif any(_text(row.get("decision_permission")) == "risk_calibrate" for row in rows):

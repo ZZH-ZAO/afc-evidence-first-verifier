@@ -31,6 +31,7 @@ from evidence_contract import (
     infer_missing_required_slots as shared_infer_missing_required_slots,
     required_slot_profile_for_mode as shared_required_slot_profile_for_mode,
 )
+from event_semantics import EVENT_SCORE_PATTERN, event_has_result_signal
 
 # 2. 项目模块：evidence_v2 做证据结构化，retrieval_v2 做检索取证。
 from evidence import claim_coverage, evidence_event_summary, normalize_text, point_conversion_diagnostics, summarize_claim_evidence, unique_points
@@ -1366,6 +1367,7 @@ def compact_claims_for_rubric(extracted: Dict[str, Any], evidence_summary: Optio
         if isinstance(evidence_summary, dict) and isinstance(evidence_summary.get("claim_summaries"), dict)
         else {}
     )
+    need_type = normalize_need_type(extracted.get("need_type")) if isinstance(extracted, dict) else "general_fact"
     rows: List[Tuple[int, Dict[str, Any]]] = []
     for claim in claims:
         if not isinstance(claim, dict):
@@ -3356,6 +3358,7 @@ def rubric_trigger_gate(
     route_uniqueness_overclaim = normalize_bool(fallback_risk_features.get("route_uniqueness_overclaim"), False)
     explicit_core_risk = route_uniqueness_overclaim or forecast_as_fact or fictional_risk
     fallback_risk_gate_override = explicit_core_risk or supporting_structured_detail_risk or time_role_conflict_risk
+    need_type = normalize_need_type(extracted.get("need_type")) if isinstance(extracted, dict) else "general_fact"
     route_guard_blocked = (
         has_core_route_like_claim(extracted, evidence_summary)
         and not normalize_bool(fallback_risk_features.get("absolute_claim_present"), False)
@@ -3403,6 +3406,13 @@ def rubric_trigger_gate(
     }
     if has_direct_refuting_evidence(evidence_summary):
         gate["reason"] = "direct_refuting_evidence_exists"
+        return gate
+    if need_type == "current_result" and not explicit_core_risk:
+        if not has_new_scheme_core_supporting_evidence(extracted, evidence_summary):
+            gate["reason"] = "current_result_without_direct_refutation_or_core_risk"
+            return gate
+    if need_type == "financial_quote":
+        gate["reason"] = "financial_quote_requires_same_metric_refutation"
         return gate
     unresolved_high_risk_details = has_unresolved_high_risk_detail_claims(extracted, evidence_summary)
     gate["unresolved_high_risk_details"] = unresolved_high_risk_details
@@ -6457,10 +6467,10 @@ def atomic_claim_search_priority(text: str, risk_type: str) -> int:
         if re.search(r"(替代|绕开|管道|港口|bypass|alternative)", clean, flags=re.I):
             priority += 4
     elif risk_type == "event_result_status":
-        if re.search(r"(退赛|弃权|不战而胜|walkover|withdrawal|retired)", clean, flags=re.I):
-            priority += 10
-        if re.search(r"(vs|VS|对阵|迎战)", clean) and EVENT_RESULT_SCORE_PATTERN.search(clean):
+        if re.search(r"(vs|VS|对阵|迎战)", clean) and EVENT_SCORE_PATTERN.search(clean):
             priority += 8
+        elif EVENT_SCORE_PATTERN.search(clean):
+            priority += 4
     elif risk_type == "phase_boundary_time":
         role = atomic_phase_time_role(clean)
         if role == "result_release":
@@ -6481,24 +6491,13 @@ def atomic_claim_search_priority(text: str, risk_type: str) -> int:
     return priority
 
 
-EVENT_RESULT_SCORE_PATTERN = re.compile(r"(?<![\d.])\d{1,3}\s*[-:：比]\s*\d{1,3}(?![\d.])")
-EVENT_CONTEXT_PATTERN = re.compile(
-    r"(比赛|赛果|比分|对阵|主场|客场|战报|胜|负|击败|战胜|不敌|退赛|弃权|不战而胜|"
-    r"NBA|CBA|WTT|世界杯|小组赛|常规赛|球队|球员|选手|女单|男单|"
-    r"result|score|game|match|win|loss|walkover|withdrawal|retired)",
-    re.I,
-)
-
-
 def has_event_result_signal(text: str) -> bool:
     clean = normalize_text(text)
     if not clean:
         return False
-    if re.search(r"(退赛|弃权|不战而胜|战胜|击败|不敌|获胜|赛果|晋级|walkover|withdrawal|retired)", clean, flags=re.I):
+    if event_has_result_signal(clean):
         return True
-    if EVENT_RESULT_SCORE_PATTERN.search(clean) and EVENT_CONTEXT_PATTERN.search(clean):
-        return True
-    return False
+    return bool(EVENT_SCORE_PATTERN.search(clean) and re.search(r"(vs|VS|对阵|迎战)", clean))
 
 
 def atomic_context_date_terms(extracted: Dict[str, Any]) -> List[str]:
@@ -6723,7 +6722,7 @@ def atomic_refutation_terms(text: str, risk_type: str, slots: Dict[str, str]) ->
     elif risk_type == "event_result_status":
         player_a, player_b, score = _atomic_converter_extract_event_pair(text)
         extras = compact_term_list(
-            [player_a, player_b, score, "赛果", "比分", "退赛", "弃权", "不战而胜", "walkover", "withdrawal"],
+            [player_a, player_b, score],
             10,
             36,
         )
@@ -6816,10 +6815,10 @@ def event_result_table_clause_candidates(answer_text: str) -> List[str]:
         if len(set(cells) & header_terms) >= 2:
             continue
         joined = normalize_text(" ".join(cells))
-        if not re.search(r"(vs|VS|对阵|迎战|战胜|击败|退赛|弃权|不战而胜)", joined):
+        if not (re.search(r"(vs|VS|对阵|迎战)", joined) or EVENT_SCORE_PATTERN.search(joined)):
             continue
-        score_match = EVENT_RESULT_SCORE_PATTERN.search(joined)
-        status_signal = re.search(r"(退赛|弃权|不战而胜|已结束|获胜|晋级|walkover|withdraw|retired)", joined, flags=re.I)
+        score_match = EVENT_SCORE_PATTERN.search(joined)
+        status_signal = event_has_result_signal(joined)
         if not score_match and not status_signal:
             continue
         score = normalize_text(score_match.group(0)) if score_match else ""
@@ -9364,7 +9363,7 @@ def normalize_extracted_plan(extracted: Dict[str, Any]) -> Dict[str, Any]:
                             "why": compact_claim_text(str(page_intent.get("why") or ""), 160),
                         },
                         "route_meta": normalize_route_meta(source_intent.get("route_meta") if isinstance(source_intent.get("route_meta"), dict) else {}),
-                    },
+                        },
                     "verification_questions": verification_questions,
                     "queries": queries_out,
                     "evidence_task_card": build_evidence_task_card(
@@ -9403,6 +9402,17 @@ def normalize_extracted_plan(extracted: Dict[str, Any]) -> Dict[str, Any]:
     normalized_claims = augment_sports_structured_detail_claims(extracted, normalized_claims)
     normalized_claims = dedupe_exclusive_premise_claims(normalized_claims)
     normalized_claims = dedupe_structured_detail_claims(normalized_claims)
+    try:
+        from centrality_calibrator import calibrate_claim_centrality
+
+        normalized_claims, centrality_debug = calibrate_claim_centrality(extracted, normalized_claims)
+    except Exception as exc:
+        centrality_debug = {"error": f"centrality_calibrator_failed:{type(exc).__name__}"}
+    for claim in normalized_claims:
+        program = claim.get("evidence_need_program") if isinstance(claim.get("evidence_need_program"), dict) else {}
+        if not isinstance(program, dict):
+            program = {}
+        claim["evidence_need_program"] = program
     user_need = normalize_text(str(extracted.get("user_need") or ""))
     selected_claims = select_claims_for_budget(normalized_claims, MAX_CLAIMS, user_need)
     atomic_payload = build_atomic_claims_for_extracted(extracted, selected_claims)
@@ -9413,6 +9423,7 @@ def normalize_extracted_plan(extracted: Dict[str, Any]) -> Dict[str, Any]:
         "atomic_claims": atomic_payload.get("atomic_claims") or [],
         "high_risk_atomic_claims": atomic_payload.get("high_risk_atomic_claims") or [],
         "atomic_claim_route_debug": atomic_payload.get("atomic_claim_route_debug") or [],
+        "centrality_calibration_debug": centrality_debug,
     }
     return refresh_extracted_claim_programs(normalized)
 
@@ -11239,9 +11250,38 @@ def point_is_strong_refutation(
     claim: Optional[Dict[str, Any]] = None,
     summary: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    summary = summary if isinstance(summary, dict) else {}
+    claim = claim if isinstance(claim, dict) else {}
     if point.get("direct_answer") != "direct":
         return False
     if point.get("source_type") not in {"official", "news"}:
+        return False
+    source_intent = claim.get("source_intent") if isinstance(claim.get("source_intent"), dict) else {}
+    mode = str(summary.get("evidence_mode") or source_intent.get("evidence_mode") or "")
+    point_conversion = summary.get("point_conversion") if isinstance(summary.get("point_conversion"), dict) else {}
+    conflict_profile = (
+        point_conversion.get("candidate_conflict_profile")
+        if isinstance(point_conversion.get("candidate_conflict_profile"), dict)
+        else {}
+    )
+    slot_contract_state = normalize_text(str(point_conversion.get("slot_contract_state") or "")).lower()
+    slot_missing = point_conversion.get("slot_missing") if isinstance(point_conversion.get("slot_missing"), list) else []
+    same_slot_ready = bool(
+        point.get("same_slot_conflict_ready")
+        or point_conversion.get("same_slot_conflict_ready")
+        or conflict_profile.get("same_slot_conflict_ready")
+    )
+    blocked_by_slot_context = (
+        mode in {"numeric_fact", "date_fact", "schedule_fact"}
+        and not same_slot_ready
+        and slot_contract_state != "same_slot_ready"
+        and (
+            "time_scope" in {str(slot) for slot in slot_missing}
+            or str(conflict_profile.get("block_reason") or "") == "slot_context_not_aligned"
+            or str(point_conversion.get("direct_candidate_gap_reason") or "") in {"numeric_reference_only", "date_only", "related_only"}
+        )
+    )
+    if blocked_by_slot_context:
         return False
     contract = point.get("comparability_contract") if isinstance(point.get("comparability_contract"), dict) else point_comparability_contract(point, claim, summary)
     if str(contract.get("comparability_status") or "") != "comparable":
@@ -12270,7 +12310,7 @@ def regression_label_calibration(
     ):
         return LABEL_0, "market_movement_resolved_forecast_overclaim"
     if sports_need and sports_unsupported_core_results >= 2 and not evidence_decidable:
-        return LABEL_0, "sports_result_has_multiple_unsupported_core_result_claims"
+        return LABEL_1, "sports_result_has_multiple_unsupported_core_result_claims"
     if sports_need and sports_unsupported_core_results == 1 and not evidence_decidable:
         return LABEL_1, "sports_result_has_unsupported_core_result_claim"
     if distance_need and unsupported_distance_numeric_core and not evidence_decidable:
@@ -13127,7 +13167,7 @@ def has_direct_refuting_evidence(evidence_summary: Optional[Dict[str, Any]]) -> 
         if not isinstance(summary, dict):
             continue
         for point in summary.get("refuting_points") or []:
-            if isinstance(point, dict) and point.get("direct_answer") == "direct":
+            if isinstance(point, dict) and point_is_strong_refutation(point, "general_fact", None, summary):
                 return True
     return False
 
@@ -13444,17 +13484,6 @@ def llm_reason_is_safe(reason: str, label: str, decision_basis: str, evidence_su
     return True
 
 
-CORE_ASSERTION_MARKERS = [
-    "代表", "意味着", "说明", "表明", "反映", "主要因为", "原因", "导致", "推动", "影响",
-    "抢筹", "定价", "解释", "本质", "说明了", "显示出", "源于", "由于", "因此",
-]
-
-SURFACE_FACT_MARKERS = [
-    "开盘", "收盘", "高开", "低开", "上涨", "下跌", "涨幅", "跌幅", "点", "比分",
-    "战胜", "击败", "休市", "开市", "日期", "时间", "汇率", "牌价", "中间价", "美元",
-]
-
-
 def claim_decision_slots(claim: Dict[str, Any]) -> Dict[str, Any]:
     program = claim.get("evidence_need_program") if isinstance(claim.get("evidence_need_program"), dict) else {}
     slots = program.get("decision_slots") if isinstance(program.get("decision_slots"), dict) else {}
@@ -13476,29 +13505,30 @@ def claim_is_core_assertion(claim: Dict[str, Any]) -> bool:
     text = normalize_text(str(claim.get("claim") or ""))
     centrality = str(claim.get("centrality") or "")
     role = claim_answer_role_impact(claim)
-    if centrality != "core" and role != "core":
-        return False
-    if any(marker in text for marker in CORE_ASSERTION_MARKERS):
+    slots = claim_decision_slots(claim)
+    if centrality == "core" or role == "core":
+        return True
+    if str(slots.get("metric_or_relation") or "").strip() and str(slots.get("status_or_result") or "").strip():
+        return True
+    if str(slots.get("time_scope") or "").strip() and str(slots.get("status_or_result") or "").strip():
         return True
     if re.search(r"比.+更|更.+", text):
-        return True
-    if re.search(r"(主要|代表|意味着|反映|导致|因为|由于|抢筹|定价)", text):
         return True
     return False
 
 
 def claim_is_surface_fact(claim: Dict[str, Any], summary: Optional[Dict[str, Any]] = None) -> bool:
     text = normalize_text(str(claim.get("claim") or ""))
-    if any(marker in text for marker in CORE_ASSERTION_MARKERS):
-        return False
     mode = claim_evidence_mode_from_summary(claim, summary)
     slots = claim_decision_slots(claim)
     buckets = slots.get("anchor_buckets") if isinstance(slots.get("anchor_buckets"), list) else []
+    if str(claim.get("centrality") or "") == "core" or claim_answer_role_impact(claim) == "core":
+        return False
     if mode in {"numeric_fact", "date_fact", "schedule_fact", "event_result", "financial_quote", "market_movement"}:
         return True
     if any(str(bucket) in {"time", "event", "numeric", "status"} for bucket in buckets):
         return True
-    return any(marker in text for marker in SURFACE_FACT_MARKERS)
+    return bool(str(slots.get("subject") or "").strip() and str(slots.get("status_or_result") or "").strip())
 
 
 def claim_topic_terms(claim: Dict[str, Any]) -> List[str]:
@@ -14225,8 +14255,6 @@ def _atomic_converter_match_row(
             converted_route["evidence_value"] = normalize_text(str(candidate.get("sentence") or candidate.get("text") or candidate.get("title") or "alternative_route"))
             candidate = converted_route
         elif risk_type == "event_result_status":
-            result_terms = ["比分", "战胜", "击败", "获胜", "退赛", "弃权", "不战而胜", "walkover", "withdraw", "retired", "result", "score"]
-            withdrawal_terms = ["退赛", "弃权", "不战而胜", "walkover", "withdraw", "withdrew", "retired"]
             score_pattern = r"\b\d{1,3}\s*[-:：]\s*\d{1,3}\b"
             claim_has_score = bool(re.search(score_pattern, claim_text))
             claim_has_score_detail = _atomic_converter_has_event_score_detail(claim_text)
@@ -14234,38 +14262,33 @@ def _atomic_converter_match_row(
             evidence_value_score = _atomic_converter_extract_score_pair(evidence_value_text)
             evidence_value_has_score = bool(evidence_value_score)
             score_scale_compatible = _atomic_converter_score_scale_compatible(claim_text, evidence_value_text)
-            candidate_has_withdrawal = _atomic_converter_has_terms(candidate_text, withdrawal_terms)
             participant_overlap = _atomic_converter_event_participants_overlap(atomic_row, candidate_text)
             subject_overlap = _atomic_converter_event_subject_overlap(atomic_row, candidate_text)
-            subject_withdrawal_near = _atomic_converter_event_subject_near_terms(atomic_row, candidate_text, withdrawal_terms)
             slot_contract_ready = str(candidate.get("slot_contract_state") or "").lower() == "same_slot_ready"
-            if candidate_has_withdrawal and claim_has_score_detail:
-                participant_ready = subject_overlap and subject_withdrawal_near
-            else:
-                participant_ready = participant_overlap or (slot_contract_ready and candidate_has_withdrawal and subject_overlap and subject_withdrawal_near)
+            candidate_has_score = bool(evidence_value_has_score or EVENT_SCORE_PATTERN.search(candidate_text))
+            participant_ready = participant_overlap or subject_overlap
             if not participant_ready:
                 continue
             if same_slot_ready and conflict_strength in {"strong", "medium"} and conflict_type in {"result_conflict", "status_conflict", "event_mismatch", "status_mismatch"}:
                 if not (
                     (claim_has_score and evidence_value_has_score and score_scale_compatible and conflict_type == "result_conflict")
-                    or (claim_has_score_detail and candidate_has_withdrawal and participant_ready)
-                    or (candidate_has_withdrawal and participant_ready and _atomic_converter_has_terms(claim_text, result_terms))
+                    or (claim_has_score_detail and candidate_has_score and participant_ready)
                 ):
                     continue
             elif not (
                 claim_has_score_detail
-                and candidate_has_withdrawal
+                and candidate_has_score
                 and participant_ready
                 and (page_role == "evidence_page" or page_profile == "result_or_score_page" or source_type in {"official", "news"})
             ):
                 continue
-            if claim_has_score_detail and candidate_has_withdrawal:
+            if claim_has_score_detail and candidate_has_score:
                 converted_detail = dict(candidate)
                 converted_detail["conflict_type"] = "status_conflict"
                 converted_detail["conflict_strength"] = "strong"
                 converted_detail["conflict_slot"] = "status_or_result"
                 converted_detail["claim_value"] = claim_text
-                converted_detail["evidence_value"] = "withdrawal_or_walkover"
+                converted_detail["evidence_value"] = evidence_value_text or normalize_text(str(candidate.get("sentence") or candidate.get("text") or candidate.get("title") or "score_conflict"))
                 candidate = converted_detail
         elif risk_type == "phase_boundary_time":
             phase_candidates = [
@@ -14327,6 +14350,8 @@ def _atomic_converter_match_row(
         converted["risk_type"] = risk_type
         converted["centrality_hint"] = str(atomic_row.get("centrality_hint") or "")
         converted["atomic_label"] = _atomic_converter_label(atomic_row)
+        if risk_type in {"event_result_status", "phase_boundary_time"}:
+            converted["atomic_label"] = LABEL_0
         converted["atomic_query"] = str((atomic_row.get("refutation_target") or {}).get("query") or "") if isinstance(atomic_row.get("refutation_target"), dict) else ""
         converted["atomic_refutation_reason"] = {
             "market_calendar_status": "same-slot market calendar conflict",
@@ -14549,23 +14574,22 @@ def reader_rescue_slot_sentence_judge(atomic_row: Dict[str, Any], sentence: str,
             "evidence_role": evidence_role,
         }
     if risk_type == "event_result_status":
-        withdrawal_terms = ["退赛", "弃权", "不战而胜", "walkover", "withdraw", "withdrew", "retired"]
         claim_has_score_detail = _atomic_converter_has_event_score_detail(claim_text)
-        has_withdrawal = _atomic_converter_has_terms(sentence_text, withdrawal_terms)
-        subject_near = _atomic_converter_event_subject_near_terms(atomic_row, sentence_text, withdrawal_terms)
-        if claim_has_score_detail and has_withdrawal and subject_near:
+        has_score = bool(EVENT_SCORE_PATTERN.search(sentence_text))
+        subject_near = _atomic_converter_event_subject_overlap(atomic_row, sentence_text)
+        if claim_has_score_detail and has_score and subject_near:
             return {
                 "state": "strong_conflict",
                 "allow_conversion": _reader_rescue_source_allowed_for_conversion(source_item, sentence_text),
                 "conflict_type": "status_conflict",
                 "conflict_slot": "status_or_result",
                 "claim_value": claim_text,
-                "evidence_value": "withdrawal_or_walkover",
+                "evidence_value": normalize_text(sentence_text),
             }
         return {
             "state": "event_status_not_conflicting",
             "allow_conversion": False,
-            "has_withdrawal": has_withdrawal,
+            "has_score": has_score,
             "subject_near": subject_near,
         }
     if risk_type == "exclusive_or_only_path":
@@ -14616,10 +14640,7 @@ def _reader_rescue_status_hit(atomic_row: Dict[str, Any], sentence: str) -> bool
     if not sentence_text:
         return False
     if risk_type == "event_result_status":
-        return bool(
-            _atomic_converter_extract_score_pair(sentence_text)
-            or _atomic_converter_has_terms(sentence_text, ["退赛", "弃权", "不战而胜", "walkover", "withdraw", "withdrew", "retired", "赛果", "比分", "结果"])
-        )
+        return event_has_result_signal(sentence_text)
     if risk_type == "exclusive_or_only_path":
         return bool(_atomic_converter_alternative_route_terms(sentence_text) or _atomic_converter_exclusive_claim_terms(sentence_text))
     if risk_type == "phase_boundary_time":
@@ -15026,6 +15047,7 @@ def build_evidence_ledger(
     claim_pipeline_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     claims = extracted.get("claims") if isinstance(extracted, dict) and isinstance(extracted.get("claims"), list) else []
+    need_type = normalize_need_type(extracted.get("need_type")) if isinstance(extracted, dict) else "general_fact"
     claim_by_id = {
         str(claim.get("claim_id") or claim.get("id") or ""): claim
         for claim in claims
@@ -15324,8 +15346,12 @@ def build_evidence_ledger(
         summary = summaries.get(claim_id) if isinstance(summaries.get(claim_id), dict) else {}
         direct_refuting = claim_direct_refuting_points(summary)
         direct_supporting = claim_direct_supporting_points(summary)
-        if direct_refuting:
-            row = _ledger_point_row(claim_id, claim_text, direct_refuting[0], "refuted")
+        strong_refuting = [
+            point for point in direct_refuting
+            if point_is_strong_refutation(point, need_type, claim, summary)
+        ]
+        if strong_refuting:
+            row = _ledger_point_row(claim_id, claim_text, strong_refuting[0], "refuted")
             ledger["refuted_points"].append(row)
             claim_state = "refuted"
         elif direct_supporting:
