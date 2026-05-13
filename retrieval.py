@@ -22,6 +22,7 @@ from afc_route_markers import (
     ROUTE_QUERY_STOPWORDS,
     ROUTE_RELATION_MARKERS,
 )
+from event_semantics import event_has_result_signal
 from evidence_contract import (
     infer_missing_required_slots as shared_infer_missing_required_slots,
     required_slot_profile_for_mode as shared_required_slot_profile_for_mode,
@@ -6474,16 +6475,15 @@ def structured_noise_features(query: str, item: Dict[str, Any], evidence_mode: s
 def structured_title_marker_hit(evidence_mode: str, item: Dict[str, Any]) -> bool:
     mode = policy_mode_label(evidence_mode)
     text = normalize_text(f"{item.get('title', '')} {item.get('snippet', '')}").lower()
-    marker_patterns = {
-        "numeric_fact": r"(汇率|中间价|牌价|外汇|fx|forex|rate|price|quote|usd|cny|eur|gbp|jpy)",
-        "date_fact": r"(日期|公布|发布|时间|date|announce|release|notice|calendar)",
-        "schedule_fact": r"(休市|交易日|开市|开盘|收盘|schedule|calendar|holiday|trading|market)",
-        "event_result": r"(赛果|比分|冠军|胜|负|result|winner|beat|score|final)",
-    }
-    pattern = marker_patterns.get(mode)
-    if not pattern:
-        return False
-    return bool(re.search(pattern, text, flags=re.I))
+    if mode == "numeric_fact":
+        return bool(re.search(r"\d", text) and (extract_numeric_markers(text) or re.search(r"[%$€£¥元克朗比点公里千米海里km|usd|cny|eur|gbp|jpy]", text, flags=re.I)))
+    if mode in {"date_fact", "schedule_fact"}:
+        has_temporal = bool(extract_temporal_markers(text))
+        has_day_shape = bool(re.search(r"(20\d{2}|[12]?\d月[0-3]?\d日|\d{1,2}\s*[/-]\s*\d{1,2})", text))
+        return has_temporal or has_day_shape
+    if mode == "event_result":
+        return bool(event_has_result_signal(text) or re.search(r"\d+\s*[-:：比]\s*\d+", text))
+    return False
 
 
 def is_recoverable_structured_penalty_item(
