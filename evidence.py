@@ -266,24 +266,31 @@ def item_blocks_structured_direct_verdict(item: Dict[str, Any]) -> bool:
     return bool(item_structured_point_blocking_risks(item))
 
 
-def claim_is_announcement_date_claim(claim: str) -> bool:
+def claim_is_announcement_date_claim(claim: str, evidence_target: str = "") -> bool:
+    target = normalize_text(str(evidence_target or "")).lower()
+    if target in {"publication_date", "effective_date", "event_date"}:
+        return True
     text = normalize_text(claim).lower()
-    return any(marker in text for marker in ANNOUNCEMENT_CLAIM_MARKERS)
+    return bool(re.search(r"(发布日期|发布日|公布日|生效日|发布时间|announce date|release date|effective date|event date)", text, flags=re.I))
 
 
 def sentence_is_non_announcement_event(sentence: str, item: Dict[str, Any]) -> bool:
+    page_role = normalize_text(str(item.get("page_role") or "")).lower()
+    contract_role = normalize_text(str(item.get("evidence_contract_role") or "")).lower()
+    if page_role in {"entry_page", "generic_page", "blocked_page"}:
+        return False
+    if contract_role == "date_authority":
+        return False
     combined = normalize_text(
         " ".join(
             [
                 sentence or "",
                 str(item.get("title") or ""),
-                str(item.get("url") or ""),
+                str(item.get("snippet") or ""),
             ]
         )
     ).lower()
-    has_announcement_marker = any(marker in combined for marker in ANNOUNCEMENT_CLAIM_MARKERS)
-    has_non_announcement_event = any(marker in combined for marker in NON_ANNOUNCEMENT_EVENT_MARKERS)
-    return has_non_announcement_event and not has_announcement_marker
+    return bool(re.search(r"\d+\s*[-:：比]\s*\d+|退赛|弃权|不战而胜|战胜|击败|获胜|winner|beat|defeat|score|result", combined, flags=re.I))
 
 
 # Keep these markers ASCII-safe via unicode escapes so state-slot extraction
@@ -1908,7 +1915,7 @@ def summarize_date_claim(
                 point["type"] = "date_reference"
                 point["point_contract_blocking_risks"] = blocking_risks
                 uncertain_points.append(point)
-            elif mismatch and claim_is_announcement_date_claim(claim) and sentence_is_non_announcement_event(best_sentence or point.get("evidence_sentence") or "", item):
+            elif mismatch and claim_is_announcement_date_claim(claim, evidence_target=evidence_target) and sentence_is_non_announcement_event(best_sentence or point.get("evidence_sentence") or "", item):
                 point["type"] = "date_reference"
                 point["date_contract_note"] = "non_announcement_event_page"
                 uncertain_points.append(point)
